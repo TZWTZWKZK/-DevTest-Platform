@@ -1,0 +1,425 @@
+// https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id           String      @id @default(cuid())
+  /// 项目名称
+  name         String
+  /// 项目编码（唯一，应用层创建/编辑时必填；库内可为空便于从旧库迁移后再补全）
+  code         String?     @unique
+  /// 项目层级（1 表示一级项目）
+  level        Int         @default(1)
+  /// 关联一级项目：非一级项目时指向 level=1 的上级项目
+  parentId     String?
+  parent       Product?    @relation("ProductHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children     Product[]   @relation("ProductHierarchy")
+  /// 项目负责人
+  owner        String?
+  /// 归属部门
+  department   String?
+  /// 项目团队成员（可存多行或逗号分隔姓名）
+  teamMembers  String?
+  /// 开始时间
+  startDate    DateTime?
+  /// 结束时间
+  endDate      DateTime?
+  description  String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  iterations   Iteration[]
+
+  @@index([parentId])
+}
+
+model Iteration {
+  id            String        @id @default(cuid())
+  name          String
+  /// 迭代编码（创建时按时间自动生成）
+  code          String        @unique
+  version       String?
+  /// 迭代内容/说明
+  content       String?
+  startDate     DateTime?
+  endDate       DateTime?
+  status        IterationStatus @default(IN_PROGRESS)
+  submitter     String?
+  productId     String
+  product       Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  requirements  Requirement[]
+  executionTasks ExecutionTask[]
+  opLogs         IterationOpLog[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([productId])
+  @@index([status])
+}
+
+model IterationOpLog {
+  id          String    @id @default(cuid())
+  iterationId String
+  action      String
+  detail      String?
+  createdAt   DateTime  @default(now())
+  iteration   Iteration @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+
+  @@index([iterationId])
+  @@index([createdAt])
+}
+
+model Requirement {
+  id           String       @id @default(cuid())
+  title          String
+  description    String?
+  /// 任务进度（如百分比、阶段等）
+  taskProgress   String?
+  /// 最新进展情况描述
+  latestProgress String?
+  priority       Int?
+  status       RequirementStatus @default(UNASSIGNED)
+  submitter    String?
+  devOwner     String?
+  testOwner    String?
+  planStartAt  DateTime?
+  planEndAt    DateTime?
+  iterationId  String
+  iteration    Iteration    @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  parentId     String?
+  parent       Requirement? @relation("RequirementTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children     Requirement[] @relation("RequirementTree")
+  sortOrder    Int          @default(0)
+  attachments  RequirementAttachment[]
+  testDesigns  TestDesign[]
+  opLogs       RequirementOpLog[]
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([iterationId])
+  @@index([parentId])
+  @@index([status])
+}
+
+model RequirementAttachment {
+  id            String      @id @default(cuid())
+  requirementId String
+  requirement   Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  name          String
+  url           String
+  createdAt     DateTime    @default(now())
+
+  @@index([requirementId])
+}
+
+model RequirementOpLog {
+  id             String      @id @default(cuid())
+  requirementId  String
+  action         String
+  detail         String?
+  createdAt      DateTime    @default(now())
+  requirement    Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+
+  @@index([requirementId])
+  @@index([createdAt])
+}
+
+/// 测试设计树节点：自关联 parent/children，type 区分功能/性能等；根节点挂在 Requirement 下
+model TestDesign {
+  id              String               @id @default(cuid())
+  title           String
+  description     String?
+  type            TestDesignType
+  /// 迭代编码（与迭代管理同步，便于按迭代筛选/归档）
+  iterationCode   String?
+  /// 创建人（无登录系统时由前端录入/可为空）
+  createdBy       String?
+  /// 修改人（无登录系统时由前端录入/可为空）
+  updatedBy       String?
+  /// 设计正文：前置条件
+  precondition    String?
+  /// 设计正文：操作步骤
+  operationSteps  String?
+  /// 设计正文：预期结果
+  expectedResult  String?
+  /// 设计正文：备注
+  remark          String?
+  /// 用例等级 L0–L4，对应 0–4（与用例库 priority 字段语义一致）
+  caseLevel       Int?
+  requirementId   String
+  requirement     Requirement          @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  parentId        String?
+  parent          TestDesign?          @relation("TestDesignTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children        TestDesign[]         @relation("TestDesignTree")
+  sortOrder       Int                  @default(0)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  linkedTestCases TestDesignTestCase[]
+  opLogs          TestDesignOpLog[]
+
+  @@index([requirementId])
+  @@index([parentId])
+  @@index([iterationCode])
+}
+
+/// 用例库文件夹（目录树）
+model TestCaseFolder {
+  id        String           @id @default(cuid())
+  name      String
+  parentId  String?
+  parent    TestCaseFolder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children  TestCaseFolder[] @relation("FolderTree")
+  sortOrder Int              @default(0)
+  testCases TestCase[]
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([parentId])
+}
+
+model TestCase {
+  id               String               @id @default(cuid())
+  caseNo           String               @unique
+  title            String
+  testPlan         String?
+  /// 迭代编码（与迭代管理同步，便于按迭代筛选）
+  iterationCode    String?
+  folderId         String
+  folder           TestCaseFolder       @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  priority         Int?
+  maintainer       String?
+  status           TestCaseStatus?
+  precondition     String?
+  operationSteps   String?
+  caseActualResult String?
+  caseRemark       String?
+  submitter        String?
+  submittedAt      DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  testDesignLinks  TestDesignTestCase[]
+  defectLinks      DefectTestCase[]
+  executionTaskLinks ExecutionTaskTestCase[]
+  taskExecRecords    ExecutionTaskTestCaseExecRecord[]
+  opLogs             TestCaseOpLog[]
+
+  @@index([folderId])
+  @@index([status])
+  @@index([iterationCode])
+}
+
+model TestDesignTestCase {
+  testDesignId String
+  testCaseId   String
+  testDesign   TestDesign @relation(fields: [testDesignId], references: [id], onDelete: Cascade)
+  testCase     TestCase   @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@id([testDesignId, testCaseId])
+  @@index([testCaseId])
+}
+
+model TestDesignOpLog {
+  id            String     @id @default(cuid())
+  testDesignId  String
+  action        String
+  detail        String?
+  createdAt     DateTime   @default(now())
+  testDesign    TestDesign @relation(fields: [testDesignId], references: [id], onDelete: Cascade)
+
+  @@index([testDesignId])
+  @@index([createdAt])
+}
+
+model TestCaseOpLog {
+  id         String   @id @default(cuid())
+  testCaseId String
+  action     String
+  detail     String?
+  createdAt  DateTime @default(now())
+  testCase   TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+
+  @@index([testCaseId])
+  @@index([createdAt])
+}
+
+/// 通过(绿) / 失败(红) / 阻塞(黄) / 废弃(灰)
+enum TestCaseStatus {
+  PASSED
+  FAILED
+  BLOCKED
+  DEPRECATED
+}
+
+/// 测试设计类型：功能、性能等
+enum TestDesignType {
+  FUNCTIONAL
+  PERFORMANCE
+  SECURITY
+  COMPATIBILITY
+  USABILITY
+  RELIABILITY
+  OTHER
+}
+
+enum IterationStatus {
+  IN_PROGRESS
+  OVERDUE
+  COMPLETED
+}
+
+enum RequirementStatus {
+  UNASSIGNED
+  IN_DEVELOPMENT
+  PENDING_VERIFICATION
+  CLOSED
+}
+
+/// 缺陷状态
+enum DefectStatus {
+  UNASSIGNED
+  IN_DEVELOPMENT
+  TESTING
+  CLOSED
+  REOPENED
+}
+
+/// 严重等级
+enum DefectSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+model Defect {
+  id            String         @id @default(cuid())
+  defectNo      String         @unique
+  name          String
+  status        DefectStatus   @default(UNASSIGNED)
+  severity      DefectSeverity @default(MEDIUM)
+  /// 关联迭代编码（用于按迭代筛选/归档；不强制外键）
+  iterationCode String?
+  caseNo        String?
+  devOwner      String?
+  submitter     String?
+  foundAt       DateTime?
+  description   String?
+  linkedTestId  String?
+  linkedProject String?
+  reopenCount   Int            @default(0)
+  /// 最后一次保存该缺陷的操作者（手填，便于无登录环境下追溯）
+  updatedBy     String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  linkedCases   DefectTestCase[]
+  opLogs        DefectOpLog[]
+
+  @@index([status])
+  @@index([severity])
+  @@index([iterationCode])
+  @@index([caseNo])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([updatedBy])
+}
+
+model DefectTestCase {
+  defectId   String
+  testCaseId String
+  defect     Defect   @relation(fields: [defectId], references: [id], onDelete: Cascade)
+  testCase   TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@id([defectId, testCaseId])
+  @@index([testCaseId])
+}
+
+model DefectOpLog {
+  id        String   @id @default(cuid())
+  defectId  String
+  action    String
+  detail    String?
+  createdAt DateTime @default(now())
+
+  defect Defect @relation(fields: [defectId], references: [id], onDelete: Cascade)
+
+  @@index([defectId])
+  @@index([createdAt])
+}
+
+/// 执行任务：用于从用例库导入用例并跟踪执行范围（可树形组织）
+model ExecutionTask {
+  id          String          @id @default(cuid())
+  title       String
+  description String?
+  iterationId String
+  iteration   Iteration       @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  parentId    String?
+  parent      ExecutionTask?  @relation("ExecutionTaskTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children    ExecutionTask[] @relation("ExecutionTaskTree")
+  sortOrder   Int             @default(0)
+  /// 创建人（无登录系统时可为空）
+  createdBy   String?
+  /// 修改人（无登录系统时可为空）
+  updatedBy   String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  linkedCases     ExecutionTaskTestCase[]
+  execCaseRecords ExecutionTaskTestCaseExecRecord[]
+
+  @@index([iterationId])
+  @@index([parentId])
+  @@index([createdBy])
+  @@index([updatedBy])
+  @@index([createdAt])
+  @@index([updatedAt])
+}
+
+model ExecutionTaskTestCase {
+  executionTaskId String
+  testCaseId      String
+  executionTask   ExecutionTask @relation(fields: [executionTaskId], references: [id], onDelete: Cascade)
+  testCase        TestCase      @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+  /// 执行任务内对该用例的执行结果（不影响用例库正文）
+  executionResult String?
+  /// 首次记录/最近一次更新执行结果的时间
+  executedAt      DateTime?
+
+  @@id([executionTaskId, testCaseId])
+  @@index([testCaseId])
+}
+
+/// 执行任务内：对某条用例的每次执行记录（时间 / 状态 / 执行人）
+model ExecutionTaskTestCaseExecRecord {
+  id              String         @id @default(cuid())
+  executionTaskId String
+  testCaseId      String
+  executedAt      DateTime       @default(now())
+  status          TestCaseStatus
+  executor        String?
+  /// 本次执行记录的执行结果文本（可为空）
+  result          String?
+  /// 关联截图（dataUrl 数组，限制体积；仅用于本地/演示场景）
+  images          Json?
+  note            String?
+
+  executionTask ExecutionTask @relation(fields: [executionTaskId], references: [id], onDelete: Cascade)
+  testCase      TestCase      @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+
+  @@index([executionTaskId, testCaseId, executedAt])
+}
+
+/// 简易 UI 配置存储（无登录系统时按 key 全局存一份）
+model UiPreference {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
