@@ -2,6 +2,7 @@ import type { RequirementFlat } from "@/app/actions/requirements";
 import { parseTaskProgressPercent } from "@/lib/task-progress-display";
 import type { TreeNode } from "@/lib/tree";
 export type RequirementSortableKey =
+  | "wbsId"
   | "priority"
   | "status"
   | "taskProgress"
@@ -20,6 +21,7 @@ export type RequirementSortState = {
 };
 
 export const REQUIREMENT_SORTABLE_KEYS: readonly RequirementSortableKey[] = [
+  "wbsId",
   "priority",
   "status",
   "taskProgress",
@@ -47,6 +49,45 @@ function normPriority(p: number | null | undefined): number {
   if (p === null || p === undefined) return -1;
   if (p >= 4) return 3;
   return p;
+}
+
+/** 将「1.2.3」式 WBS 拆成整数段；含非数字段时返回 null（改用字符串比较） */
+function wbsNumericSegments(raw: string): number[] | null {
+  const parts = raw
+    .split(".")
+    .map((p) => p.trim())
+    .filter((x) => x.length > 0);
+  if (parts.length === 0) return null;
+  const out: number[] = [];
+  for (const p of parts) {
+    const n = parseInt(p, 10);
+    if (!Number.isFinite(n)) return null;
+    out.push(n);
+  }
+  return out;
+}
+
+function compareWbsValues(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): number {
+  const as = (a ?? "").trim();
+  const bs = (b ?? "").trim();
+  if (!as && !bs) return 0;
+  if (!as) return 1;
+  if (!bs) return -1;
+  const an = wbsNumericSegments(as);
+  const bn = wbsNumericSegments(bs);
+  if (an !== null && bn !== null) {
+    const len = Math.max(an.length, bn.length);
+    for (let i = 0; i < len; i++) {
+      const av = an[i] ?? 0;
+      const bv = bn[i] ?? 0;
+      if (av !== bv) return av - bv;
+    }
+    return 0;
+  }
+  return as.localeCompare(bs, "zh-CN", { numeric: true });
 }
 
 export function taskProgressPassesValueFilter(
@@ -77,6 +118,8 @@ function compareOne(
 ): number {
   const mul = crit.dir === "asc" ? 1 : -1;
   switch (crit.key) {
+    case "wbsId":
+      return compareWbsValues(a.wbsId, b.wbsId) * mul;
     case "priority": {
       const an = a.priority === null || a.priority === undefined;
       const bn = b.priority === null || b.priority === undefined;

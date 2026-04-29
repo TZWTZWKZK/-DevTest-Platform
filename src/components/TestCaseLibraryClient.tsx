@@ -39,13 +39,20 @@ import {
 import { bulkImportDesignsToTestCases } from "@/app/actions/test-design";
 import {
   addExecutionTaskCaseExecRecord,
+  getGlobalIterationProductPreference,
+  getGlobalTestCaseExecResultHeightPreference,
+  getGlobalTestCaseSidebarPreference,
   getExecutionTaskCaseResult,
   listExecutionTaskCaseExecRecords,
   listTestCaseExecRecords,
+  saveGlobalTestCaseExecResultHeightPreference,
+  saveGlobalIterationProductPreference,
+  saveGlobalTestCaseSidebarPreference,
   saveExecutionTaskCaseResult,
   type ExecutionTaskCaseExecRecordDTO,
 } from "@/app/actions/executions";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
+import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
   caseLevelToFormValue,
   formatCaseLevelDisplay,
@@ -145,6 +152,18 @@ const DEFAULT_ADV_FILTER = {
   updatedFrom: "",
   updatedTo: "",
 };
+const MAX_PASTED_IMAGE_BYTES = 1_000_000;
+const PASTE_IMAGE_SCALE_STEPS = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4] as const;
+const EXEC_RESULT_TEXTAREA_MIN_HEIGHT = 120;
+const EXEC_RESULT_TEXTAREA_MAX_HEIGHT = 600;
+
+function clampExecResultHeight(v: number): number {
+  if (!Number.isFinite(v)) return EXEC_RESULT_TEXTAREA_MIN_HEIGHT;
+  return Math.max(
+    EXEC_RESULT_TEXTAREA_MIN_HEIGHT,
+    Math.min(EXEC_RESULT_TEXTAREA_MAX_HEIGHT, Math.round(v)),
+  );
+}
 
 function dayBoundaryMs(isoDate: string, endOfDay: boolean): number | null {
   if (!isoDate) return null;
@@ -171,6 +190,84 @@ function csvEscapeCell(val: string): string {
   const s = String(val).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
+}
+
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(new Error("read failed"));
+    r.readAsDataURL(blob);
+  });
+}
+
+async function decodeImageForCanvas(file: File): Promise<{
+  width: number;
+  height: number;
+  draw: (
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+  ) => void;
+  release: () => void;
+}> {
+  if (typeof createImageBitmap === "function") {
+    const bmp = await createImageBitmap(file);
+    return {
+      width: bmp.width,
+      height: bmp.height,
+      draw: (ctx, width, height) => ctx.drawImage(bmp, 0, 0, width, height),
+      release: () => bmp.close(),
+    };
+  }
+
+  const src = await blobToDataUrl(file);
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const i = new Image();
+    i.onload = () => resolve(i);
+    i.onerror = () => reject(new Error("image decode failed"));
+    i.src = src;
+  });
+  return {
+    width: img.naturalWidth || img.width,
+    height: img.naturalHeight || img.height,
+    draw: (ctx, width, height) => ctx.drawImage(img, 0, 0, width, height),
+    release: () => {
+      img.src = "";
+    },
+  };
+}
+
+async function normalizePastedImagePng(
+  file: File,
+  maxBytes = MAX_PASTED_IMAGE_BYTES,
+): Promise<{ dataUrl: string; compressed: boolean } | null> {
+  if (file.size <= maxBytes) {
+    return { dataUrl: await blobToDataUrl(file), compressed: false };
+  }
+  const decoded = await decodeImageForCanvas(file);
+  try {
+    for (const scale of PASTE_IMAGE_SCALE_STEPS) {
+      const width = Math.max(1, Math.floor(decoded.width * scale));
+      const height = Math.max(1, Math.floor(decoded.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) continue;
+      decoded.draw(ctx, width, height);
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/png"),
+      );
+      if (!blob) continue;
+      if (blob.size <= maxBytes) {
+        return { dataUrl: await blobToDataUrl(blob), compressed: true };
+      }
+    }
+    return null;
+  } finally {
+    decoded.release();
+  }
 }
 
 function CaseListDataCell({
@@ -282,9 +379,12 @@ export function TestCaseLibraryClient({
     return roots[0]?.id ?? null;
   });
   const [iterationCode, setIterationCode] = useState<string>("");
+  const [products, setProducts] = useState<ProductOption[]>([]);
+  const [productId, setProductId] = useState("");
+  const productPrefHydratedRef = useRef(false);
   const [iterationOptions, setIterationOptions] = useState<
-    { code: string; label: string }[]
-  >([{ code: "", label: "baseline（全部迭代）" }]);
+    { code: string; label: string; productId?: string | null }[]
+  >([{ code: "", label: "baseline（全部迭代）", productId: null }]);
   const [cases, setCases] = useState<TestCaseListItem[]>([]);
   const [loadingCases, setLoadingCases] = useState(false);
   const [folders, setFolders] = useState(initialFolders);
@@ -324,6 +424,10 @@ export function TestCaseLibraryClient({
   /** 执行任务内的执行结果（仅嵌入模式可用） */
   const [execResult, setExecResult] = useState("");
   const [execResultUpdatedIso, setExecResultUpdatedIso] = useState<string | null>(null);
+  const [execResultTextareaHeight, setExecResultTextareaHeight] = useState(
+    EXEC_RESULT_TEXTAREA_MIN_HEIGHT,
+  );
+  const [execResultTextareaPrefReady, setExecResultTextareaPrefReady] = useState(false);
   const execRunStatusAtOpen = useRef<TestCaseStatus>("BLOCKED");
   const [execRunImages, setExecRunImages] = useState<Array<{ id: string; dataUrl: string }>>(
     [],
@@ -457,6 +561,11 @@ export function TestCaseLibraryClient({
   const [folderExpandedById, setFolderExpandedById] = useState<
     Record<string, boolean>
   >({});
+  const [showFolderLevelNumber, setShowFolderLevelNumber] = useState(true);
+  const [iterationOptionsReady, setIterationOptionsReady] = useState(false);
+  const [sidebarPrefReady, setSidebarPrefReady] = useState(false);
+  const [sidebarPrefResolved, setSidebarPrefResolved] = useState(false);
+  const pendingPrefIterationCodeRef = useRef<string | null>(null);
 
   const toggleFolderExpand = useCallback((folderId: string) => {
     setFolderExpandedById((prev) => {
@@ -580,7 +689,10 @@ export function TestCaseLibraryClient({
     return list;
   }, [cases, caseSearchQuery, advFilter]);
 
-  const casePager = usePagination(filteredCases, { defaultPageSize: 20 });
+  const casePager = usePagination(filteredCases, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.testCases",
+  });
 
   const allFilteredSelected =
     filteredCases.length > 0 &&
@@ -789,9 +901,145 @@ export function TestCaseLibraryClient({
         setIterationOptions(opts);
       } catch {
         // ignore
+      } finally {
+        setIterationOptionsReady(true);
       }
     })();
   }, []);
+
+  const visibleIterationOptions = useMemo(
+    () =>
+      productId
+        ? iterationOptions.filter(
+            (o) => o.code === "" || (o.productId ?? "") === productId,
+          )
+        : iterationOptions,
+    [iterationOptions, productId],
+  );
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const ps = await listProductOptions();
+        setProducts(ps);
+      } catch {
+        setProducts([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate) setProductId(candidate);
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, products]);
+
+  useEffect(() => {
+    if (!productPrefHydratedRef.current || !productId) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [productId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const pref = await getGlobalTestCaseSidebarPreference();
+        if (cancelled) return;
+        pendingPrefIterationCodeRef.current = (pref.iterationCode ?? "").trim();
+        if (pref.folderExpandedById && typeof pref.folderExpandedById === "object") {
+          setFolderExpandedById(pref.folderExpandedById);
+        }
+      } finally {
+        if (!cancelled) setSidebarPrefReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!iterationOptionsReady || !sidebarPrefReady || sidebarPrefResolved) return;
+    const prefCode = pendingPrefIterationCodeRef.current;
+    if (prefCode === null) {
+      setSidebarPrefResolved(true);
+      return;
+    }
+    if (!prefCode) {
+      setIterationCode("");
+      pendingPrefIterationCodeRef.current = null;
+      setSidebarPrefResolved(true);
+      return;
+    }
+    if (visibleIterationOptions.some((o) => o.code === prefCode)) {
+      setIterationCode((prev) => (prev === prefCode ? prev : prefCode));
+    } else {
+      setIterationCode("");
+    }
+    pendingPrefIterationCodeRef.current = null;
+    setSidebarPrefResolved(true);
+  }, [visibleIterationOptions, iterationOptionsReady, sidebarPrefReady, sidebarPrefResolved]);
+
+  useEffect(() => {
+    if (!sidebarPrefResolved) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalTestCaseSidebarPreference({
+        iterationCode,
+        folderExpandedById,
+      });
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [iterationCode, folderExpandedById, sidebarPrefResolved]);
+
+  useEffect(() => {
+    if (!visibleIterationOptions.some((o) => o.code === iterationCode)) {
+      setIterationCode("");
+    }
+  }, [visibleIterationOptions, iterationCode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const pref = await getGlobalTestCaseExecResultHeightPreference();
+        if (cancelled) return;
+        if (typeof pref.height === "number") {
+          setExecResultTextareaHeight(clampExecResultHeight(pref.height));
+        }
+      } finally {
+        if (!cancelled) setExecResultTextareaPrefReady(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!execResultTextareaPrefReady) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalTestCaseExecResultHeightPreference({
+        height: clampExecResultHeight(execResultTextareaHeight),
+      });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [execResultTextareaHeight, execResultTextareaPrefReady]);
 
   const openCreate = (targetFolderId?: string | null) => {
     const fid = targetFolderId ?? selectedFolderId;
@@ -857,22 +1105,22 @@ export function TestCaseLibraryClient({
       if (!img) return;
       const f = img.getAsFile();
       if (!f) return;
-      // 约 1MB 保护：避免把超大 base64 写进 sqlite
-      if (f.size > 1_000_000) {
-        e.preventDefault();
-        showNotice("截图过大", "截图超过 1MB，已忽略。建议裁剪后再粘贴。");
-        return;
-      }
       e.preventDefault();
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const r = new FileReader();
-        r.onload = () => resolve(String(r.result || ""));
-        r.onerror = () => reject(new Error("read failed"));
-        r.readAsDataURL(f);
-      });
-      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      setExecRunImages((prev) => [...prev, { id, dataUrl }]);
-      // 仅追加到截图列表，不在文本里插入占位符
+      try {
+        const normalized = await normalizePastedImagePng(f);
+        if (!normalized) {
+          showNotice(
+            "截图过大",
+            "已尝试自动压缩，但截图仍超过 1MB，请手动裁剪后再粘贴。",
+          );
+          return;
+        }
+        const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        setExecRunImages((prev) => [...prev, { id, dataUrl: normalized.dataUrl }]);
+        // 仅追加到截图列表，不在文本里插入占位符
+      } catch {
+        showNotice("处理截图失败", "截图处理失败，请重试或手动裁剪后再粘贴。");
+      }
     },
     [embedMode, showNotice],
   );
@@ -1355,7 +1603,8 @@ export function TestCaseLibraryClient({
           status: recordStatus,
           executor: submitter.trim() || null,
           result: execResult.trim() || null,
-          images: execRunImages.map((x) => x.dataUrl),
+          // 通过字符串传输，规避 server action 对深层数组序列化限制
+          images: JSON.stringify(execRunImages.map((x) => x.dataUrl)),
           note: null,
         });
         if (r3.error) {
@@ -1700,9 +1949,12 @@ export function TestCaseLibraryClient({
                 className="min-w-0 flex-1 py-1 pl-0.5 pr-0.5 text-left text-xs leading-tight text-zinc-800"
                 style={{ paddingLeft: Math.max(0, depth * 10) }}
               >
-                <span className="font-medium tabular-nums text-zinc-400">
-                  {depth + 1}.
-                </span>{" "}
+                {showFolderLevelNumber ? (
+                  <span className="font-medium tabular-nums text-zinc-400">
+                    {depth + 1}.
+                  </span>
+                ) : null}
+                {showFolderLevelNumber ? " " : null}
                 <span className="font-medium">{n.name}</span>
                 <span
                   className="ml-1 shrink-0 tabular-nums text-zinc-400"
@@ -1757,6 +2009,22 @@ export function TestCaseLibraryClient({
             </p>
             <div className="mt-2">
               <label className="text-xs font-medium text-zinc-600">
+                切换产品
+              </label>
+              <select
+                className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
+                value={productId}
+                onChange={(e) => setProductId(e.target.value)}
+              >
+                {products.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.code ? `${p.name}（${p.code}）` : p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-2">
+              <label className="text-xs font-medium text-zinc-600">
                 迭代筛选
               </label>
               <select
@@ -1765,20 +2033,64 @@ export function TestCaseLibraryClient({
                 onChange={(e) => setIterationCode(e.target.value)}
                 title="baseline 表示查看全部迭代"
               >
-                {iterationOptions.map((o) => (
+                {visibleIterationOptions.map((o) => (
                   <option key={o.code || "__baseline__"} value={o.code}>
                     {o.label}
                   </option>
                 ))}
               </select>
             </div>
-            <button
-              type="button"
-              onClick={runCreateRootFolder}
-              className="mt-2 text-xs font-medium text-blue-700 hover:underline"
-            >
-              + 新建根文件夹
-            </button>
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={runCreateRootFolder}
+                className="text-xs font-medium text-blue-700 hover:underline"
+              >
+                + 新建根文件夹
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowFolderLevelNumber((prev) => !prev)}
+                className="inline-flex h-6 w-6 items-center justify-center rounded border border-zinc-300 bg-white text-zinc-500 hover:border-zinc-400 hover:text-zinc-800"
+                aria-label={showFolderLevelNumber ? "隐藏层级序号" : "显示层级序号"}
+                title={showFolderLevelNumber ? "隐藏层级序号" : "显示层级序号"}
+              >
+                {showFolderLevelNumber ? (
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="none"
+                    className="h-3.5 w-3.5"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M1.5 10c1.7-3.3 4.6-5 8.5-5s6.8 1.7 8.5 5c-1.7 3.3-4.6 5-8.5 5s-6.8-1.7-8.5-5Z"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                    />
+                    <circle cx="10" cy="10" r="2.5" stroke="currentColor" strokeWidth="1.5" />
+                  </svg>
+                ) : (
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="none"
+                    className="h-3.5 w-3.5"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M1.5 10c1.7-3.3 4.6-5 8.5-5 2.2 0 4.1.5 5.7 1.5"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                    />
+                    <path
+                      d="M18.5 10c-1.7 3.3-4.6 5-8.5 5-2.2 0-4.1-.5-5.7-1.5"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                    />
+                    <path d="M3 3l14 14" stroke="currentColor" strokeWidth="1.5" />
+                  </svg>
+                )}
+              </button>
+            </div>
           </div>
           {!embedMode && pendingDesignImportIds.length > 0 ? (
             <div className="shrink-0 border-b border-blue-200/80 bg-blue-50/95 px-3 py-2.5">
@@ -2455,9 +2767,9 @@ export function TestCaseLibraryClient({
                   {editingId ? "编辑用例" : "新建用例"}
                 </h3>
               ) : null}
-              <div className="mt-2 max-w-[820px]">
+              <div className="mt-2">
                 <input
-                  className="w-full rounded-lg border border-transparent bg-transparent px-0 py-0 text-lg font-semibold text-zinc-900 outline-none focus:border-transparent focus:ring-0"
+                  className="w-full overflow-x-auto whitespace-nowrap rounded-lg border border-transparent bg-transparent px-0 py-0 text-lg font-semibold text-zinc-900 outline-none focus:border-transparent focus:ring-0"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   placeholder="用例名称"
@@ -2594,31 +2906,6 @@ export function TestCaseLibraryClient({
                             </p>
                           </>
                         ) : null}
-                        <div
-                          className={[
-                            "space-y-1",
-                            embedMode && executionTaskId ? "mt-3" : "mt-4",
-                          ].join(" ")}
-                        >
-                          <label className="text-xs font-medium text-zinc-700">
-                            用例等级
-                          </label>
-                          <CaseLevelSelect
-                            className={[
-                              "mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm",
-                              embedMode && executionTaskId ? metaFieldCls : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" ")}
-                            disabled={
-                              Boolean(
-                                embedMode && executionTaskId && embedTaskMetaLocked,
-                              )
-                            }
-                            value={priority}
-                            onChange={(v) => setPriority(v)}
-                          />
-                        </div>
                         {embedMode && executionTaskId ? (
                           <div className="mt-3 max-h-[min(52vh,640px)] overflow-y-auto rounded-lg border border-zinc-200 bg-white">
                             {(
@@ -2706,10 +2993,18 @@ export function TestCaseLibraryClient({
                             </div>
                           ) : null}
                           <textarea
-                            className="mt-2 min-h-[120px] w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm leading-relaxed"
+                            className="mt-2 w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm leading-relaxed"
+                            style={{ height: `${execResultTextareaHeight}px` }}
                             placeholder="例如：本轮执行的实际结果、截图/日志链接、备注等"
                             value={execResult}
                             onChange={(e) => setExecResult(e.target.value)}
+                            onMouseUp={(e) =>
+                              setExecResultTextareaHeight(
+                                clampExecResultHeight(
+                                  e.currentTarget.getBoundingClientRect().height,
+                                ),
+                              )
+                            }
                             onPaste={onPasteExecResult}
                           />
                           {execRunImages.length > 0 ? (

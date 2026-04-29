@@ -13,36 +13,22 @@ import {
 import { RequirementPrioritySelect } from "@/components/RequirementPrioritySelect";
 import { ModuleWorkspaceCard } from "@/components/PageModuleLayout";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
+import {
+  beijingDatetimeLocalToIsoOrNull,
+  formatIsoBeijing,
+  isoToBeijingDatetimeLocal,
+} from "@/lib/timezone-cn";
 
 function formatOpTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
+  return formatIsoBeijing(iso, { withSeconds: true });
 }
 
 function isoToDatetimeLocal(iso: string | null | undefined): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return isoToBeijingDatetimeLocal(iso);
 }
 
 function datetimeLocalToIsoOrNull(v: string): string | null {
-  const t = v.trim();
-  if (!t) return null;
-  const d = new Date(t);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+  return beijingDatetimeLocalToIsoOrNull(v);
 }
 
 const requirementStatusLabel = {
@@ -55,8 +41,8 @@ const requirementStatusLabel = {
 const requirementStatusBadgeClass = {
   UNASSIGNED: "border-violet-500/80 bg-violet-50 text-violet-800",
   IN_DEVELOPMENT: "border-red-500/80 bg-red-50 text-red-800",
-  PENDING_VERIFICATION: "border-blue-500/80 bg-blue-50 text-blue-800",
-  CLOSED: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
+  PENDING_VERIFICATION: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
+  CLOSED: "border-blue-500/80 bg-blue-50 text-blue-800",
 } as const;
 
 export function RequirementNodeDetailClient({
@@ -74,6 +60,8 @@ export function RequirementNodeDetailClient({
   initialTestOwner,
   initialPlanStartAt,
   initialPlanEndAt,
+  initialUpdatedAt,
+  initialWbsId,
   initialAttachments,
   initialOpLogs,
 }: {
@@ -81,6 +69,7 @@ export function RequirementNodeDetailClient({
   iterationId: string;
   breadcrumb: string;
   initialTitle: string;
+  initialWbsId: string | null;
   initialDescription: string | null;
   initialTaskProgress: string | null;
   initialLatestProgress: string | null;
@@ -91,10 +80,12 @@ export function RequirementNodeDetailClient({
   initialTestOwner: string | null;
   initialPlanStartAt: string | null;
   initialPlanEndAt: string | null;
+  initialUpdatedAt: string;
   initialAttachments: { id: string; name: string; url: string; createdAt: string }[];
   initialOpLogs: RequirementOpLogRow[];
 }) {
   const [title, setTitle] = useState(initialTitle);
+  const [wbsId, setWbsId] = useState(initialWbsId ?? "");
   const [description, setDescription] = useState(initialDescription ?? "");
   const [taskProgress, setTaskProgress] = useState(initialTaskProgress ?? "");
   const [latestProgress, setLatestProgress] = useState(
@@ -115,6 +106,7 @@ export function RequirementNodeDetailClient({
   const [planEndLocal, setPlanEndLocal] = useState(() =>
     isoToDatetimeLocal(initialPlanEndAt),
   );
+  const [updatedAt, setUpdatedAt] = useState(initialUpdatedAt);
   const [msg, setMsg] = useState<ActionResult | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -153,6 +145,7 @@ export function RequirementNodeDetailClient({
     const r = await updateRequirementNodeDetail({
       id: nodeId,
       title,
+      wbsId: wbsId.trim() || null,
       description: description.trim() || null,
       taskProgress: taskProgress.trim() || null,
       latestProgress: latestProgress.trim() || null,
@@ -171,6 +164,7 @@ export function RequirementNodeDetailClient({
         taskProgress.trim() || null,
       );
       if (derived !== null) setStatus(derived);
+      setUpdatedAt(new Date().toISOString());
       void refreshOpLogs();
     }
   };
@@ -280,6 +274,22 @@ export function RequirementNodeDetailClient({
                 }}
                 placeholder="任务名称"
               />
+              <label className="mt-3 block text-xs font-medium text-zinc-600">
+                WBS 编号
+              </label>
+              <input
+                className="mt-0.5 w-full max-w-md rounded-lg border border-zinc-200 px-2 py-1.5 text-sm font-mono tabular-nums text-zinc-800 outline-none focus:ring-2 focus:ring-zinc-300"
+                value={wbsId}
+                onChange={(e) => {
+                  setWbsId(e.target.value);
+                  setMsg(null);
+                }}
+                placeholder="如 1、1.1、2.1.2（同一迭代内需唯一，可留空）"
+                aria-label="WBS 编号"
+              />
+              <div className="mt-1 text-xs text-zinc-500">
+                修改时间：{formatOpTs(updatedAt)}
+              </div>
             </div>
             <p className="mt-1 text-xs text-zinc-500">
               编辑任务名称、优先级与描述；保存后将在测试设计中作为挂载对象使用。

@@ -4,22 +4,47 @@ import type React from "react";
 import type { TestDesignType } from "@prisma/client";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   bulkDeleteTestDesignNodes,
+  bulkDuplicateTestDesignNodes,
   bulkMoveTestDesignNodes,
+  bulkMoveAllTestDesignsBetweenRequirements,
+  bulkUpdateTestDesignNodes,
+  countTestDesignByDirSubtree,
+  countTestDesignByDirSubtreeForRequirements,
   countTestDesignsForCategoryHide,
-  countTestDesignsForCustomDirHide,
+  createTestDesignDir,
   createTestDesignNode,
   countTestDesignByRequirement,
   countTestDesignByType,
+  countTestDesignByTypeForRequirements,
   deleteTestDesignNode,
+  deleteTestDesignDir,
   getTestDesignFlat,
+  getTestDesignFlatForRequirements,
   getTestDesignsExportRows,
+  listTestDesignDirs,
   listRequirementsForDesignTree,
+  moveTestDesignDir,
+  renameTestDesignDir,
   type RequirementTreeFlat,
   type TestDesignFlat,
 } from "@/app/actions/test-design";
+import {
+  getGlobalIterationProductPreference,
+  getGlobalTestDesignIterationPreference,
+  saveGlobalIterationProductPreference,
+  saveGlobalTestDesignIterationPreference,
+} from "@/app/actions/executions";
+import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
   ModuleWorkspaceCard,
   MODULE_TOOLBAR_BTN_PRIMARY,
@@ -33,12 +58,38 @@ import {
 } from "@/hooks/useTestDesignListColumns";
 import { usePagination } from "@/hooks/usePagination";
 import { testDesignTypeLabel, testDesignTypeOptions } from "@/lib/test-labels";
+import { compareWbsId } from "@/lib/wbs-id";
 import { buildTree, type TreeNode } from "@/lib/tree";
 
 const PENDING_TEST_DESIGN_IMPORT_STORAGE = "pm-pending-test-design-import";
 
 type Node = TreeNode<TestDesignFlat>;
 type ReqNode = TreeNode<RequirementTreeFlat>;
+
+function collectReqSubtreeIds(
+  rootId: string,
+  flat: RequirementTreeFlat[],
+): string[] {
+  if (!rootId) return [];
+  const children = new Map<string, string[]>();
+  for (const r of flat) {
+    if (!r.parentId) continue;
+    const arr = children.get(r.parentId) ?? [];
+    arr.push(r.id);
+    children.set(r.parentId, arr);
+  }
+  const out: string[] = [];
+  const stack = [rootId];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    out.push(cur);
+    for (const cid of children.get(cur) ?? []) stack.push(cid);
+  }
+  return out;
+}
 
 /** 展开需求树中通往 requirementId 的各级父节点 */
 function expandRequirementAncestors(
@@ -62,40 +113,31 @@ type CategoryItem = {
 };
 
 const CATEGORY_STORAGE_KEY = "pm-test-design-categories-v1";
-const CUSTOM_DIR_STORAGE_KEY = "pm-test-design-custom-dirs-v1";
+type CustomDir = {
+  id: string;
+  label: string;
+  parentType: TestDesignType;
+  parentId: string | null;
+};
 
-type CustomDir = { id: string; label: string; hidden?: boolean };
+type CustomDirNode = CustomDir & { children: CustomDirNode[] };
 
-function loadCustomDirs(): CustomDir[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = localStorage.getItem(CUSTOM_DIR_STORAGE_KEY);
-    if (!raw) return [];
-    const j = JSON.parse(raw) as unknown;
-    if (!Array.isArray(j)) return [];
-    const out: CustomDir[] = [];
-    for (const it of j) {
-      if (!it || typeof it !== "object") continue;
-      const rec = it as unknown as Record<string, unknown>;
-      const id = typeof rec.id === "string" ? rec.id : "";
-      const label = typeof rec.label === "string" ? rec.label : "";
-      const hidden = Boolean(rec.hidden);
-      if (!id || !label.trim()) continue;
-      out.push({ id, label: label.trim(), hidden });
-    }
-    return out;
-  } catch {
-    return [];
+function buildCustomDirTree(items: CustomDir[]): CustomDirNode[] {
+  const map = new Map<string, CustomDirNode>();
+  for (const it of items) map.set(it.id, { ...it, children: [] });
+  const roots: CustomDirNode[] = [];
+  for (const it of items) {
+    const node = map.get(it.id)!;
+    if (it.parentId && map.has(it.parentId)) map.get(it.parentId)!.children.push(node);
+    else roots.push(node);
   }
-}
-
-function saveCustomDirs(list: CustomDir[]) {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(CUSTOM_DIR_STORAGE_KEY, JSON.stringify(list));
-}
-
-function dirTag(label: string): string {
-  return `【${label}】`;
+  // 默认按 label 排序（目录没有 wbs），更直观
+  const sortRec = (nodes: CustomDirNode[]) => {
+    nodes.sort((a, b) => a.label.localeCompare(b.label, "zh-CN"));
+    for (const n of nodes) sortRec(n.children);
+  };
+  sortRec(roots);
+  return roots;
 }
 
 function stripDirTag(title: string): string {
@@ -184,14 +226,14 @@ function TreeRows({
   depth,
   requirementId,
   iterationCode,
-  customDirLabel,
+  dirId,
   onAdded,
 }: {
   nodes: Node[];
   depth: number;
   requirementId: string;
   iterationCode: string;
-  customDirLabel: string | null;
+  dirId: string | null;
   onAdded: () => void;
 }) {
   const [addingFor, setAddingFor] = useState<string | null>(null);
@@ -210,12 +252,10 @@ function TreeRows({
     const r = await createTestDesignNode({
       requirementId,
       parentId,
-      title:
-        customDirLabel && (parentType ?? "FUNCTIONAL") === "OTHER"
-          ? `${dirTag(customDirLabel)} ${titleDraft}`.trim()
-          : titleDraft,
+      title: titleDraft,
       type: parentType ?? ("FUNCTIONAL" as TestDesignType),
       iterationCode,
+      dirId,
     });
     setBusy(false);
     if (r.error) {
@@ -258,9 +298,7 @@ function TreeRows({
               href={`/test-design/node/${n.id}`}
               className="flex-1 truncate text-sm font-medium text-zinc-900 underline-offset-2 hover:underline"
             >
-              {customDirLabel && n.type === "OTHER"
-                ? stripDirTag(n.title) || n.title
-                : n.title}
+              {stripDirTag(n.title) || n.title}
             </Link>
             <span className="shrink-0 rounded bg-zinc-200 px-1.5 py-0.5 text-xs text-zinc-700">
               {testDesignTypeLabel[n.type]}
@@ -321,7 +359,7 @@ function TreeRows({
               depth={depth + 1}
               requirementId={requirementId}
               iterationCode={iterationCode}
-              customDirLabel={customDirLabel}
+              dirId={dirId}
               onAdded={onAdded}
             />
           )}
@@ -333,14 +371,82 @@ function TreeRows({
 
 export function TestDesignTreeClient({
   iterations,
+  initialIterationCode = "",
+  initialRequirementId = "",
 }: {
-  iterations: { code: string; label: string }[];
+  iterations: { code: string; label: string; productId?: string | null }[];
+  /** 由服务端 page 解析 query，避免首屏 iterationCode 为空时误请求空列表 */
+  initialIterationCode?: string;
+  initialRequirementId?: string;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const urlNavOnceRef = useRef(false);
-  const urlPendingRequirementIdRef = useRef<string | null>(null);
-  const [iterationCode, setIterationCode] = useState<string>("");
+  const [products, setProducts] = useState<ProductOption[]>([]);
+  const [productId, setProductId] = useState("");
+  const productPrefHydratedRef = useRef(false);
+  const hasUrlIterationCode = !!initialIterationCode.trim();
+  const urlPendingRequirementIdRef = useRef<string | null>(
+    initialRequirementId.trim() || null,
+  );
+  const deeplinkScrollReqIdRef = useRef<string | null>(null);
+  const lastSyncedLocationSearchRef = useRef<string | undefined>(undefined);
+  const [iterationCode, setIterationCode] = useState<string>(() => {
+    const ic = initialIterationCode.trim();
+    if (!ic) return "";
+    return iterations.some((it) => it.code === ic) ? ic : "";
+  });
+  const iterationPrefHydratedRef = useRef(false);
+  const visibleIterations = useMemo(
+    () =>
+      productId
+        ? iterations.filter((it) => (it.productId ?? "") === productId || it.code === "")
+        : iterations,
+    [iterations, productId],
+  );
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const ps = await listProductOptions();
+        setProducts(ps);
+      } catch {
+        setProducts([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate) setProductId(candidate);
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, products]);
+
+  useEffect(() => {
+    if (!productPrefHydratedRef.current || !productId) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [productId]);
+
+  useEffect(() => {
+    if (!visibleIterations.some((it) => it.code === iterationCode)) {
+      setIterationCode("");
+    }
+  }, [visibleIterations, iterationCode]);
   const [topPaneH, setTopPaneH] = useState(138);
   const [reqFlat, setReqFlat] = useState<RequirementTreeFlat[]>([]);
   const [selectedReqId, setSelectedReqId] = useState<string>("");
@@ -355,11 +461,14 @@ export function TestDesignTreeClient({
     defaultCategoriesForHydration(),
   );
   const [customDirs, setCustomDirs] = useState<CustomDir[]>([]);
-  const [selectedCustomDirId, setSelectedCustomDirId] = useState<string | null>(
-    null,
-  );
+  const [selectedCustomDirId, setSelectedCustomDirId] = useState<string | null>(null);
+  const [dirExpandedById, setDirExpandedById] = useState<Record<string, boolean>>({});
+  const dragDirIdRef = useRef<string | null>(null);
   const [reqSearch, setReqSearch] = useState("");
   const [designSearch, setDesignSearch] = useState("");
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkEditType, setBulkEditType] = useState<TestDesignType | "">("");
+  const [bulkEditDirId, setBulkEditDirId] = useState<string>(""); // "" 不修改；"__clear__" 清空；否则 dirId
   const [countsByType, setCountsByType] = useState<Record<TestDesignType, number>>({
     FUNCTIONAL: 0,
     PERFORMANCE: 0,
@@ -370,16 +479,23 @@ export function TestDesignTreeClient({
     OTHER: 0,
   });
   const [otherFlatAll, setOtherFlatAll] = useState<TestDesignFlat[]>([]);
+  const [dirCountsById, setDirCountsById] = useState<Record<string, number>>({});
   const [reqDesignCounts, setReqDesignCounts] = useState<Record<string, number>>(
     {},
   );
   const [expandedReq, setExpandedReq] = useState<Record<string, boolean>>({});
+  /** 设计数据变更触发计数刷新（否则 iterationCode/reqFlat 未变时不会重算） */
+  const [designRevision, setDesignRevision] = useState(0);
 
   const [selectedDesignIds, setSelectedDesignIds] = useState<string[]>([]);
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   const [batchWorking, setBatchWorking] = useState(false);
   const [moveModalOpen, setMoveModalOpen] = useState(false);
   const [moveTargetReqId, setMoveTargetReqId] = useState<string>("");
+  const [moveTargetIterationCode, setMoveTargetIterationCode] = useState<string>("");
+  const [moveReqOptions, setMoveReqOptions] = useState<RequirementTreeFlat[]>([]);
+  const [moveAllModalOpen, setMoveAllModalOpen] = useState(false);
+  const [moveAllSourceReqId, setMoveAllSourceReqId] = useState<string>("");
   const [newCustomDirOpen, setNewCustomDirOpen] = useState(false);
   const [newCustomDirName, setNewCustomDirName] = useState("");
   const newCustomDirInputRef = useRef<HTMLInputElement | null>(null);
@@ -399,6 +515,9 @@ export function TestDesignTreeClient({
     updatedTo: "",
   });
 
+  const TOP_PANE_DEFAULT_H = 138;
+  const topPaneLastNonZeroRef = useRef<number>(TOP_PANE_DEFAULT_H);
+
   const [catPaneW, setCatPaneW] = useState(140);
   const {
     config: designColConfig,
@@ -411,11 +530,9 @@ export function TestDesignTreeClient({
   } = useTestDesignListColumns();
   const [designGearOpen, setDesignGearOpen] = useState(false);
   const skipFirstCategoriesPersist = useRef(true);
-  const skipFirstCustomDirsPersist = useRef(true);
 
   useEffect(() => {
     setCategories(loadCategories());
-    setCustomDirs(loadCustomDirs());
   }, []);
 
   const startResizeCatPane = useCallback(
@@ -471,33 +588,58 @@ export function TestDesignTreeClient({
     }
     saveCategories(categories);
   }, [categories]);
+
   useEffect(() => {
-    if (skipFirstCustomDirsPersist.current) {
-      skipFirstCustomDirsPersist.current = false;
-      return;
-    }
-    saveCustomDirs(customDirs);
-  }, [customDirs]);
+    (async () => {
+      const r = await listTestDesignDirs({ iterationCode });
+      if (r.error) {
+        setCustomDirs([]);
+        return;
+      }
+      const rows = r.rows ?? [];
+      setCustomDirs(
+        rows.map((x) => ({
+          id: x.id,
+          label: x.name,
+          parentType: x.type,
+          parentId: x.parentId,
+        })),
+      );
+      // 默认展开根目录
+      setDirExpandedById((prev) => {
+        const next = { ...prev };
+        for (const row of rows) {
+          if (!row.parentId && next[row.id] === undefined) next[row.id] = true;
+        }
+        return next;
+      });
+    })();
+  }, [iterationCode]);
 
   const visibleCategories = useMemo(
     () => categories.filter((c) => !c.hidden),
     [categories],
   );
-  const visibleCustomDirs = useMemo(
-    () => customDirs.filter((d) => !d.hidden),
-    [customDirs],
-  );
+  const visibleCustomDirs = useMemo(() => {
+    return customDirs;
+  }, [customDirs]);
+  const visibleCustomDirsByType = useMemo(() => {
+    const m = new Map<TestDesignType, CustomDir[]>();
+    for (const d of visibleCustomDirs) {
+      const arr = m.get(d.parentType) ?? [];
+      arr.push(d);
+      m.set(d.parentType, arr);
+    }
+    return m;
+  }, [visibleCustomDirs]);
   const hiddenCategoriesForRestore = useMemo(
     () => categories.filter((c) => c.hidden),
     [categories],
   );
-  const hiddenCustomDirsForRestore = useMemo(
-    () => customDirs.filter((d) => d.hidden),
-    [customDirs],
-  );
-  const activeCustomDirLabel = useMemo(() => {
+  const hiddenCustomDirsForRestore = useMemo<CustomDir[]>(() => [], []);
+  const activeCustomDir = useMemo(() => {
     if (!selectedCustomDirId) return null;
-    return visibleCustomDirs.find((d) => d.id === selectedCustomDirId)?.label ?? null;
+    return visibleCustomDirs.find((d) => d.id === selectedCustomDirId) ?? null;
   }, [selectedCustomDirId, visibleCustomDirs]);
 
   useEffect(() => {
@@ -507,9 +649,11 @@ export function TestDesignTreeClient({
   }, [category, visibleCategories]);
 
   useEffect(() => {
-    // 非 OTHER 时不使用自定义目录
-    if (category !== "OTHER") setSelectedCustomDirId(null);
-  }, [category]);
+    // 切换类别时，若当前目录不属于该类别则清空
+    if (activeCustomDir && activeCustomDir.parentType !== category) {
+      setSelectedCustomDirId(null);
+    }
+  }, [activeCustomDir, category]);
 
   useEffect(() => {
     if (!newCustomDirOpen) return;
@@ -532,10 +676,34 @@ export function TestDesignTreeClient({
   const submitNewCustomDir = () => {
     const name = newCustomDirName.trim();
     if (!name) return;
-    const id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    setCustomDirs((prev) => [...prev, { id, label: name, hidden: false }]);
-    setNewCustomDirOpen(false);
-    setNewCustomDirName("");
+    const ic = iterationCode.trim();
+    if (!ic) {
+      window.alert("请先选择具体迭代（baseline 不支持维护子目录）。");
+      return;
+    }
+    (async () => {
+      const r = await createTestDesignDir({
+        iterationCode: ic,
+        type: category,
+        parentId: null,
+        name,
+      });
+      if (r.error) {
+        window.alert(r.error);
+        return;
+      }
+      const r2 = await listTestDesignDirs({ iterationCode });
+      setCustomDirs(
+        (r2.rows ?? []).map((x) => ({
+          id: x.id,
+          label: x.name,
+          parentType: x.type,
+          parentId: x.parentId,
+        })),
+      );
+      setNewCustomDirOpen(false);
+      setNewCustomDirName("");
+    })();
   };
 
   const openRestoreHiddenModal = () => {
@@ -559,9 +727,6 @@ export function TestDesignTreeClient({
   };
 
   const restoreHiddenCustomDir = (id: string) => {
-    setCustomDirs((prev) =>
-      prev.map((x) => (x.id === id ? { ...x, hidden: false } : x)),
-    );
     setRestoreHiddenOpen(false);
   };
 
@@ -604,36 +769,20 @@ export function TestDesignTreeClient({
 
   const confirmHideCustomDir = useCallback(
     async (id: string, label: string) => {
-      const r = await countTestDesignsForCustomDirHide({
-        customDirLabel: label,
-        iterationCode,
-      });
-      if ("error" in r) {
-        setHideBlockedDialog({
-          title: "不可删除",
-          detail: `校验时出错，暂时不能从侧栏删除自定义目录「${label}」。\n\n原因：${r.error}`,
-        });
+      if (!window.confirm(`确定删除自定义目录「${label}」？删除后不可恢复。`)) return;
+      const r = await deleteTestDesignDir(id);
+      if (r.error) {
+        setHideBlockedDialog({ title: "不可删除", detail: r.error });
         return;
       }
-      if (r.count > 0) {
-        const scope = iterationCode.trim()
-          ? "当前迭代筛选下"
-          : "全部迭代范围内";
-        setHideBlockedDialog({
-          title: "不可删除",
-          detail: `「${label}」目录下仍有关联的测试设计（「其他」类且标题以「【${label}】」开头）。\n\n原因：${scope}仍有 ${r.count} 条。请先迁移、删除或改标题后再从侧栏删除该目录。`,
-        });
-        return;
-      }
-      if (
-        !window.confirm(
-          `确定从侧栏删除自定义目录「${label}」？仅移除侧栏入口，数据仍保留；可在「恢复隐藏」中找回。`,
-        )
-      ) {
-        return;
-      }
-      setCustomDirs((prev) =>
-        prev.map((x) => (x.id === id ? { ...x, hidden: true } : x)),
+      const r2 = await listTestDesignDirs({ iterationCode });
+      setCustomDirs(
+        (r2.rows ?? []).map((x) => ({
+          id: x.id,
+          label: x.name,
+          parentType: x.type,
+          parentId: x.parentId,
+        })),
       );
     },
     [iterationCode],
@@ -645,58 +794,133 @@ export function TestDesignTreeClient({
       return;
     }
     setLoading(true);
-    const data = await getTestDesignFlat({
-      requirementId: selectedReqId,
+    const dirId =
+      activeCustomDir && activeCustomDir.parentType === category
+        ? activeCustomDir.id
+        : null;
+    const scopeReqIds = collectReqSubtreeIds(selectedReqId, reqFlat);
+    const data = await getTestDesignFlatForRequirements({
+      requirementIds: scopeReqIds,
       iterationCode: iterationCode === "" ? "" : iterationCode,
       type: category,
+      dirId,
     });
     setFlat(data);
     setLoading(false);
-  }, [category, iterationCode, selectedReqId]);
+  }, [activeCustomDir, category, iterationCode, selectedReqId, reqFlat]);
 
-  const startResizeTopPane = useCallback(
-    (startX: number, startY: number) => {
-      const sy = startY;
-      const h0 = topPaneH;
-      const move = (ev: globalThis.MouseEvent) => {
-        const dy = ev.clientY - sy;
-        setTopPaneH(Math.min(360, Math.max(96, h0 + dy)));
-      };
-      const up = () => {
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
-      };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
-    },
-    [topPaneH],
-  );
+  const startResizeTopPane = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const el = e.currentTarget as HTMLElement;
+    el.setPointerCapture?.(e.pointerId);
+    const sy = e.clientY;
+    const h0 = topPaneH;
+    const move = (ev: PointerEvent) => {
+      const dy = ev.clientY - sy;
+      // 允许把下方区域“压到底”：最大高度跟随窗口高度
+      // 约减掉页面外层 padding + 卡片边框等，避免拖拽到完全超出可视
+      const maxH = Math.max(0, Math.floor(window.innerHeight - 140));
+      const next = Math.min(maxH, Math.max(0, h0 + dy));
+      if (next > 24) topPaneLastNonZeroRef.current = next;
+      setTopPaneH(next);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      try {
+        el.releasePointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }, [topPaneH]);
+
+  const topPaneCollapsed = topPaneH <= 24;
+  const restoreTopPane = useCallback(() => {
+    setTopPaneH((cur) => {
+      if (cur > 24) {
+        topPaneLastNonZeroRef.current = cur;
+        return 0;
+      }
+      return Math.max(96, topPaneLastNonZeroRef.current || TOP_PANE_DEFAULT_H);
+    });
+  }, []);
 
   useEffect(() => {
     reload();
   }, [reload]);
 
-  useEffect(() => {
-    if (urlNavOnceRef.current) return;
-    const ic = searchParams.get("iterationCode")?.trim() ?? "";
-    const rq = searchParams.get("requirementId")?.trim() ?? "";
-    if (!ic && !rq) return;
-    urlNavOnceRef.current = true;
-    if (rq) urlPendingRequirementIdRef.current = rq;
-    if (ic && iterations.some((it) => it.code === ic)) {
-      setIterationCode(ic);
+  /** 从地址栏同步迭代/需求（详情链回）；首帧用 location 避免 useSearchParams 滞后。qs 未变则不再覆盖，避免下拉改迭代后被 URL 打回 */
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+    const qs = window.location.search;
+    if (lastSyncedLocationSearchRef.current === qs) return;
+
+    const sp = new URLSearchParams(qs);
+    let ic = sp.get("iterationCode")?.trim() ?? "";
+    let rq = sp.get("requirementId")?.trim() ?? "";
+    if (!ic) ic = searchParams.get("iterationCode")?.trim() ?? "";
+    if (!rq) rq = searchParams.get("requirementId")?.trim() ?? "";
+
+    if (!ic && !rq) {
+      lastSyncedLocationSearchRef.current = qs;
+      return;
     }
-    router.replace("/test-design", { scroll: false });
-  }, [searchParams, iterations, router]);
+    if (rq) urlPendingRequirementIdRef.current = rq;
+
+    if (ic) {
+      const ok = visibleIterations.some((it) => it.code === ic);
+      if (!ok && visibleIterations.length === 0) return;
+      if (ok) setIterationCode(ic);
+    }
+    lastSyncedLocationSearchRef.current = qs;
+  }, [searchParams, visibleIterations]);
 
   useEffect(() => {
+    if (hasUrlIterationCode) {
+      iterationPrefHydratedRef.current = true;
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalTestDesignIterationPreference();
+      if (cancelled) return;
+      const candidate = (pref.iterationCode ?? "").trim();
+      if (!candidate) {
+        setIterationCode("");
+      } else if (visibleIterations.some((it) => it.code === candidate)) {
+        setIterationCode((prev) => (prev === candidate ? prev : candidate));
+      }
+      iterationPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasUrlIterationCode, visibleIterations]);
+
+  useEffect(() => {
+    if (!iterationPrefHydratedRef.current) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalTestDesignIterationPreference({ iterationCode });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [iterationCode]);
+
+  useEffect(() => {
+    let cancelled = false;
     (async () => {
       const rows = await listRequirementsForDesignTree(iterationCode);
+      if (cancelled) return;
       setReqFlat(rows);
       const pending = urlPendingRequirementIdRef.current;
       if (pending && rows.some((r) => r.id === pending)) {
         setSelectedReqId(pending);
         urlPendingRequirementIdRef.current = null;
+        deeplinkScrollReqIdRef.current = pending;
         setExpandedReq((prev) => ({
           ...prev,
           ...expandRequirementAncestors(pending, rows),
@@ -707,7 +931,22 @@ export function TestDesignTreeClient({
         setSelectedReqId(rows[0]?.id ?? "");
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [iterationCode]);
+
+  useEffect(() => {
+    const target = deeplinkScrollReqIdRef.current;
+    if (!target || target !== selectedReqId || reqFlat.length === 0) return;
+    requestAnimationFrame(() => {
+      const el = document.querySelector(
+        `[data-td-req-row="${CSS.escape(target)}"]`,
+      );
+      el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      deeplinkScrollReqIdRef.current = null;
+    });
+  }, [selectedReqId, reqFlat]);
 
   useEffect(() => {
     // 初始化需求树展开：默认展开根
@@ -731,9 +970,28 @@ export function TestDesignTreeClient({
         iterationCode: code,
         requirementIds: reqFlat.map((r) => r.id),
       });
-      setReqDesignCounts(m);
+      // 父需求展示其子树的设计数：将直接计数向上汇总到父节点
+      const children = new Map<string, string[]>();
+      for (const r of reqFlat) {
+        if (!r.parentId) continue;
+        const arr = children.get(r.parentId) ?? [];
+        arr.push(r.id);
+        children.set(r.parentId, arr);
+      }
+      const memo = new Map<string, number>();
+      const dfs = (id: string): number => {
+        const hit = memo.get(id);
+        if (hit !== undefined) return hit;
+        let t = typeof m[id] === "number" ? m[id] : 0;
+        for (const cid of children.get(id) ?? []) t += dfs(cid);
+        memo.set(id, t);
+        return t;
+      };
+      const out: Record<string, number> = {};
+      for (const r of reqFlat) out[r.id] = dfs(r.id);
+      setReqDesignCounts(out);
     })();
-  }, [iterationCode, reqFlat]);
+  }, [iterationCode, reqFlat, designRevision]);
 
   useEffect(() => {
     (async () => {
@@ -748,42 +1006,63 @@ export function TestDesignTreeClient({
           OTHER: 0,
         });
         setOtherFlatAll([]);
+        setDirCountsById({});
         return;
       }
       const code = iterationCode === "" ? "" : iterationCode;
-      const counts = await countTestDesignByType({
-        requirementId: selectedReqId,
+      const scopeReqIds = collectReqSubtreeIds(selectedReqId, reqFlat);
+      const counts = await countTestDesignByTypeForRequirements({
+        requirementIds: scopeReqIds,
         iterationCode: code,
       });
       setCountsByType(counts);
       if (code === "") {
         setOtherFlatAll([]);
+        setDirCountsById({});
         return;
       }
-      const other = await getTestDesignFlat({
-        requirementId: selectedReqId,
+      const other = await getTestDesignFlatForRequirements({
+        requirementIds: scopeReqIds,
         iterationCode: code,
         type: "OTHER",
       });
       setOtherFlatAll(other);
+
+      const dirCountRes = await countTestDesignByDirSubtreeForRequirements({
+        requirementIds: scopeReqIds,
+        iterationCode: code,
+      });
+      if (dirCountRes.error || !dirCountRes.counts) {
+        setDirCountsById({});
+      } else {
+        setDirCountsById(dirCountRes.counts);
+      }
     })();
-  }, [iterationCode, selectedReqId]);
+  }, [customDirs, iterationCode, selectedReqId, reqFlat, designRevision]);
 
   const filteredReqFlat = useMemo(() => {
     if (!reqSearch.trim()) return reqFlat;
     return filterTreeKeepAncestors(reqFlat, (r) => matchesText(r.title, reqSearch));
   }, [reqFlat, reqSearch]);
-  const reqTree = useMemo(() => buildTree(filteredReqFlat), [filteredReqFlat]);
+  const reqTree = useMemo(() => {
+    const tree = buildTree(filteredReqFlat);
+    const sortRec = (nodes: ReqNode[]): ReqNode[] => {
+      const out = [...nodes]
+        .map((n) => ({ ...n, children: sortRec(n.children) }))
+        .sort((a, b) => compareWbsId(a.wbsId, b.wbsId) || a.title.localeCompare(b.title, "zh-CN"));
+      return out;
+    };
+    return sortRec(tree);
+  }, [filteredReqFlat]);
 
   const filteredDesignFlat = useMemo(() => {
     if (!designSearch.trim()) return flat;
     return filterTreeKeepAncestors(flat, (r) => matchesText(r.title, designSearch));
   }, [designSearch, flat]);
   const filteredByCustomDir = useMemo(() => {
-    if (category !== "OTHER" || !activeCustomDirLabel) return filteredDesignFlat;
-    const tag = dirTag(activeCustomDirLabel);
-    return filteredDesignFlat.filter((r) => r.title.startsWith(tag));
-  }, [activeCustomDirLabel, category, filteredDesignFlat]);
+    if (!activeCustomDir || activeCustomDir.parentType !== category) return filteredDesignFlat;
+    return filteredDesignFlat.filter((r) => r.dirId === activeCustomDir.id);
+  }, [activeCustomDir, category, filteredDesignFlat]);
 
   const listRows = useMemo(() => {
     const q = adv.titleContains.trim().toLowerCase();
@@ -820,7 +1099,10 @@ export function TestDesignTreeClient({
       .sort((a, b) => a.sortOrder - b.sortOrder);
   }, [adv, filteredByCustomDir]);
 
-  const designPager = usePagination(listRows, { defaultPageSize: 20 });
+  const designPager = usePagination(listRows, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.testDesign",
+  });
   const pagedDesignRows = designPager.pagedItems;
 
   const runBatchExport = useCallback(async () => {
@@ -859,6 +1141,53 @@ export function TestDesignTreeClient({
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }, [selectedDesignIds]);
 
+  const bulkEditTreeOptions = useMemo(() => {
+    const out: Array<{ value: string; label: string }> = [];
+    for (const t of testDesignTypeOptions) {
+      out.push({ value: `type:${t.value}`, label: t.label });
+      const dirs = customDirs.filter((d) => d.parentType === t.value);
+      const tree = buildCustomDirTree(dirs);
+      const walk = (nodes: CustomDirNode[], depth: number) => {
+        for (const n of nodes) {
+          const indent = `${"—".repeat(Math.min(12, (depth + 1) * 2))} `;
+          out.push({ value: `dir:${n.id}`, label: `${indent}${n.label}`.trim() });
+          if (n.children.length > 0) walk(n.children, depth + 1);
+        }
+      };
+      walk(tree, 0);
+    }
+    return out;
+  }, [customDirs]);
+
+  const runBatchEdit = useCallback(async () => {
+    if (selectedDesignIds.length === 0) return;
+    if (!bulkEditType && !bulkEditDirId) {
+      window.alert("请至少选择一个要修改的字段（类别或目录）。");
+      return;
+    }
+    setBatchWorking(true);
+    const r = await bulkUpdateTestDesignNodes({
+      ids: selectedDesignIds,
+      type: bulkEditType ? bulkEditType : null,
+      dirId:
+        bulkEditDirId === ""
+          ? undefined
+          : bulkEditDirId === "__clear__"
+            ? null
+            : bulkEditDirId,
+    });
+    setBatchWorking(false);
+    if (r.error) {
+      window.alert(r.error);
+      return;
+    }
+    setBulkEditOpen(false);
+    setBulkEditType("");
+    setBulkEditDirId("");
+    await reload();
+    setDesignRevision((x) => x + 1);
+  }, [bulkEditDirId, bulkEditType, reload, selectedDesignIds]);
+
   const runBatchDelete = useCallback(async () => {
     if (selectedDesignIds.length === 0) return;
     if (!window.confirm(`确定批量删除已选 ${selectedDesignIds.length} 条设计？`)) return;
@@ -867,14 +1196,48 @@ export function TestDesignTreeClient({
     setBatchWorking(false);
     if (r.error) return;
     setSelectedDesignIds([]);
-    reload();
+    await reload();
+    setDesignRevision((x) => x + 1);
   }, [reload, selectedDesignIds]);
+
+  const runBatchDuplicate = useCallback(async () => {
+    if (selectedDesignIds.length === 0) return;
+    setBatchWorking(true);
+    const dirId =
+      activeCustomDir && activeCustomDir.parentType === category
+        ? activeCustomDir.id
+        : null;
+    const r = await bulkDuplicateTestDesignNodes({
+      ids: selectedDesignIds,
+      targetType: category,
+      targetDirId: dirId,
+    });
+    setBatchWorking(false);
+    if (r.error) return;
+    setSelectedDesignIds([]);
+    await reload();
+    setDesignRevision((x) => x + 1);
+  }, [activeCustomDir, category, reload, selectedDesignIds]);
 
   const runBatchMove = useCallback(async () => {
     if (selectedDesignIds.length === 0) return;
+    setMoveTargetIterationCode(iterationCode);
     setMoveTargetReqId(selectedReqId);
     setMoveModalOpen(true);
   }, [selectedDesignIds.length, selectedReqId]);
+
+  useEffect(() => {
+    if (!moveModalOpen) return;
+    (async () => {
+      const code = moveTargetIterationCode.trim();
+      const rows = await listRequirementsForDesignTree(code ? code : undefined);
+      setMoveReqOptions(rows);
+      // 若当前目标不在列表中，则默认选中第一条
+      if (!rows.some((r) => r.id === moveTargetReqId)) {
+        setMoveTargetReqId(rows[0]?.id ?? "");
+      }
+    })();
+  }, [moveModalOpen, moveTargetIterationCode, moveTargetReqId]);
 
   const confirmBatchMove = useCallback(async () => {
     setBatchWorking(true);
@@ -886,7 +1249,8 @@ export function TestDesignTreeClient({
     if (r.error) return;
     setMoveModalOpen(false);
     setSelectedDesignIds([]);
-    reload();
+    await reload();
+    setDesignRevision((x) => x + 1);
   }, [moveTargetReqId, reload, selectedDesignIds]);
 
   const runBatchImport = useCallback(() => {
@@ -917,21 +1281,105 @@ export function TestDesignTreeClient({
     el.checked = allSelected;
   }, [pagedDesignRows, selectedDesignIds]);
   const reqById = useMemo(() => new Map(reqFlat.map((r) => [r.id, r])), [reqFlat]);
+
+  const moveReqSelectOptions = useMemo(() => {
+    const tree = buildTree(moveReqOptions);
+    const sortRec = (nodes: ReqNode[]): ReqNode[] =>
+      [...nodes]
+        .map((n) => ({ ...n, children: sortRec(n.children) }))
+        .sort(
+          (a, b) =>
+            compareWbsId(a.wbsId, b.wbsId) ||
+            a.title.localeCompare(b.title, "zh-CN"),
+        );
+    const sorted = sortRec(tree);
+    const out: Array<{ id: string; label: string }> = [];
+    const walk = (nodes: ReqNode[], depth: number) => {
+      for (const n of nodes) {
+        const indent = depth <= 0 ? "" : `${"—".repeat(Math.min(12, depth * 2))} `;
+        const wbs = n.wbsId?.trim() ? `${n.wbsId} ` : "";
+        const iter = n.iterationLabel ? `${n.iterationLabel} / ` : "";
+        out.push({ id: n.id, label: `${indent}${iter}${wbs}${n.title}`.trim() });
+        if (n.children.length > 0) walk(n.children, depth + 1);
+      }
+    };
+    walk(sorted, 0);
+    return out;
+  }, [moveReqOptions]);
+
+  /** 整需求迁入：源需求下拉（当前迭代需求树，排除当前选中需求） */
+  const moveAllReqSelectOptions = useMemo(() => {
+    if (!selectedReqId) return [];
+    const tree = buildTree(reqFlat.filter((r) => r.id !== selectedReqId));
+    const sortRec = (nodes: ReqNode[]): ReqNode[] =>
+      [...nodes]
+        .map((n) => ({ ...n, children: sortRec(n.children) }))
+        .sort(
+          (a, b) =>
+            compareWbsId(a.wbsId, b.wbsId) ||
+            a.title.localeCompare(b.title, "zh-CN"),
+        );
+    const sorted = sortRec(tree);
+    const out: Array<{ id: string; label: string }> = [];
+    const walk = (nodes: ReqNode[], depth: number) => {
+      for (const n of nodes) {
+        const indent = depth <= 0 ? "" : `${"—".repeat(Math.min(12, depth * 2))} `;
+        const wbs = n.wbsId?.trim() ? `${n.wbsId} ` : "";
+        const iter = n.iterationLabel ? `${n.iterationLabel} / ` : "";
+        out.push({ id: n.id, label: `${indent}${iter}${wbs}${n.title}`.trim() });
+        if (n.children.length > 0) walk(n.children, depth + 1);
+      }
+    };
+    walk(sorted, 0);
+    return out;
+  }, [reqFlat, selectedReqId]);
+
+  const designSumAllCategories = useMemo(
+    () => Object.values(countsByType).reduce((a, b) => a + b, 0),
+    [countsByType],
+  );
+
   const selectedReqTitle = selectedReqId ? reqById.get(selectedReqId)?.title : "";
+
+  const confirmMoveAllFromRequirement = useCallback(async () => {
+    if (!selectedReqId || !moveAllSourceReqId) return;
+    const title = reqById.get(selectedReqId)?.title ?? selectedReqId;
+    setBatchWorking(true);
+    const r = await bulkMoveAllTestDesignsBetweenRequirements({
+      sourceRequirementId: moveAllSourceReqId,
+      targetRequirementId: selectedReqId,
+    });
+    setBatchWorking(false);
+    if (r.error) {
+      window.alert(r.error);
+      return;
+    }
+    window.alert(
+      r.moved !== undefined
+        ? `已迁入 ${r.moved} 条测试设计到当前需求「${title}」。`
+        : "迁入完成。",
+    );
+    setMoveAllModalOpen(false);
+    setMoveAllSourceReqId("");
+    await reload();
+    setDesignRevision((x) => x + 1);
+  }, [moveAllSourceReqId, reload, reqById, selectedReqId]);
 
   const addRoot = async () => {
     if (!selectedReqId) return;
     setRootBusy(true);
     setRootErr(null);
+    const dirId =
+      activeCustomDir && activeCustomDir.parentType === category
+        ? activeCustomDir.id
+        : null;
     const r = await createTestDesignNode({
       requirementId: selectedReqId,
       parentId: null,
-      title:
-        category === "OTHER" && activeCustomDirLabel
-          ? `${dirTag(activeCustomDirLabel)} ${rootTitle}`.trim()
-          : rootTitle,
+      title: rootTitle,
       type: category,
       iterationCode: iterationCode === "" ? "" : iterationCode,
+      dirId,
     });
     setRootBusy(false);
     if (r.error) {
@@ -939,7 +1387,8 @@ export function TestDesignTreeClient({
       return;
     }
     setRootTitle("");
-    reload();
+    await reload();
+    setDesignRevision((x) => x + 1);
   };
 
   return (
@@ -947,88 +1396,122 @@ export function TestDesignTreeClient({
     <ModuleWorkspaceCard>
       <div className="flex min-h-[70vh] flex-col">
         <div
-          className="relative shrink-0 overflow-hidden border-b border-zinc-200 bg-zinc-50/60 px-3 py-2 sm:px-4"
-          style={{ height: topPaneH, minHeight: 96 }}
+          className={[
+            "relative shrink-0 overflow-hidden border-b border-zinc-200 bg-zinc-50/60 px-3 sm:px-4",
+            topPaneCollapsed ? "py-0" : "py-2",
+          ].join(" ")}
+          style={{ height: topPaneH, minHeight: 0 }}
         >
-          <div className="flex flex-wrap items-baseline justify-between gap-2 gap-y-1">
-            <h2 className="text-xs font-semibold text-zinc-900">需求目录</h2>
-            <p className="hidden max-w-2xl text-[11px] leading-snug text-zinc-500 sm:block">
-              在上方选择<strong>需求节点</strong>，下方可切换类别并维护测试设计；点击设计标题进入详情并
-              <strong>关联用例</strong>。
-            </p>
-          </div>
-          <div className="mt-2 flex flex-wrap items-end gap-3 gap-y-2">
-            <div className="min-w-[min(100%,10rem)] flex-1 sm:flex-initial sm:min-w-[180px]">
-              <label className="text-xs font-medium text-zinc-600">
-                迭代筛选
-              </label>
-              <select
-                className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
-                value={iterationCode}
-                onChange={(e) => setIterationCode(e.target.value)}
-                title="baseline 表示查看全部迭代"
-              >
-                {iterations.map((o) => (
-                  <option key={o.code || "__baseline__"} value={o.code}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="min-w-[min(100%,12rem)] flex-1 sm:min-w-[200px]">
-              <label className="text-xs font-medium text-zinc-600">
-                模糊查询（需求/设计）
-              </label>
-              <input
-                type="search"
-                autoComplete="off"
-                className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
-                placeholder="关键字筛选需求（右侧可筛设计）"
-                value={reqSearch}
-                onChange={(e) => setReqSearch(e.target.value)}
-              />
-            </div>
-          </div>
-          <div className="mt-2 max-h-36 min-h-0 overflow-y-auto rounded-md border border-zinc-200/90 bg-white/90 px-2 py-1.5">
-            {reqTree.length === 0 ? (
-              <p className="text-xs text-zinc-500">
-                暂无需求，请先在「需求管理」中创建需求节点。
-              </p>
-            ) : (
-              <ul className="space-y-0.5" role="tree">
-                {reqTree.map((n) => (
-                  <ReqTreeRows
-                    key={n.id}
-                    node={n}
-                    depth={0}
-                    selectedId={selectedReqId}
-                    onSelect={setSelectedReqId}
-                    countByReqId={reqDesignCounts}
-                    expandedById={expandedReq}
-                    onToggle={(id) =>
-                      setExpandedReq((p) => ({ ...p, [id]: !(p[id] ?? true) }))
-                    }
+          {topPaneCollapsed ? (
+            <button
+              type="button"
+              onClick={restoreTopPane}
+              className="absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-700 shadow-sm hover:bg-zinc-50"
+              title="展开顶部区域"
+              aria-label="展开顶部区域"
+            >
+              ↑
+            </button>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-baseline justify-between gap-2 gap-y-1">
+                <h2 className="text-xs font-semibold text-zinc-900">需求目录</h2>
+                <p className="hidden max-w-2xl text-[11px] leading-snug text-zinc-500 sm:block">
+                  在上方选择<strong>需求节点</strong>，下方可切换类别并维护测试设计；点击设计标题进入详情并
+                  <strong>关联用例</strong>。
+                </p>
+              </div>
+              <div className="mt-2 flex flex-wrap items-end gap-3 gap-y-2">
+                <div className="min-w-[min(100%,10rem)] flex-1 sm:flex-initial sm:min-w-[180px]">
+                  <label className="text-xs font-medium text-zinc-600">
+                    切换产品
+                  </label>
+                  <select
+                    className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                    value={productId}
+                    onChange={(e) => setProductId(e.target.value)}
+                  >
+                    {products.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.code ? `${p.name}（${p.code}）` : p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="min-w-[min(100%,10rem)] flex-1 sm:flex-initial sm:min-w-[180px]">
+                  <label className="text-xs font-medium text-zinc-600">
+                    迭代筛选
+                  </label>
+                  <select
+                    className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                    value={iterationCode}
+                    onChange={(e) => setIterationCode(e.target.value)}
+                    title="baseline 表示查看全部迭代"
+                  >
+                    {visibleIterations.map((o) => (
+                      <option key={o.code || "__baseline__"} value={o.code}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="min-w-[min(100%,12rem)] flex-1 sm:min-w-[200px]">
+                  <label className="text-xs font-medium text-zinc-600">
+                    模糊查询（需求/设计）
+                  </label>
+                  <input
+                    type="search"
+                    autoComplete="off"
+                    className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-sm"
+                    placeholder="关键字筛选需求（右侧可筛设计）"
+                    value={reqSearch}
+                    onChange={(e) => setReqSearch(e.target.value)}
                   />
-                ))}
-              </ul>
-            )}
-          </div>
+                </div>
+              </div>
+              <div
+                className="mt-2 min-h-0 overflow-y-auto rounded-md border border-zinc-200/90 bg-white/90 px-2 py-1.5 text-xs leading-tight"
+                style={{ height: Math.max(0, topPaneH - 88) }}
+              >
+                {reqTree.length === 0 ? (
+                  <p className="text-xs text-zinc-500">
+                    暂无需求，请先在「需求管理」中创建需求节点。
+                  </p>
+                ) : (
+                  <ul className="space-y-0.5" role="tree">
+                    {reqTree.map((n) => (
+                      <ReqTreeRows
+                        key={n.id}
+                        node={n}
+                        depth={0}
+                        selectedId={selectedReqId}
+                        onSelect={setSelectedReqId}
+                        countByReqId={reqDesignCounts}
+                        expandedById={expandedReq}
+                        onToggle={(id) =>
+                          setExpandedReq((p) => ({ ...p, [id]: !(p[id] ?? true) }))
+                        }
+                      />
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </>
+          )}
           <div
             className="absolute bottom-0 left-0 right-0 z-20 h-2 cursor-row-resize hover:bg-zinc-300/30"
             role="separator"
             aria-label="拖动调整顶部区域高度"
             title="拖动调整高度"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              startResizeTopPane(e.clientX, e.clientY);
-            }}
+            onPointerDown={startResizeTopPane}
+            onDoubleClick={() => restoreTopPane()}
           />
         </div>
 
         <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
           <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
             <section
-              className="relative flex min-h-[180px] flex-col border-b border-zinc-200 bg-zinc-50/60 lg:min-h-0 lg:border-b-0 lg:border-r lg:border-zinc-200"
+              className="relative flex min-h-[180px] flex-col bg-zinc-50/60 lg:min-h-0 lg:border-r lg:border-zinc-200"
               style={{ width: catPaneW }}
             >
               <div className="shrink-0 border-b border-zinc-200/80 px-3 py-2">
@@ -1047,116 +1530,370 @@ export function TestDesignTreeClient({
                 <ul className="space-y-0.5">
                   {visibleCategories.map((o) => (
                     <li key={o.key}>
-                      <div
-                        className={[
-                          "flex items-center gap-1 rounded-md px-2 py-1.5 text-sm",
-                          category === o.key
-                            ? "bg-zinc-200/90 text-zinc-900"
-                            : "hover:bg-zinc-100/80 text-zinc-700",
-                        ].join(" ")}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => setCategory(o.key)}
-                          className="min-w-0 flex-1 truncate text-left font-medium"
-                          title={o.label}
-                        >
-                          {o.label}
-                        </button>
-                        <span className="shrink-0 text-xs text-zinc-500 tabular-nums">
-                          {countsByType[o.key]}
-                        </span>
-                        {categoryEditOpen ? (
+                      {(() => {
+                        const dirs = visibleCustomDirsByType.get(o.key) ?? [];
+                        const tree = buildCustomDirTree(dirs);
+                        const toggleDirExpand = (id: string) => {
+                          setDirExpandedById((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
+                        };
+
+                        const doMoveDir = async (input: {
+                          dirId: string;
+                          targetType: TestDesignType;
+                          targetParentId: string | null;
+                        }) => {
+                          const ic = iterationCode.trim();
+                          if (!ic) {
+                            window.alert("请先选择具体迭代（baseline 不支持维护子目录）。");
+                            return;
+                          }
+                          const r = await moveTestDesignDir({
+                            id: input.dirId,
+                            iterationCode: ic,
+                            targetType: input.targetType,
+                            targetParentId: input.targetParentId,
+                          });
+                          if (r.error) {
+                            window.alert(r.error);
+                            return;
+                          }
+                          const r2 = await listTestDesignDirs({ iterationCode: ic });
+                          setCustomDirs(
+                            (r2.rows ?? []).map((x) => ({
+                              id: x.id,
+                              label: x.name,
+                              parentType: x.type,
+                              parentId: x.parentId,
+                            })),
+                          );
+                          setDirExpandedById((prev) => ({
+                            ...prev,
+                            ...(input.targetParentId ? { [input.targetParentId]: true } : {}),
+                          }));
+                        };
+
+                        const renderDir = (n: CustomDirNode, depth = 0): React.ReactNode => {
+                          const active =
+                            category === n.parentType && selectedCustomDirId === n.id;
+                          const hasChildren = n.children.length > 0;
+                          const expanded = dirExpandedById[n.id] !== false;
+                          return (
+                            <li key={n.id}>
+                              <div
+                                className={[
+                                  // 子节点：字体更小、行距更紧凑（比根节点小两号）
+                                  "flex items-center gap-1 rounded-md px-2 py-1 text-[10px] leading-tight",
+                                  active
+                                    ? "bg-zinc-200/90 text-zinc-900"
+                                    : "hover:bg-zinc-100/80 text-zinc-700",
+                                ].join(" ")}
+                                style={{ paddingLeft: 8 + (depth + 1) * 12 }}
+                                draggable={categoryEditOpen}
+                                onDragStart={(e) => {
+                                  if (!categoryEditOpen) return;
+                                  dragDirIdRef.current = n.id;
+                                  try {
+                                    e.dataTransfer.effectAllowed = "move";
+                                    e.dataTransfer.setData("text/plain", n.id);
+                                  } catch {
+                                    // ignore
+                                  }
+                                }}
+                                onDragOver={(e) => {
+                                  if (!categoryEditOpen) return;
+                                  e.preventDefault();
+                                  e.dataTransfer.dropEffect = "move";
+                                }}
+                                onDrop={(e) => {
+                                  if (!categoryEditOpen) return;
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  const dragged = dragDirIdRef.current;
+                                  dragDirIdRef.current = null;
+                                  if (!dragged || dragged === n.id) return;
+                                  void doMoveDir({
+                                    dirId: dragged,
+                                    targetType: n.parentType,
+                                    targetParentId: n.id,
+                                  });
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className={[
+                                    "h-5 w-5 shrink-0 self-center rounded text-[10px] leading-none text-zinc-400 hover:bg-zinc-200/60 hover:text-zinc-700",
+                                    hasChildren ? "visible" : "invisible pointer-events-none",
+                                  ].join(" ")}
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    toggleDirExpand(n.id);
+                                  }}
+                                  aria-label={expanded ? "收起子目录" : "展开子目录"}
+                                  title={expanded ? "收起" : "展开"}
+                                >
+                                  {expanded ? "▾" : "▸"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCategory(n.parentType);
+                                    setSelectedCustomDirId(n.id);
+                                  }}
+                                  className="min-w-0 flex-1 truncate text-left font-medium"
+                                  title={n.label}
+                                >
+                                  {n.label}
+                                </button>
+                                <span
+                                  className="shrink-0 tabular-nums text-zinc-400"
+                                  title="该目录及子目录下的设计数（随当前迭代/需求筛选）"
+                                >
+                                  ({dirCountsById[n.id] ?? 0})
+                                </span>
+                                {categoryEditOpen ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                                      onClick={async (e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        const ic = iterationCode.trim();
+                                        if (!ic) {
+                                          window.alert(
+                                            "请先选择具体迭代（baseline 不支持维护子目录）。",
+                                          );
+                                          return;
+                                        }
+                                        const next = window.prompt("新增子目录", "");
+                                        if (!next || !next.trim()) return;
+                                        try {
+                                          const r = await createTestDesignDir({
+                                            iterationCode: ic,
+                                            type: n.parentType,
+                                            parentId: n.id,
+                                            name: next.trim(),
+                                          });
+                                          if (r.error) {
+                                            window.alert(r.error);
+                                            return;
+                                          }
+                                          const r2 = await listTestDesignDirs({
+                                            iterationCode: ic,
+                                          });
+                                          setCustomDirs(
+                                            (r2.rows ?? []).map((x) => ({
+                                              id: x.id,
+                                              label: x.name,
+                                              parentType: x.type,
+                                              parentId: x.parentId,
+                                            })),
+                                          );
+                                        } catch (err) {
+                                          window.alert(
+                                            err instanceof Error
+                                              ? err.message
+                                              : "新增目录失败",
+                                          );
+                                        }
+                                      }}
+                                      title="新增子节点"
+                                    >
+                                      +子
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                                      onClick={async (e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        const next = window.prompt("重命名目录", n.label);
+                                        if (!next || !next.trim()) return;
+                                        try {
+                                          const r = await renameTestDesignDir({
+                                            id: n.id,
+                                            name: next.trim(),
+                                          });
+                                          if (r.error) {
+                                            window.alert(r.error);
+                                            return;
+                                          }
+                                          const r2 = await listTestDesignDirs({
+                                            iterationCode,
+                                          });
+                                          setCustomDirs(
+                                            (r2.rows ?? []).map((x) => ({
+                                              id: x.id,
+                                              label: x.name,
+                                              parentType: x.type,
+                                              parentId: x.parentId,
+                                            })),
+                                          );
+                                        } catch (err) {
+                                          window.alert(
+                                            err instanceof Error ? err.message : "重命名失败",
+                                          );
+                                        }
+                                      }}
+                                    >
+                                      改
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="rounded border border-red-200 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
+                                      title="从侧栏删除该目录：存在归属该目录的设计时不可删除"
+                                      onClick={() => void confirmHideCustomDir(n.id, n.label)}
+                                    >
+                                      删
+                                    </button>
+                                  </>
+                                ) : null}
+                              </div>
+                              {hasChildren && expanded ? (
+                                <div className="relative ml-1.5 border-l border-dashed border-zinc-200 pl-0.5">
+                                  <ul className="space-y-0" role="group">
+                                    {n.children.map((c) => renderDir(c, depth + 1))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                            </li>
+                          );
+                        };
+
+                        return (
                           <>
-                            <button
-                              type="button"
-                              className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
-                              onClick={() => {
-                                const next = window.prompt("重命名类别", o.label);
-                                if (!next || !next.trim()) return;
-                                setCategories((prev) =>
-                                  prev.map((x) =>
-                                    x.key === o.key ? { ...x, label: next.trim() } : x,
-                                  ),
-                                );
+                            <div
+                              className={[
+                                "flex items-center gap-1 rounded-md px-2 py-1.5 text-sm",
+                                category === o.key
+                                  ? "bg-zinc-200/90 text-zinc-900"
+                                  : "hover:bg-zinc-100/80 text-zinc-700",
+                              ].join(" ")}
+                              onDragOver={(e) => {
+                                if (!categoryEditOpen) return;
+                                e.preventDefault();
+                                e.dataTransfer.dropEffect = "move";
+                              }}
+                              onDrop={(e) => {
+                                if (!categoryEditOpen) return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const dragged = dragDirIdRef.current;
+                                dragDirIdRef.current = null;
+                                if (!dragged) return;
+                                void doMoveDir({
+                                  dirId: dragged,
+                                  targetType: o.key,
+                                  targetParentId: null,
+                                });
                               }}
                             >
-                              改
-                            </button>
-                            <button
-                              type="button"
-                              className="rounded border border-red-200 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
-                              onClick={() => void confirmHideCategory(o.key, o.label)}
-                              title="从侧栏删除该类别：存在测试设计数据时不可删除"
-                            >
-                              删
-                            </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setCategory(o.key);
+                                  setSelectedCustomDirId(null);
+                                }}
+                                className="min-w-0 flex-1 truncate text-left font-medium"
+                                title={o.label}
+                              >
+                                {o.label}
+                              </button>
+                              <span className="shrink-0 text-xs text-zinc-500 tabular-nums">
+                                {countsByType[o.key]}
+                              </span>
+                              {categoryEditOpen ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                                    onClick={async (e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      const ic = iterationCode.trim();
+                                      if (!ic) {
+                                        window.alert(
+                                          "请先选择具体迭代（baseline 不支持维护子目录）。",
+                                        );
+                                        return;
+                                      }
+                                      const next = window.prompt(
+                                        `新增「${o.label}」子节点`,
+                                        "",
+                                      );
+                                      if (!next || !next.trim()) return;
+                                      try {
+                                        const r = await createTestDesignDir({
+                                          iterationCode: ic,
+                                          type: o.key,
+                                          parentId: null,
+                                          name: next.trim(),
+                                        });
+                                        if (r.error) {
+                                          window.alert(r.error);
+                                          return;
+                                        }
+                                        const r2 = await listTestDesignDirs({
+                                          iterationCode: ic,
+                                        });
+                                        setCustomDirs(
+                                          (r2.rows ?? []).map((x) => ({
+                                            id: x.id,
+                                            label: x.name,
+                                            parentType: x.type,
+                                            parentId: x.parentId,
+                                          })),
+                                        );
+                                      } catch (err) {
+                                        window.alert(
+                                          err instanceof Error ? err.message : "新增目录失败",
+                                        );
+                                      }
+                                    }}
+                                    title="新增子节点"
+                                  >
+                                    +子
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                                    onClick={() => {
+                                      const next = window.prompt("重命名类别", o.label);
+                                      if (!next || !next.trim()) return;
+                                      setCategories((prev) =>
+                                        prev.map((x) =>
+                                          x.key === o.key
+                                            ? { ...x, label: next.trim() }
+                                            : x,
+                                        ),
+                                      );
+                                    }}
+                                  >
+                                    改
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded border border-red-200 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
+                                    onClick={() => void confirmHideCategory(o.key, o.label)}
+                                    title="从侧栏删除该类别：存在测试设计数据时不可删除"
+                                  >
+                                    删
+                                  </button>
+                                </>
+                              ) : null}
+                            </div>
+                            {tree.length > 0 ? (
+                              <ul className="mt-0.5 space-y-0" role="group">
+                                {tree.map((n) => renderDir(n, 0))}
+                              </ul>
+                            ) : null}
                           </>
-                        ) : null}
-                      </div>
+                        );
+                      })()}
                     </li>
                   ))}
                 </ul>
-                {visibleCustomDirs.map((d) => (
-                  <ul key={d.id} className="space-y-0.5">
-                    <li>
-                      <div
-                        className={[
-                          "flex items-center gap-1 rounded-md px-2 py-1.5 text-sm",
-                          category === "OTHER" && selectedCustomDirId === d.id
-                            ? "bg-zinc-200/90 text-zinc-900"
-                            : "hover:bg-zinc-100/80 text-zinc-700",
-                        ].join(" ")}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCategory("OTHER");
-                            setSelectedCustomDirId(d.id);
-                          }}
-                          className="min-w-0 flex-1 truncate text-left font-medium"
-                          title={d.label}
-                        >
-                          {d.label}
-                        </button>
-                        <span className="shrink-0 text-xs text-zinc-500 tabular-nums">
-                          {otherFlatAll.filter((r) =>
-                            r.title.startsWith(dirTag(d.label)),
-                          ).length}
-                        </span>
-                        {categoryEditOpen ? (
-                          <>
-                            <button
-                              type="button"
-                              className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
-                              onClick={() => {
-                                const next = window.prompt("重命名目录", d.label);
-                                if (!next || !next.trim()) return;
-                                setCustomDirs((prev) =>
-                                  prev.map((x) =>
-                                    x.id === d.id
-                                      ? { ...x, label: next.trim() }
-                                      : x,
-                                  ),
-                                );
-                              }}
-                            >
-                              改
-                            </button>
-                            <button
-                              type="button"
-                              className="rounded border border-red-200 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
-                              title="从侧栏删除该目录：存在归属该目录的设计时不可删除"
-                              onClick={() => void confirmHideCustomDir(d.id, d.label)}
-                            >
-                              删
-                            </button>
-                          </>
-                        ) : null}
-                      </div>
-                    </li>
-                  </ul>
-                ))}
                 {categoryEditOpen ? (
                   <div className="mt-2 flex flex-col gap-1.5">
                     <button
@@ -1190,9 +1927,13 @@ export function TestDesignTreeClient({
               />
             </section>
 
-            <section className="min-w-0 flex-1 bg-white p-4">
+            <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white p-4">
               {!selectedReqId ? (
-                <p className="text-sm text-zinc-500">请先在上方选择需求节点。</p>
+                <div className="min-h-0 flex-1">
+                  <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-zinc-50/40 p-6">
+                    <p className="text-sm text-zinc-500">请先在上方选择需求节点。</p>
+                  </div>
+                </div>
               ) : (
                 <>
                   <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
@@ -1208,8 +1949,33 @@ export function TestDesignTreeClient({
                         value={designSearch}
                         onChange={(e) => setDesignSearch(e.target.value)}
                       />
+                      <p className="mt-2 max-w-3xl text-[11px] leading-relaxed text-zinc-600">
+                        需求树旁数字 = 当前迭代下该需求的<strong>全部类别</strong>合计（
+                        {designSumAllCategories} 条）；右侧列表默认只看<strong>当前类别</strong>「
+                        {testDesignTypeLabel[category]}」（{countsByType[category] ?? 0}
+                        条），并受目录与筛选影响（当前匹配 {listRows.length} 条）。
+                        若设计挂在<strong>其他需求</strong>上，请用「整需求迁入」。
+                      </p>
                     </div>
                     <div className="flex flex-shrink-0 flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={!iterationCode.trim() || !selectedReqId}
+                        title={
+                          !iterationCode.trim()
+                            ? "请先选择具体迭代"
+                            : !selectedReqId
+                              ? "请先选择需求"
+                              : "将另一需求下的全部测试设计迁入当前需求"
+                        }
+                        className={MODULE_TOOLBAR_BTN_SECONDARY}
+                        onClick={() => {
+                          setMoveAllSourceReqId(moveAllReqSelectOptions[0]?.id ?? "");
+                          setMoveAllModalOpen(true);
+                        }}
+                      >
+                        整需求迁入
+                      </button>
                       <button
                         type="button"
                         onClick={() => setAdvOpen((o) => !o)}
@@ -1471,13 +2237,21 @@ export function TestDesignTreeClient({
                   ) : null}
 
                   {loading ? (
-                    <p className="text-sm text-zinc-500">加载中…</p>
+                    <div className="min-h-0 flex-1">
+                      <div className="flex h-full items-center justify-center">
+                        <p className="text-sm text-zinc-500">加载中…</p>
+                      </div>
+                    </div>
                   ) : listRows.length === 0 ? (
-                    <p className="text-sm text-zinc-500">
-                      {iterationCode === ""
-                        ? "baseline 数据已清空。"
-                        : "暂无数据或不符合筛选条件。"}
-                    </p>
+                    <div className="min-h-0 flex-1">
+                      <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-zinc-50/40 p-6">
+                        <p className="text-sm text-zinc-500">
+                          {iterationCode === ""
+                            ? "baseline 数据已清空。"
+                            : "暂无数据或不符合筛选条件。"}
+                        </p>
+                      </div>
+                    </div>
                   ) : (
                     <>
                       {selectedDesignIds.length > 0 ? (
@@ -1502,9 +2276,30 @@ export function TestDesignTreeClient({
                             type="button"
                             disabled={batchWorking}
                             className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium hover:bg-zinc-50 disabled:opacity-50"
+                            onClick={runBatchDuplicate}
+                            title="复制后将生成新设计；不复制关联用例与操作记录"
+                          >
+                            批量复制
+                          </button>
+                          <button
+                            type="button"
+                            disabled={batchWorking}
+                            className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium hover:bg-zinc-50 disabled:opacity-50"
                             onClick={runBatchMove}
                           >
                             批量移动
+                          </button>
+                          <button
+                            type="button"
+                            disabled={batchWorking}
+                            className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium hover:bg-zinc-50 disabled:opacity-50"
+                            onClick={() => {
+                              setBulkEditType("");
+                              setBulkEditDirId("");
+                              setBulkEditOpen(true);
+                            }}
+                          >
+                            批量修改
                           </button>
                           <button
                             type="button"
@@ -1533,8 +2328,8 @@ export function TestDesignTreeClient({
                         </div>
                       ) : null}
 
-                      <div className="flex flex-col">
-                        <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
+                      <div className="flex min-h-0 flex-1 flex-col">
+                        <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-zinc-200 bg-white">
                           <table
                             className="table-fixed text-left text-sm"
                             style={{ minWidth: designTableMinW }}
@@ -1740,6 +2535,159 @@ export function TestDesignTreeClient({
         </section>
       </div>
     </ModuleWorkspaceCard>
+    {bulkEditOpen ? (
+      <div
+        className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30 p-4"
+        role="dialog"
+        aria-modal="true"
+      >
+        <div className="w-full max-w-xl overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xl">
+          <div className="border-b border-zinc-100 px-5 py-4">
+            <h3 className="text-lg font-semibold text-zinc-900">批量修改</h3>
+            <p className="mt-1 text-xs text-zinc-500">
+              将对已选择的 <strong>{selectedDesignIds.length}</strong> 条测试设计生效。
+            </p>
+          </div>
+          <div className="space-y-3 px-5 py-4">
+            <div>
+              <label className="text-xs font-medium text-zinc-700">
+                类别 / 目录（树状，可选）
+              </label>
+              <select
+                className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                value={
+                  bulkEditDirId && bulkEditDirId !== "__clear__"
+                    ? `dir:${bulkEditDirId}`
+                    : bulkEditType
+                      ? `type:${bulkEditType}`
+                      : ""
+                }
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) {
+                    setBulkEditType("");
+                    setBulkEditDirId("");
+                    return;
+                  }
+                  if (v.startsWith("type:")) {
+                    setBulkEditType(v.slice("type:".length) as TestDesignType);
+                    setBulkEditDirId("");
+                    return;
+                  }
+                  if (v.startsWith("dir:")) {
+                    const id = v.slice("dir:".length);
+                    const dir = customDirs.find((d) => d.id === id) ?? null;
+                    if (!dir) {
+                      setBulkEditType("");
+                      setBulkEditDirId("");
+                      return;
+                    }
+                    setBulkEditType(dir.parentType);
+                    setBulkEditDirId(id);
+                    return;
+                  }
+                }}
+              >
+                <option value="">不修改</option>
+                {bulkEditTreeOptions.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+                下拉里会显示当前迭代下所有目录子节点（缩进表示层级）。选择目录会自动设置其所属类别。
+              </p>
+            </div>
+            <div>
+              <label className="text-xs font-medium text-zinc-700">目录（可选）</label>
+              <div className="mt-1 flex items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  onClick={() => setBulkEditDirId("__clear__")}
+                  disabled={batchWorking}
+                  title="清空这些设计的目录归属（dirId 置空）"
+                >
+                  清空目录
+                </button>
+                <span className="text-xs text-zinc-500">
+                  当前：{bulkEditDirId === "__clear__" ? "将清空" : bulkEditDirId ? "已选择目录" : "不修改"}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-2 border-t border-zinc-100 px-5 py-4">
+            <button
+              type="button"
+              className="rounded-lg border border-zinc-200 px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+              onClick={() => setBulkEditOpen(false)}
+              disabled={batchWorking}
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              onClick={() => void runBatchEdit()}
+              disabled={batchWorking}
+            >
+              {batchWorking ? "保存中…" : "保存"}
+            </button>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    {moveAllModalOpen ? (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-black/45 p-4">
+        <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
+          <div className="shrink-0 border-b border-zinc-100 px-6 py-4">
+            <h3 className="text-lg font-semibold text-zinc-900">整需求迁入</h3>
+            <p className="mt-1 text-sm text-zinc-500">
+              将<strong>源需求</strong>下全部测试设计迁入当前选中需求「{selectedReqTitle || selectedReqId}
+              」；迁入后设计在目标需求下为<strong>根节点</strong>，迭代编码随目标需求。
+            </p>
+          </div>
+          <div className="space-y-4 px-6 py-4">
+            <div>
+              <label className="text-sm font-medium text-zinc-700">源需求（当前迭代）</label>
+              <select
+                className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                value={moveAllSourceReqId}
+                onChange={(e) => setMoveAllSourceReqId(e.target.value)}
+              >
+                {moveAllReqSelectOptions.length === 0 ? (
+                  <option value="">无可选源需求（或仅有一个需求）</option>
+                ) : (
+                  moveAllReqSelectOptions.map((o) => (
+                    <option key={o.id} value={o.id}>
+                      {o.label}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm"
+                onClick={() => setMoveAllModalOpen(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={batchWorking || !moveAllSourceReqId}
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+                onClick={() => void confirmMoveAllFromRequirement()}
+              >
+                {batchWorking ? "处理中…" : "迁入"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
     {moveModalOpen ? (
       <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/45 p-4">
         <div className="w-full max-w-lg rounded-xl bg-white shadow-2xl">
@@ -1749,15 +2697,29 @@ export function TestDesignTreeClient({
           </div>
           <div className="space-y-4 px-6 py-4">
             <div>
+              <label className="text-sm font-medium text-zinc-700">目标迭代</label>
+              <select
+                className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                value={moveTargetIterationCode}
+                onChange={(e) => setMoveTargetIterationCode(e.target.value)}
+              >
+                {visibleIterations.map((o) => (
+                  <option key={o.code || "__all__"} value={o.code}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
               <label className="text-sm font-medium text-zinc-700">目标需求</label>
               <select
                 className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
                 value={moveTargetReqId}
                 onChange={(e) => setMoveTargetReqId(e.target.value)}
               >
-                {reqFlat.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.title}
+                {moveReqSelectOptions.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.label}
                   </option>
                 ))}
               </select>
@@ -1958,15 +2920,18 @@ function ReqTreeRows({
   onToggle?: (id: string) => void;
 }) {
   const expanded = expandedById?.[node.id] ?? true;
+  const count =
+    typeof countByReqId?.[node.id] === "number" ? countByReqId[node.id] : null;
   return (
     <li
       role="treeitem"
       aria-level={depth + 1}
       aria-selected={selectedId === node.id}
+      data-td-req-row={node.id}
     >
       <div
         className={[
-          "group flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-left text-sm transition-colors",
+          "group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs leading-tight transition-colors",
           selectedId === node.id ? "bg-zinc-200/90" : "hover:bg-zinc-100/80",
         ].join(" ")}
         style={{ paddingLeft: 8 + depth * 12 }}
@@ -1988,9 +2953,7 @@ function ReqTreeRows({
           onClick={() => onSelect(node.id)}
           className={[
             "min-w-0 flex-1 text-left",
-            typeof countByReqId?.[node.id] === "number"
-              ? "grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-0.5"
-              : "block min-w-0",
+            "block min-w-0",
           ].join(" ")}
           title={
             node.iterationLabel
@@ -1998,20 +2961,38 @@ function ReqTreeRows({
               : node.title
           }
         >
-          {typeof countByReqId?.[node.id] === "number" ? (
-            <>
-              <span className="min-w-0 truncate font-medium text-zinc-800">
-                {node.title}
-              </span>
-              <span className="shrink-0 rounded bg-zinc-200 px-1 py-0.5 text-[10px] leading-none tabular-nums text-zinc-700">
-                {countByReqId[node.id]}
-              </span>
-            </>
-          ) : (
-            <span className="block min-w-0 truncate font-medium text-zinc-800">
-              {node.title}
+          <span className="block min-w-0 font-medium text-zinc-800">
+            <span className="inline-flex min-w-0 items-center gap-1">
+              <span className="min-w-0 truncate">{node.title}</span>
+              {node.status === "PENDING_VERIFICATION" ? (
+                <span
+                  className="inline-flex h-4 shrink-0 items-center rounded-full border border-blue-300 bg-blue-50 px-1.5 text-[10px] font-semibold leading-none text-blue-700"
+                  title="待验证"
+                  aria-label="待验证"
+                >
+                  ✓
+                </span>
+              ) : null}
+              {node.testOwner?.trim() ? (
+                <span
+                  className="inline-flex h-4 shrink-0 items-center rounded-full border border-zinc-200 bg-white px-1.5 text-[10px] font-medium leading-none text-zinc-700"
+                  title={`测试负责人：${node.testOwner}`}
+                  aria-label={`测试负责人：${node.testOwner}`}
+                >
+                  {node.testOwner}
+                </span>
+              ) : null}
+              {count !== null ? (
+                <span
+                  className="shrink-0 rounded bg-zinc-200 px-1 py-0.5 text-[10px] leading-none tabular-nums text-zinc-700"
+                  title={`已关联设计数：${count}（当前迭代下该需求的全部类别合计；右侧列表按「当前类别」筛选，条数可能更少）`}
+                  aria-label={`已关联设计数：${count}`}
+                >
+                  {count}
+                </span>
+              ) : null}
             </span>
-          )}
+          </span>
         </button>
       </div>
       {node.children.length > 0 && expanded && (

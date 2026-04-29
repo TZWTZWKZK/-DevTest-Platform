@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { normalizeColumnOrder } from "@/lib/normalize-column-order";
 
-const STORAGE_KEY = "pm-requirement-list-columns-v4";
+const STORAGE_KEY = "pm-requirement-list-columns-v6";
 
 export const REQUIREMENT_COLUMN_KEYS = [
   "title",
+  "wbsId",
   "priority",
   "status",
   "taskProgress",
@@ -24,6 +25,7 @@ export type RequirementColumnKey = (typeof REQUIREMENT_COLUMN_KEYS)[number];
 
 export const REQUIREMENT_COLUMN_LABELS: Record<RequirementColumnKey, string> = {
   title: "任务名称",
+  wbsId: "WBS编号",
   priority: "优先级",
   status: "状态",
   taskProgress: "任务进度",
@@ -41,6 +43,7 @@ const DEFAULT_ORDER: RequirementColumnKey[] = [...REQUIREMENT_COLUMN_KEYS];
 
 const DEFAULT_VISIBLE: Record<RequirementColumnKey, boolean> = {
   title: true,
+  wbsId: true,
   priority: true,
   status: true,
   taskProgress: true,
@@ -56,6 +59,7 @@ const DEFAULT_VISIBLE: Record<RequirementColumnKey, boolean> = {
 
 const DEFAULT_WIDTH: Record<RequirementColumnKey, number> = {
   title: 360,
+  wbsId: 100,
   priority: 90,
   status: 120,
   taskProgress: 140,

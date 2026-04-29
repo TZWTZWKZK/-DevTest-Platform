@@ -5,59 +5,60 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
 model Product {
-  id           String      @id @default(cuid())
+  id          String      @id @default(cuid())
   /// 项目名称
-  name         String
+  name        String
   /// 项目编码（唯一，应用层创建/编辑时必填；库内可为空便于从旧库迁移后再补全）
-  code         String?     @unique
+  code        String?     @unique
   /// 项目层级（1 表示一级项目）
-  level        Int         @default(1)
+  level       Int         @default(1)
   /// 关联一级项目：非一级项目时指向 level=1 的上级项目
-  parentId     String?
-  parent       Product?    @relation("ProductHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
-  children     Product[]   @relation("ProductHierarchy")
+  parentId    String?
+  parent      Product?    @relation("ProductHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Product[]   @relation("ProductHierarchy")
   /// 项目负责人
-  owner        String?
+  owner       String?
   /// 归属部门
-  department   String?
+  department  String?
   /// 项目团队成员（可存多行或逗号分隔姓名）
-  teamMembers  String?
+  teamMembers String?     @db.Text
   /// 开始时间
-  startDate    DateTime?
+  startDate   DateTime?
   /// 结束时间
-  endDate      DateTime?
-  description  String?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  iterations   Iteration[]
+  endDate     DateTime?
+  description String?     @db.Text
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  iterations  Iteration[]
 
   @@index([parentId])
 }
 
 model Iteration {
-  id            String        @id @default(cuid())
-  name          String
+  id             String           @id @default(cuid())
+  name           String
   /// 迭代编码（创建时按时间自动生成）
-  code          String        @unique
-  version       String?
+  code           String           @unique
+  version        String?
   /// 迭代内容/说明
-  content       String?
-  startDate     DateTime?
-  endDate       DateTime?
-  status        IterationStatus @default(IN_PROGRESS)
-  submitter     String?
-  productId     String
-  product       Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
-  requirements  Requirement[]
+  content        String?          @db.Text
+  startDate      DateTime?
+  endDate        DateTime?
+  status         IterationStatus  @default(IN_PROGRESS)
+  submitter      String?
+  productId      String
+  product        Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  requirements   Requirement[]
   executionTasks ExecutionTask[]
+  testDesignDirs TestDesignDir[]
   opLogs         IterationOpLog[]
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
 
   @@index([productId])
   @@index([status])
@@ -67,7 +68,7 @@ model IterationOpLog {
   id          String    @id @default(cuid())
   iterationId String
   action      String
-  detail      String?
+  detail      String?   @db.Text
   createdAt   DateTime  @default(now())
   iteration   Iteration @relation(fields: [iterationId], references: [id], onDelete: Cascade)
 
@@ -76,35 +77,40 @@ model IterationOpLog {
 }
 
 model Requirement {
-  id           String       @id @default(cuid())
+  id             String                  @id @default(cuid())
+  /// 外部稳定 ID：导出为 data_id；再次导入时相同值将更新对应记录而非新建
+  dataId         String?                 @unique @map("data_id") @db.VarChar(512)
+  /// WBS 编号（如 1、1.1、2.1.2），同一迭代内唯一；用于层级与导入时推断父子关系
+  wbsId          String?                 @map("wbs_id") @db.VarChar(128)
   title          String
-  description    String?
+  description    String?                 @db.Text
   /// 任务进度（如百分比、阶段等）
-  taskProgress   String?
+  taskProgress   String?                 @db.Text
   /// 最新进展情况描述
-  latestProgress String?
+  latestProgress String?                 @db.Text
   priority       Int?
-  status       RequirementStatus @default(UNASSIGNED)
-  submitter    String?
-  devOwner     String?
-  testOwner    String?
-  planStartAt  DateTime?
-  planEndAt    DateTime?
-  iterationId  String
-  iteration    Iteration    @relation(fields: [iterationId], references: [id], onDelete: Cascade)
-  parentId     String?
-  parent       Requirement? @relation("RequirementTree", fields: [parentId], references: [id], onDelete: Cascade)
-  children     Requirement[] @relation("RequirementTree")
-  sortOrder    Int          @default(0)
-  attachments  RequirementAttachment[]
-  testDesigns  TestDesign[]
-  opLogs       RequirementOpLog[]
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
+  status         RequirementStatus       @default(UNASSIGNED)
+  submitter      String?
+  devOwner       String?
+  testOwner      String?
+  planStartAt    DateTime?
+  planEndAt      DateTime?
+  iterationId    String
+  iteration      Iteration               @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  parentId       String?
+  parent         Requirement?            @relation("RequirementTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children       Requirement[]           @relation("RequirementTree")
+  sortOrder      Int                     @default(0)
+  attachments    RequirementAttachment[]
+  testDesigns    TestDesign[]
+  opLogs         RequirementOpLog[]
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
 
   @@index([iterationId])
   @@index([parentId])
   @@index([status])
+  @@unique([iterationId, wbsId])
 }
 
 model RequirementAttachment {
@@ -112,19 +118,20 @@ model RequirementAttachment {
   requirementId String
   requirement   Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
   name          String
-  url           String
+  /// 可能为 Data URL，长度较大
+  url           String      @db.LongText
   createdAt     DateTime    @default(now())
 
   @@index([requirementId])
 }
 
 model RequirementOpLog {
-  id             String      @id @default(cuid())
-  requirementId  String
-  action         String
-  detail         String?
-  createdAt      DateTime    @default(now())
-  requirement    Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  id            String      @id @default(cuid())
+  requirementId String
+  action        String
+  detail        String?     @db.Text
+  createdAt     DateTime    @default(now())
+  requirement   Requirement @relation(fields: [requirementId], references: [id], onDelete: Cascade)
 
   @@index([requirementId])
   @@index([createdAt])
@@ -134,8 +141,11 @@ model RequirementOpLog {
 model TestDesign {
   id              String               @id @default(cuid())
   title           String
-  description     String?
+  description     String?              @db.Text
   type            TestDesignType
+  /// 设计归属目录（按迭代维护的目录树）
+  dirId           String?
+  dir             TestDesignDir?       @relation(fields: [dirId], references: [id], onDelete: SetNull)
   /// 迭代编码（与迭代管理同步，便于按迭代筛选/归档）
   iterationCode   String?
   /// 创建人（无登录系统时由前端录入/可为空）
@@ -143,13 +153,13 @@ model TestDesign {
   /// 修改人（无登录系统时由前端录入/可为空）
   updatedBy       String?
   /// 设计正文：前置条件
-  precondition    String?
+  precondition    String?              @db.Text
   /// 设计正文：操作步骤
-  operationSteps  String?
+  operationSteps  String?              @db.Text
   /// 设计正文：预期结果
-  expectedResult  String?
+  expectedResult  String?              @db.Text
   /// 设计正文：备注
-  remark          String?
+  remark          String?              @db.Text
   /// 用例等级 L0–L4，对应 0–4（与用例库 priority 字段语义一致）
   caseLevel       Int?
   requirementId   String
@@ -166,6 +176,59 @@ model TestDesign {
   @@index([requirementId])
   @@index([parentId])
   @@index([iterationCode])
+  @@index([dirId])
+}
+
+/// 已删除的测试设计归档（删除主表前由应用写入）
+model TestDesignDeleted {
+  id               String         @id @default(cuid())
+  /// 原 TestDesign.id
+  originalId       String
+  title            String
+  description      String?        @db.Text
+  type             TestDesignType
+  dirId            String?
+  iterationCode    String?
+  createdBy        String?
+  updatedBy        String?
+  precondition     String?        @db.Text
+  operationSteps   String?        @db.Text
+  expectedResult   String?        @db.Text
+  remark           String?        @db.Text
+  caseLevel        Int?
+  requirementId    String
+  parentId         String?
+  sortOrder        Int
+  createdAt        DateTime
+  updatedAt        DateTime
+  deletedAt        DateTime       @default(now())
+  /// 删除时关联的用例 id 列表（JSON 数组）
+  linkedTestCaseIds Json?
+
+  @@index([originalId])
+  @@index([requirementId])
+  @@index([deletedAt])
+}
+
+/// 测试设计目录树：按迭代维护，可挂在任意 TestDesignType 下
+model TestDesignDir {
+  id          String        @id @default(cuid())
+  iterationId String
+  iteration   Iteration     @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  type        TestDesignType
+  name        String
+  parentId    String?
+  parent      TestDesignDir? @relation("TestDesignDirTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children    TestDesignDir[] @relation("TestDesignDirTree")
+  sortOrder   Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  designs     TestDesign[]
+
+  @@index([iterationId])
+  @@index([parentId])
+  @@index([type])
+  @@unique([iterationId, type, parentId, name])
 }
 
 /// 用例库文件夹（目录树）
@@ -184,27 +247,27 @@ model TestCaseFolder {
 }
 
 model TestCase {
-  id               String               @id @default(cuid())
-  caseNo           String               @unique
-  title            String
-  testPlan         String?
+  id                 String                            @id @default(cuid())
+  caseNo             String                            @unique
+  title              String
+  testPlan           String?                           @db.Text
   /// 迭代编码（与迭代管理同步，便于按迭代筛选）
-  iterationCode    String?
-  folderId         String
-  folder           TestCaseFolder       @relation(fields: [folderId], references: [id], onDelete: Cascade)
-  priority         Int?
-  maintainer       String?
-  status           TestCaseStatus?
-  precondition     String?
-  operationSteps   String?
-  caseActualResult String?
-  caseRemark       String?
-  submitter        String?
-  submittedAt      DateTime?
-  createdAt        DateTime             @default(now())
-  updatedAt        DateTime             @updatedAt
-  testDesignLinks  TestDesignTestCase[]
-  defectLinks      DefectTestCase[]
+  iterationCode      String?
+  folderId           String
+  folder             TestCaseFolder                    @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  priority           Int?
+  maintainer         String?
+  status             TestCaseStatus?
+  precondition       String?                           @db.Text
+  operationSteps     String?                           @db.Text
+  caseActualResult   String?                           @db.Text
+  caseRemark         String?                           @db.Text
+  submitter          String?
+  submittedAt        DateTime?
+  createdAt          DateTime                          @default(now())
+  updatedAt          DateTime                          @updatedAt
+  testDesignLinks    TestDesignTestCase[]
+  defectLinks        DefectTestCase[]
   executionTaskLinks ExecutionTaskTestCase[]
   taskExecRecords    ExecutionTaskTestCaseExecRecord[]
   opLogs             TestCaseOpLog[]
@@ -212,6 +275,43 @@ model TestCase {
   @@index([folderId])
   @@index([status])
   @@index([iterationCode])
+}
+
+/// 已删除的测试用例归档（删除主表前由应用写入）
+model TestCaseDeleted {
+  id                 String    @id @default(cuid())
+  /// 原 TestCase.id
+  originalId         String
+  caseNo             String
+  title              String
+  testPlan           String?   @db.Text
+  iterationCode      String?
+  folderId           String
+  priority           Int?
+  maintainer         String?
+  status             TestCaseStatus?
+  precondition       String?   @db.Text
+  operationSteps     String?   @db.Text
+  caseActualResult   String?   @db.Text
+  caseRemark         String?   @db.Text
+  submitter          String?
+  submittedAt        DateTime?
+  createdAt          DateTime
+  updatedAt          DateTime
+  deletedAt          DateTime  @default(now())
+
+  /// 删除时关联的测试设计 id 列表（JSON 数组）
+  linkedTestDesignIds Json?
+  /// 删除时关联的缺陷 id 列表（JSON 数组）
+  linkedDefectIds     Json?
+  /// 删除时关联的执行任务 id 列表（JSON 数组）
+  linkedExecTaskIds   Json?
+
+  @@index([originalId])
+  @@index([caseNo])
+  @@index([folderId])
+  @@index([iterationCode])
+  @@index([deletedAt])
 }
 
 model TestDesignTestCase {
@@ -226,12 +326,12 @@ model TestDesignTestCase {
 }
 
 model TestDesignOpLog {
-  id            String     @id @default(cuid())
-  testDesignId  String
-  action        String
-  detail        String?
-  createdAt     DateTime   @default(now())
-  testDesign    TestDesign @relation(fields: [testDesignId], references: [id], onDelete: Cascade)
+  id           String     @id @default(cuid())
+  testDesignId String
+  action       String
+  detail       String?    @db.Text
+  createdAt    DateTime   @default(now())
+  testDesign   TestDesign @relation(fields: [testDesignId], references: [id], onDelete: Cascade)
 
   @@index([testDesignId])
   @@index([createdAt])
@@ -241,7 +341,7 @@ model TestCaseOpLog {
   id         String   @id @default(cuid())
   testCaseId String
   action     String
-  detail     String?
+  detail     String?  @db.Text
   createdAt  DateTime @default(now())
   testCase   TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
 
@@ -299,25 +399,26 @@ enum DefectSeverity {
 }
 
 model Defect {
-  id            String         @id @default(cuid())
-  defectNo      String         @unique
+  id            String           @id @default(cuid())
+  defectNo      String           @unique
   name          String
-  status        DefectStatus   @default(UNASSIGNED)
-  severity      DefectSeverity @default(MEDIUM)
+  status        DefectStatus     @default(UNASSIGNED)
+  severity      DefectSeverity   @default(MEDIUM)
   /// 关联迭代编码（用于按迭代筛选/归档；不强制外键）
   iterationCode String?
   caseNo        String?
   devOwner      String?
   submitter     String?
   foundAt       DateTime?
-  description   String?
+  /// 可能包含图片 DataURL/base64，长度较大
+  description   String?          @db.LongText
   linkedTestId  String?
   linkedProject String?
-  reopenCount   Int            @default(0)
+  reopenCount   Int              @default(0)
   /// 最后一次保存该缺陷的操作者（手填，便于无登录环境下追溯）
   updatedBy     String?
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
   linkedCases   DefectTestCase[]
   opLogs        DefectOpLog[]
 
@@ -328,6 +429,39 @@ model Defect {
   @@index([createdAt])
   @@index([updatedAt])
   @@index([updatedBy])
+}
+
+/// 已删除的缺陷归档（删除主表前由应用写入）
+model DefectDeleted {
+  id            String         @id @default(cuid())
+  /// 原 Defect.id
+  originalId    String
+  defectNo      String
+  name          String
+  status        DefectStatus
+  severity      DefectSeverity
+  iterationCode String?
+  caseNo        String?
+  devOwner      String?
+  submitter     String?
+  foundAt       DateTime?
+  description   String?        @db.LongText
+  linkedTestId  String?
+  linkedProject String?
+  reopenCount   Int
+  updatedBy     String?
+  createdAt     DateTime
+  updatedAt     DateTime
+  deletedAt     DateTime       @default(now())
+
+  /// 删除时关联的用例 id 列表（JSON 数组）
+  linkedTestCaseIds Json?
+
+  @@index([originalId])
+  @@index([defectNo])
+  @@index([iterationCode])
+  @@index([caseNo])
+  @@index([deletedAt])
 }
 
 model DefectTestCase {
@@ -345,7 +479,7 @@ model DefectOpLog {
   id        String   @id @default(cuid())
   defectId  String
   action    String
-  detail    String?
+  detail    String?  @db.LongText
   createdAt DateTime @default(now())
 
   defect Defect @relation(fields: [defectId], references: [id], onDelete: Cascade)
@@ -356,21 +490,21 @@ model DefectOpLog {
 
 /// 执行任务：用于从用例库导入用例并跟踪执行范围（可树形组织）
 model ExecutionTask {
-  id          String          @id @default(cuid())
-  title       String
-  description String?
-  iterationId String
-  iteration   Iteration       @relation(fields: [iterationId], references: [id], onDelete: Cascade)
-  parentId    String?
-  parent      ExecutionTask?  @relation("ExecutionTaskTree", fields: [parentId], references: [id], onDelete: Cascade)
-  children    ExecutionTask[] @relation("ExecutionTaskTree")
-  sortOrder   Int             @default(0)
+  id              String                            @id @default(cuid())
+  title           String
+  description     String?                           @db.Text
+  iterationId     String
+  iteration       Iteration                         @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  parentId        String?
+  parent          ExecutionTask?                    @relation("ExecutionTaskTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children        ExecutionTask[]                   @relation("ExecutionTaskTree")
+  sortOrder       Int                               @default(0)
   /// 创建人（无登录系统时可为空）
-  createdBy   String?
+  createdBy       String?
   /// 修改人（无登录系统时可为空）
-  updatedBy   String?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  updatedBy       String?
+  createdAt       DateTime                          @default(now())
+  updatedAt       DateTime                          @updatedAt
   linkedCases     ExecutionTaskTestCase[]
   execCaseRecords ExecutionTaskTestCaseExecRecord[]
 
@@ -389,7 +523,7 @@ model ExecutionTaskTestCase {
   testCase        TestCase      @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
   createdAt       DateTime      @default(now())
   /// 执行任务内对该用例的执行结果（不影响用例库正文）
-  executionResult String?
+  executionResult String?       @db.LongText
   /// 首次记录/最近一次更新执行结果的时间
   executedAt      DateTime?
 
@@ -406,7 +540,7 @@ model ExecutionTaskTestCaseExecRecord {
   status          TestCaseStatus
   executor        String?
   /// 本次执行记录的执行结果文本（可为空）
-  result          String?
+  result          String?         @db.LongText
   /// 关联截图（dataUrl 数组，限制体积；仅用于本地/演示场景）
   images          Json?
   note            String?
@@ -420,6 +554,7 @@ model ExecutionTaskTestCaseExecRecord {
 /// 简易 UI 配置存储（无登录系统时按 key 全局存一份）
 model UiPreference {
   key       String   @id
-  value     String
+  /// JSON 配置（列显隐/顺序/宽度等），可能较长
+  value     String   @db.LongText
   updatedAt DateTime @updatedAt
 }

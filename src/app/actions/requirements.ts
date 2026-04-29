@@ -9,6 +9,12 @@ import {
   requirementPriorityLabel,
 } from "@/lib/requirement-priority";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
+import { formatIsoBeijing } from "@/lib/timezone-cn";
+import {
+  nextWbsForNewSiblingUnderParent,
+  parentWbsFromChildWbs,
+} from "@/lib/wbs-id";
+import { archiveTestDesignsBeforeRequirementDelete } from "@/app/actions/test-design";
 
 export type ActionResult = { ok?: true; error?: string };
 
@@ -19,7 +25,7 @@ const PRISMA_DB_SCHEMA_MISMATCH_MESSAGE =
 function prismaKnownToMessage(e: Prisma.PrismaClientKnownRequestError): string {
   switch (e.code) {
     case "P2002":
-      return "与已有数据冲突（例如标题重复或唯一键冲突）。";
+      return "与已有数据冲突（例如同一迭代下 WBS 编号重复、data_id 重复等）。";
     case "P2022":
       return PRISMA_DB_SCHEMA_MISMATCH_MESSAGE;
     case "P2025":
@@ -189,35 +195,31 @@ function messageForPrismaArgumentValueFailure(e: unknown): string | null {
 
 function planDateForLog(d: Date | null | undefined): string {
   if (!d) return "空";
-  try {
-    return d.toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return String(d);
-  }
+  return formatIsoBeijing(d.toISOString());
 }
 
-export type IterationOption = { id: string; label: string };
+export type IterationOption = { id: string; label: string; productId: string };
 
-export async function listIterationOptions(): Promise<IterationOption[]> {
+export async function listIterationOptions(
+  productId?: string | null,
+): Promise<IterationOption[]> {
+  const pid = (productId ?? "").trim();
   const rows = await prisma.iteration.findMany({
+    where: pid ? { productId: pid } : undefined,
     include: { product: true },
     orderBy: [{ updatedAt: "desc" }],
   });
   return rows.map((it) => ({
     id: it.id,
     label: `${it.product.name} / ${it.name}`,
+    productId: it.productId,
   }));
 }
 
 export type RequirementFlat = {
   id: string;
   title: string;
+  wbsId: string | null;
   parentId: string | null;
   iterationId: string;
   sortOrder: number;
@@ -246,6 +248,7 @@ export async function listRequirementsFlat(
       select: {
         id: true,
         title: true,
+        wbsId: true,
         parentId: true,
         iterationId: true,
         sortOrder: true,
@@ -270,6 +273,38 @@ export async function listRequirementsFlat(
       updatedAt: r.updatedAt.toISOString(),
     }));
   } catch (e) {
+    if (isUnknownField(e, "wbsId")) {
+      const rows = await prisma.requirement.findMany({
+        where: { iterationId: id },
+        orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+        select: {
+          id: true,
+          title: true,
+          parentId: true,
+          iterationId: true,
+          sortOrder: true,
+          taskProgress: true,
+          latestProgress: true,
+          priority: true,
+          status: true,
+          submitter: true,
+          devOwner: true,
+          testOwner: true,
+          planStartAt: true,
+          planEndAt: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      return rows.map((r) => ({
+        ...r,
+        wbsId: null,
+        planStartAt: r.planStartAt?.toISOString() ?? null,
+        planEndAt: r.planEndAt?.toISOString() ?? null,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+      }));
+    }
     // 兼容：若 Prisma Client 尚未 generate，可能不认识新字段 devOwner/testOwner
     if (isUnknownField(e, "devOwner") || isUnknownField(e, "testOwner")) {
       const rows = await prisma.requirement.findMany({
@@ -294,6 +329,7 @@ export async function listRequirementsFlat(
       });
       return rows.map((r) => ({
         ...r,
+        wbsId: null,
         devOwner: null,
         testOwner: null,
         planStartAt: r.planStartAt?.toISOString() ?? null,
@@ -325,6 +361,7 @@ export async function listRequirementsFlat(
       });
       return rows.map((r) => ({
         ...r,
+        wbsId: null,
         taskProgress: null,
         latestProgress: null,
         planStartAt: r.planStartAt?.toISOString() ?? null,
@@ -356,6 +393,7 @@ export async function listRequirementsFlat(
       });
       return rows.map((r) => ({
         ...r,
+        wbsId: null,
         planStartAt: null,
         planEndAt: null,
         createdAt: r.createdAt.toISOString(),
@@ -533,11 +571,45 @@ export async function renameRequirementNode(
   }
 }
 
+async function collectRequirementSubtreeIds(
+  rootId: string,
+  tx: Prisma.TransactionClient,
+): Promise<string[]> {
+  const root = await tx.requirement.findUnique({
+    where: { id: rootId },
+    select: { iterationId: true },
+  });
+  if (!root) return [];
+  const all = await tx.requirement.findMany({
+    where: { iterationId: root.iterationId },
+    select: { id: true, parentId: true },
+  });
+  const children = new Map<string, string[]>();
+  for (const r of all) {
+    if (!r.parentId) continue;
+    const arr = children.get(r.parentId) ?? [];
+    arr.push(r.id);
+    children.set(r.parentId, arr);
+  }
+  const out: string[] = [];
+  const stack = [rootId];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    out.push(cur);
+    for (const cid of children.get(cur) ?? []) stack.push(cid);
+  }
+  return out;
+}
+
 export async function deleteRequirementNode(id: string): Promise<ActionResult> {
   const i = id.trim();
   if (!i) return { error: "无效节点" };
   try {
-    await prisma.requirement.delete({ where: { id: i }, select: { id: true } });
+    await prisma.$transaction(async (tx) => {
+      const reqSubtree = await collectRequirementSubtreeIds(i, tx);
+      await archiveTestDesignsBeforeRequirementDelete(tx, reqSubtree);
+      await tx.requirement.delete({ where: { id: i }, select: { id: true } });
+    });
     revalidatePath("/requirements");
     return { ok: true };
   } catch (e) {
@@ -615,9 +687,14 @@ export async function updateRequirementNodeDetail(input: {
   testOwner: string | null;
   planStartAt: string | null;
   planEndAt: string | null;
+  wbsId: string | null;
 }): Promise<ActionResult> {
   const title = input.title.trim();
   if (!title) return { error: "任务名称不能为空" };
+  const nextWbsId =
+    input.wbsId === null || input.wbsId === undefined
+      ? null
+      : input.wbsId.trim() || null;
   const nextPlanStart = parseOptionalPlanDateIso(input.planStartAt);
   const nextPlanEnd = parseOptionalPlanDateIso(input.planEndAt);
   const errPlanStart = planIsoInputErrorIfInvalid(
@@ -652,6 +729,7 @@ export async function updateRequirementNodeDetail(input: {
         testOwner: true,
         planStartAt: true,
         planEndAt: true,
+        wbsId: true,
       },
     });
     if (!before) return { error: "记录不存在或已被删除。" };
@@ -672,6 +750,7 @@ export async function updateRequirementNodeDetail(input: {
           testOwner: input.testOwner,
           planStartAt: nextPlanStart,
           planEndAt: nextPlanEnd,
+          wbsId: nextWbsId,
         },
         select: { id: true },
       });
@@ -691,6 +770,7 @@ export async function updateRequirementNodeDetail(input: {
               submitter: input.submitter,
               planStartAt: nextPlanStart,
               planEndAt: nextPlanEnd,
+              wbsId: nextWbsId,
             },
             select: { id: true },
           });
@@ -709,6 +789,7 @@ export async function updateRequirementNodeDetail(input: {
                 submitter: input.submitter,
                 planStartAt: nextPlanStart,
                 planEndAt: nextPlanEnd,
+                wbsId: nextWbsId,
               },
               select: { id: true },
             });
@@ -725,6 +806,25 @@ export async function updateRequirementNodeDetail(input: {
           data: {
             title,
             description: input.description,
+            priority: input.priority,
+            status: effectiveStatus,
+            submitter: input.submitter,
+            devOwner: input.devOwner,
+            testOwner: input.testOwner,
+            planStartAt: nextPlanStart,
+            planEndAt: nextPlanEnd,
+            wbsId: nextWbsId,
+          },
+          select: { id: true },
+        });
+      } else if (isUnknownField(e, "wbsId")) {
+        await prisma.requirement.update({
+          where: { id: input.id },
+          data: {
+            title,
+            description: input.description,
+            taskProgress: input.taskProgress,
+            latestProgress: input.latestProgress,
             priority: input.priority,
             status: effectiveStatus,
             submitter: input.submitter,
@@ -809,6 +909,11 @@ export async function updateRequirementNodeDetail(input: {
       changes.push(
         `计划结束：${planDateForLog(before.planEndAt)} → ${planDateForLog(nextPlanEnd)}`,
       );
+    }
+    const wb0 = normStrLog(before.wbsId);
+    const wb1 = normStrLog(nextWbsId);
+    if (wb0 !== wb1) {
+      changes.push(`WBS编号：${wb0 || "空"} → ${wb1 || "空"}`);
     }
 
     await appendRequirementOpLog(
@@ -985,6 +1090,8 @@ export async function deleteRequirementAttachment(id: string): Promise<ActionRes
 export type RequirementExportRow = {
   节点ID: string;
   父节点ID: string;
+  data_id: string;
+  wbs_id: string;
   任务名称: string;
   优先级: string;
   状态: string;
@@ -1002,6 +1109,8 @@ export type RequirementExportRow = {
 function mapRequirementToExportRow(r: {
   id: string;
   parentId: string | null;
+  dataId: string | null;
+  wbsId: string | null;
   title: string;
   taskProgress: string | null;
   latestProgress: string | null;
@@ -1018,6 +1127,8 @@ function mapRequirementToExportRow(r: {
   return {
     节点ID: r.id,
     父节点ID: r.parentId ?? "",
+    data_id: r.dataId ?? "",
+    wbs_id: r.wbsId ?? "",
     任务名称: r.title,
     优先级: formatRequirementPriorityExport(r.priority),
     状态: String(r.status),
@@ -1045,6 +1156,8 @@ export async function getRequirementsExportRows(
       select: {
         id: true,
         parentId: true,
+        dataId: true,
+        wbsId: true,
         title: true,
         taskProgress: true,
         latestProgress: true,
@@ -1080,6 +1193,8 @@ export async function getRequirementsExportAllForIteration(
       select: {
         id: true,
         parentId: true,
+        dataId: true,
+        wbsId: true,
         title: true,
         taskProgress: true,
         latestProgress: true,
@@ -1103,6 +1218,10 @@ export async function getRequirementsExportAllForIteration(
 export type ImportRequirementRow = {
   节点ID: string;
   父节点ID: string;
+  /** 外部稳定 ID；与库中已有记录相同时更新该记录，否则新建（可留空） */
+  data_id: string;
+  /** WBS 层级编号（如 1、1.1）；同一迭代内唯一；可仅填此项由程序推断父节点 */
+  wbs_id: string;
   任务名称: string;
   优先级: string;
   状态: string;
@@ -1139,6 +1258,10 @@ function parseRequirementStatusImport(raw: string): RequirementStatus | null {
 type NormalizedImport = {
   oldId: string;
   parentOldId: string | null;
+  /** 非空时按全局唯一匹配已有需求并更新 */
+  dataId: string | null;
+  /** 同一迭代内唯一；用于导入时推断父子（1.1 的父为 1） */
+  wbsId: string | null;
   title: string;
   taskProgress: string | null;
   latestProgress: string | null;
@@ -1176,7 +1299,10 @@ function importRowFailureMessage(item: NormalizedImport, e: unknown): string {
 }
 
 /**
- * 将导出格式 CSV 解析后的行导入到指定迭代（总是新建节点，原 节点ID 仅用于还原父子关系）。
+ * 将导出格式 CSV/Excel 解析后的行导入到指定迭代。
+ * - 若某行提供非空 `data_id` 且库中已存在相同值，则更新该需求（含归属迭代与父节点）；
+ * - 否则新建节点；文件内 `节点ID` 仍用于同一文件内的父子关系映射；
+ * - 若填写 `wbs_id`（如 1.1），且未指定「父节点ID」，则按 WBS 规则推断父行（1.1 的父为 1）。
  */
 export async function importRequirementsCsv(
   iterationId: string,
@@ -1204,6 +1330,10 @@ export async function importRequirementsCsv(
     const priority = parseRequirementPriorityImport(r.优先级);
     const oldIdRaw = r.节点ID.trim();
     const oldId = oldIdRaw || `__import_${i}_${Math.random().toString(16).slice(2)}`;
+    const dataIdTrim = r.data_id.trim();
+    const dataId = dataIdTrim || null;
+    const wbsIdTrim = r.wbs_id.trim();
+    const wbsId = wbsIdTrim || null;
     const parentRaw = r.父节点ID.trim();
     const taskP = r.任务进度.trim();
     const latestP = r.最新进展情况.trim();
@@ -1222,6 +1352,8 @@ export async function importRequirementsCsv(
     normalized.push({
       oldId,
       parentOldId: parentRaw || null,
+      dataId,
+      wbsId,
       title,
       taskProgress: taskP || null,
       latestProgress: latestP || null,
@@ -1240,6 +1372,25 @@ export async function importRequirementsCsv(
 
   const byId = new Map(normalized.map((x) => [x.oldId, x]));
   const idSet = new Set(byId.keys());
+
+  const wbsToOldId = new Map<string, string>();
+  for (const x of normalized) {
+    if (!x.wbsId) continue;
+    if (wbsToOldId.has(x.wbsId)) {
+      return { error: `导入文件中 wbs_id「${x.wbsId}」出现多次` };
+    }
+    wbsToOldId.set(x.wbsId, x.oldId);
+  }
+  for (const x of normalized) {
+    if (x.parentOldId) continue;
+    const w = x.wbsId?.trim();
+    if (!w) continue;
+    const pw = parentWbsFromChildWbs(w);
+    if (!pw) continue;
+    const pOld = wbsToOldId.get(pw);
+    if (pOld) x.parentOldId = pOld;
+  }
+
   for (const x of normalized) {
     if (x.parentOldId && !idSet.has(x.parentOldId)) {
       x.parentOldId = null;
@@ -1252,6 +1403,25 @@ export async function importRequirementsCsv(
       a.title.localeCompare(b.title, "zh-CN"),
   );
 
+  const seenFileDataIds = new Set<string>();
+  for (const x of normalized) {
+    if (!x.dataId) continue;
+    if (seenFileDataIds.has(x.dataId)) {
+      return { error: `导入文件中 data_id「${x.dataId}」出现多次` };
+    }
+    seenFileDataIds.add(x.dataId);
+  }
+  const existingByDataId = new Map<string, string>();
+  if (seenFileDataIds.size > 0) {
+    const foundRows = await prisma.requirement.findMany({
+      where: { dataId: { in: Array.from(seenFileDataIds) } },
+      select: { id: true, dataId: true },
+    });
+    for (const fr of foundRows) {
+      if (fr.dataId) existingByDataId.set(fr.dataId, fr.id);
+    }
+  }
+
   try {
     let imported = 0;
     await prisma.$transaction(async (tx) => {
@@ -1261,6 +1431,335 @@ export async function importRequirementsCsv(
           item.parentOldId && idMap.has(item.parentOldId)
             ? idMap.get(item.parentOldId)!
             : null;
+        const existingFromDataId =
+          item.dataId && existingByDataId.get(item.dataId);
+        if (existingFromDataId) {
+          try {
+            await tx.requirement.update({
+              where: { id: existingFromDataId },
+              data: {
+                iterationId: iter,
+                parentId: newParentId,
+                title: item.title,
+                taskProgress: item.taskProgress,
+                latestProgress: item.latestProgress,
+                priority: item.priority,
+                status: item.status,
+                submitter: item.submitter,
+                devOwner: item.devOwner,
+                testOwner: item.testOwner,
+                planStartAt: item.planStartAt,
+                planEndAt: item.planEndAt,
+                dataId: item.dataId,
+                wbsId: item.wbsId,
+              },
+            });
+            idMap.set(item.oldId, existingFromDataId);
+            imported++;
+          } catch (e) {
+            if (isUnknownField(e, "dataId")) {
+              try {
+                await tx.requirement.update({
+                  where: { id: existingFromDataId },
+                  data: {
+                    iterationId: iter,
+                    parentId: newParentId,
+                    title: item.title,
+                    taskProgress: item.taskProgress,
+                    latestProgress: item.latestProgress,
+                    priority: item.priority,
+                    status: item.status,
+                    submitter: item.submitter,
+                    devOwner: item.devOwner,
+                    testOwner: item.testOwner,
+                    planStartAt: item.planStartAt,
+                    planEndAt: item.planEndAt,
+                    wbsId: item.wbsId,
+                  },
+                });
+                idMap.set(item.oldId, existingFromDataId);
+                imported++;
+              } catch (e2) {
+                if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
+                  try {
+                    await tx.requirement.update({
+                      where: { id: existingFromDataId },
+                      data: {
+                        iterationId: iter,
+                        parentId: newParentId,
+                        title: item.title,
+                        taskProgress: item.taskProgress,
+                        latestProgress: item.latestProgress,
+                        priority: item.priority,
+                        status: item.status,
+                        submitter: item.submitter,
+                        planStartAt: item.planStartAt,
+                        planEndAt: item.planEndAt,
+                        wbsId: item.wbsId,
+                      },
+                    });
+                    idMap.set(item.oldId, existingFromDataId);
+                    imported++;
+                  } catch (e3) {
+                    if (
+                      isUnknownField(e3, "taskProgress") ||
+                      isUnknownField(e3, "latestProgress")
+                    ) {
+                      await tx.requirement.update({
+                        where: { id: existingFromDataId },
+                        data: {
+                          iterationId: iter,
+                          parentId: newParentId,
+                          title: item.title,
+                          priority: item.priority,
+                          status: item.status,
+                          submitter: item.submitter,
+                          planStartAt: item.planStartAt,
+                          planEndAt: item.planEndAt,
+                          wbsId: item.wbsId,
+                        },
+                      });
+                      idMap.set(item.oldId, existingFromDataId);
+                      imported++;
+                    } else {
+                      throw new Error(importRowFailureMessage(item, e3));
+                    }
+                  }
+                } else if (
+                  isUnknownField(e2, "taskProgress") ||
+                  isUnknownField(e2, "latestProgress")
+                ) {
+                  try {
+                    await tx.requirement.update({
+                      where: { id: existingFromDataId },
+                      data: {
+                        iterationId: iter,
+                        parentId: newParentId,
+                        title: item.title,
+                        priority: item.priority,
+                        status: item.status,
+                        submitter: item.submitter,
+                        devOwner: item.devOwner,
+                        testOwner: item.testOwner,
+                        planStartAt: item.planStartAt,
+                        planEndAt: item.planEndAt,
+                        wbsId: item.wbsId,
+                      },
+                    });
+                    idMap.set(item.oldId, existingFromDataId);
+                    imported++;
+                  } catch (e3) {
+                    if (isUnknownField(e3, "devOwner") || isUnknownField(e3, "testOwner")) {
+                      await tx.requirement.update({
+                        where: { id: existingFromDataId },
+                        data: {
+                          iterationId: iter,
+                          parentId: newParentId,
+                          title: item.title,
+                          priority: item.priority,
+                          status: item.status,
+                          submitter: item.submitter,
+                          planStartAt: item.planStartAt,
+                          planEndAt: item.planEndAt,
+                          wbsId: item.wbsId,
+                        },
+                      });
+                      idMap.set(item.oldId, existingFromDataId);
+                      imported++;
+                    } else {
+                      throw new Error(importRowFailureMessage(item, e3));
+                    }
+                  }
+                } else {
+                  throw new Error(importRowFailureMessage(item, e2));
+                }
+              }
+            } else if (isUnknownField(e, "devOwner") || isUnknownField(e, "testOwner")) {
+              try {
+                await tx.requirement.update({
+                  where: { id: existingFromDataId },
+                  data: {
+                    iterationId: iter,
+                    parentId: newParentId,
+                    title: item.title,
+                    taskProgress: item.taskProgress,
+                    latestProgress: item.latestProgress,
+                    priority: item.priority,
+                    status: item.status,
+                    submitter: item.submitter,
+                    planStartAt: item.planStartAt,
+                    planEndAt: item.planEndAt,
+                    dataId: item.dataId,
+                    wbsId: item.wbsId,
+                  },
+                });
+                idMap.set(item.oldId, existingFromDataId);
+                imported++;
+              } catch (e2) {
+                if (isUnknownField(e2, "dataId")) {
+                  try {
+                    await tx.requirement.update({
+                      where: { id: existingFromDataId },
+                      data: {
+                        iterationId: iter,
+                        parentId: newParentId,
+                        title: item.title,
+                        taskProgress: item.taskProgress,
+                        latestProgress: item.latestProgress,
+                        priority: item.priority,
+                        status: item.status,
+                        submitter: item.submitter,
+                        planStartAt: item.planStartAt,
+                        planEndAt: item.planEndAt,
+                        wbsId: item.wbsId,
+                      },
+                    });
+                    idMap.set(item.oldId, existingFromDataId);
+                    imported++;
+                  } catch (e3) {
+                    if (
+                      isUnknownField(e3, "taskProgress") ||
+                      isUnknownField(e3, "latestProgress")
+                    ) {
+                      await tx.requirement.update({
+                        where: { id: existingFromDataId },
+                        data: {
+                          iterationId: iter,
+                          parentId: newParentId,
+                          title: item.title,
+                          priority: item.priority,
+                          status: item.status,
+                          submitter: item.submitter,
+                          planStartAt: item.planStartAt,
+                          planEndAt: item.planEndAt,
+                          wbsId: item.wbsId,
+                        },
+                      });
+                      idMap.set(item.oldId, existingFromDataId);
+                      imported++;
+                    } else {
+                      throw new Error(importRowFailureMessage(item, e3));
+                    }
+                  }
+                } else if (
+                  isUnknownField(e2, "taskProgress") ||
+                  isUnknownField(e2, "latestProgress")
+                ) {
+                  await tx.requirement.update({
+                    where: { id: existingFromDataId },
+                    data: {
+                      iterationId: iter,
+                      parentId: newParentId,
+                      title: item.title,
+                      priority: item.priority,
+                      status: item.status,
+                      submitter: item.submitter,
+                      planStartAt: item.planStartAt,
+                      planEndAt: item.planEndAt,
+                      wbsId: item.wbsId,
+                    },
+                  });
+                  idMap.set(item.oldId, existingFromDataId);
+                  imported++;
+                } else {
+                  throw new Error(importRowFailureMessage(item, e2));
+                }
+              }
+            } else if (
+              isUnknownField(e, "taskProgress") ||
+              isUnknownField(e, "latestProgress")
+            ) {
+              try {
+                await tx.requirement.update({
+                  where: { id: existingFromDataId },
+                  data: {
+                    iterationId: iter,
+                    parentId: newParentId,
+                    title: item.title,
+                    priority: item.priority,
+                    status: item.status,
+                    submitter: item.submitter,
+                    devOwner: item.devOwner,
+                    testOwner: item.testOwner,
+                    planStartAt: item.planStartAt,
+                    planEndAt: item.planEndAt,
+                    dataId: item.dataId,
+                    wbsId: item.wbsId,
+                  },
+                });
+                idMap.set(item.oldId, existingFromDataId);
+                imported++;
+              } catch (e2) {
+                if (isUnknownField(e2, "dataId")) {
+                  try {
+                    await tx.requirement.update({
+                      where: { id: existingFromDataId },
+                      data: {
+                        iterationId: iter,
+                        parentId: newParentId,
+                        title: item.title,
+                        priority: item.priority,
+                        status: item.status,
+                        submitter: item.submitter,
+                        devOwner: item.devOwner,
+                        testOwner: item.testOwner,
+                        planStartAt: item.planStartAt,
+                        planEndAt: item.planEndAt,
+                        wbsId: item.wbsId,
+                      },
+                    });
+                    idMap.set(item.oldId, existingFromDataId);
+                    imported++;
+                  } catch (e3) {
+                    if (isUnknownField(e3, "devOwner") || isUnknownField(e3, "testOwner")) {
+                      await tx.requirement.update({
+                        where: { id: existingFromDataId },
+                        data: {
+                          iterationId: iter,
+                          parentId: newParentId,
+                          title: item.title,
+                          priority: item.priority,
+                          status: item.status,
+                          submitter: item.submitter,
+                          planStartAt: item.planStartAt,
+                          planEndAt: item.planEndAt,
+                          wbsId: item.wbsId,
+                        },
+                      });
+                      idMap.set(item.oldId, existingFromDataId);
+                      imported++;
+                    } else {
+                      throw new Error(importRowFailureMessage(item, e3));
+                    }
+                  }
+                } else if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
+                  await tx.requirement.update({
+                    where: { id: existingFromDataId },
+                    data: {
+                      iterationId: iter,
+                      parentId: newParentId,
+                      title: item.title,
+                      priority: item.priority,
+                      status: item.status,
+                      submitter: item.submitter,
+                      planStartAt: item.planStartAt,
+                      planEndAt: item.planEndAt,
+                      wbsId: item.wbsId,
+                    },
+                  });
+                  idMap.set(item.oldId, existingFromDataId);
+                  imported++;
+                } else {
+                  throw new Error(importRowFailureMessage(item, e2));
+                }
+              }
+            } else {
+              throw new Error(importRowFailureMessage(item, e));
+            }
+          }
+          continue;
+        }
+
         const maxSort = await tx.requirement.aggregate({
           where: { iterationId: iter, parentId: newParentId },
           _max: { sortOrder: true },
@@ -1282,6 +1781,8 @@ export async function importRequirementsCsv(
               planStartAt: item.planStartAt,
               planEndAt: item.planEndAt,
               sortOrder,
+              dataId: item.dataId,
+              wbsId: item.wbsId,
             },
             select: { id: true },
           });
@@ -1303,6 +1804,8 @@ export async function importRequirementsCsv(
                   planStartAt: item.planStartAt,
                   planEndAt: item.planEndAt,
                   sortOrder,
+                  dataId: item.dataId,
+                  wbsId: item.wbsId,
                 },
                 select: { id: true },
               });
@@ -1324,6 +1827,8 @@ export async function importRequirementsCsv(
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
                     sortOrder,
+                    dataId: item.dataId,
+                    wbsId: item.wbsId,
                   },
                   select: { id: true },
                 });
@@ -1351,6 +1856,8 @@ export async function importRequirementsCsv(
                   planStartAt: item.planStartAt,
                   planEndAt: item.planEndAt,
                   sortOrder,
+                  dataId: item.dataId,
+                  wbsId: item.wbsId,
                 },
                 select: { id: true },
               });
@@ -1369,6 +1876,106 @@ export async function importRequirementsCsv(
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
                     sortOrder,
+                    dataId: item.dataId,
+                    wbsId: item.wbsId,
+                  },
+                  select: { id: true },
+                });
+                idMap.set(item.oldId, row.id);
+                imported++;
+              } else {
+                throw new Error(importRowFailureMessage(item, e2));
+              }
+            }
+          } else if (isUnknownField(e, "dataId")) {
+            try {
+              const row = await tx.requirement.create({
+                data: {
+                  iterationId: iter,
+                  parentId: newParentId,
+                  title: item.title,
+                  taskProgress: item.taskProgress,
+                  latestProgress: item.latestProgress,
+                  priority: item.priority,
+                  status: item.status,
+                  submitter: item.submitter,
+                  devOwner: item.devOwner,
+                  testOwner: item.testOwner,
+                  planStartAt: item.planStartAt,
+                  planEndAt: item.planEndAt,
+                  sortOrder,
+                  wbsId: item.wbsId,
+                },
+                select: { id: true },
+              });
+              idMap.set(item.oldId, row.id);
+              imported++;
+            } catch (e2) {
+              if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
+                try {
+                  const row = await tx.requirement.create({
+                    data: {
+                      iterationId: iter,
+                      parentId: newParentId,
+                      title: item.title,
+                      taskProgress: item.taskProgress,
+                      latestProgress: item.latestProgress,
+                      priority: item.priority,
+                      status: item.status,
+                      submitter: item.submitter,
+                      planStartAt: item.planStartAt,
+                      planEndAt: item.planEndAt,
+                      sortOrder,
+                      wbsId: item.wbsId,
+                    },
+                    select: { id: true },
+                  });
+                  idMap.set(item.oldId, row.id);
+                  imported++;
+                } catch (e3) {
+                  if (
+                    isUnknownField(e3, "taskProgress") ||
+                    isUnknownField(e3, "latestProgress")
+                  ) {
+                    const row = await tx.requirement.create({
+                      data: {
+                        iterationId: iter,
+                        parentId: newParentId,
+                        title: item.title,
+                        priority: item.priority,
+                        status: item.status,
+                        submitter: item.submitter,
+                        planStartAt: item.planStartAt,
+                        planEndAt: item.planEndAt,
+                        sortOrder,
+                        wbsId: item.wbsId,
+                      },
+                      select: { id: true },
+                    });
+                    idMap.set(item.oldId, row.id);
+                    imported++;
+                  } else {
+                    throw new Error(importRowFailureMessage(item, e3));
+                  }
+                }
+              } else if (
+                isUnknownField(e2, "taskProgress") ||
+                isUnknownField(e2, "latestProgress")
+              ) {
+                const row = await tx.requirement.create({
+                  data: {
+                    iterationId: iter,
+                    parentId: newParentId,
+                    title: item.title,
+                    priority: item.priority,
+                    status: item.status,
+                    submitter: item.submitter,
+                    devOwner: item.devOwner,
+                    testOwner: item.testOwner,
+                    planStartAt: item.planStartAt,
+                    planEndAt: item.planEndAt,
+                    sortOrder,
+                    wbsId: item.wbsId,
                   },
                   select: { id: true },
                 });
@@ -1413,9 +2020,19 @@ export async function duplicateRequirementAsChild(
         testOwner: true,
         planStartAt: true,
         planEndAt: true,
+        wbsId: true,
       },
     });
     if (!parent) return { error: "父节点不存在" };
+
+    const siblingWbsRows = await prisma.requirement.findMany({
+      where: { iterationId: parent.iterationId, parentId: parent.id },
+      select: { wbsId: true },
+    });
+    const nextWbs = nextWbsForNewSiblingUnderParent(
+      parent.wbsId,
+      siblingWbsRows.map((s) => s.wbsId),
+    );
 
     const maxSort = await prisma.requirement.aggregate({
       where: { iterationId: parent.iterationId, parentId: parent.id },
@@ -1440,6 +2057,7 @@ export async function duplicateRequirementAsChild(
           planStartAt: parent.planStartAt,
           planEndAt: parent.planEndAt,
           sortOrder,
+          wbsId: nextWbs,
         },
         select: { id: true },
       });
@@ -1460,6 +2078,7 @@ export async function duplicateRequirementAsChild(
               planStartAt: parent.planStartAt,
               planEndAt: parent.planEndAt,
               sortOrder,
+              wbsId: nextWbs,
             },
             select: { id: true },
           });
@@ -1480,6 +2099,7 @@ export async function duplicateRequirementAsChild(
                 planStartAt: parent.planStartAt,
                 planEndAt: parent.planEndAt,
                 sortOrder,
+                wbsId: nextWbs,
               },
               select: { id: true },
             });
@@ -1506,6 +2126,7 @@ export async function duplicateRequirementAsChild(
               planStartAt: parent.planStartAt,
               planEndAt: parent.planEndAt,
               sortOrder,
+              wbsId: nextWbs,
             },
             select: { id: true },
           });
@@ -1523,6 +2144,7 @@ export async function duplicateRequirementAsChild(
                 planStartAt: parent.planStartAt,
                 planEndAt: parent.planEndAt,
                 sortOrder,
+                wbsId: nextWbs,
               },
               select: { id: true },
             });
@@ -1571,8 +2193,17 @@ export async function bulkDeleteRequirements(input: {
       toDelete.add(cur);
       for (const cid of children.get(cur) ?? []) stack.push(cid);
     }
+    const deleteIds = Array.from(toDelete);
+    const tdCount = await prisma.testDesign.count({
+      where: { requirementId: { in: deleteIds } },
+    });
+    if (tdCount > 0) {
+      return {
+        error: `无法删除：所选范围（含子节点）下仍有关联的测试设计共 ${tdCount} 条。请先迁移、删除测试设计，或解除关联后再删除需求。`,
+      };
+    }
     await prisma.requirement.deleteMany({
-      where: { id: { in: Array.from(toDelete) } },
+      where: { id: { in: deleteIds } },
     });
     revalidatePath("/requirements");
     return { ok: true };

@@ -1132,10 +1132,49 @@ export async function deleteDefect(id: string): Promise<ActionResult> {
   const i = id.trim();
   if (!i) return { error: "无效缺陷" };
   try {
-    const db = prisma as unknown as {
-      defect: { delete: (args: unknown) => Promise<{ id: string }> };
-    };
-    await db.defect.delete({ where: { id: i }, select: { id: true } });
+    await prisma.$transaction(async (tx) => {
+      const db = tx as unknown as {
+        defect: {
+          findUnique: (args: unknown) => Promise<unknown>;
+          delete: (args: unknown) => Promise<{ id: string }>;
+        };
+        defectDeleted: { createMany: (args: unknown) => Promise<unknown> };
+      };
+      const row = (await db.defect.findUnique({
+        where: { id: i },
+        include: { linkedCases: { select: { testCaseId: true } } },
+      })) as unknown as
+        | (Record<string, unknown> & { linkedCases?: Array<{ testCaseId: string }> })
+        | null;
+      if (!row) return;
+      const deletedAt = new Date();
+      await db.defectDeleted.createMany({
+        data: [
+          {
+            originalId: String(row.id),
+            defectNo: String(row.defectNo),
+            name: String(row.name),
+            status: row.status,
+            severity: row.severity,
+            iterationCode: row.iterationCode ?? null,
+            caseNo: row.caseNo ?? null,
+            devOwner: row.devOwner ?? null,
+            submitter: row.submitter ?? null,
+            foundAt: row.foundAt ?? null,
+            description: row.description ?? null,
+            linkedTestId: row.linkedTestId ?? null,
+            linkedProject: row.linkedProject ?? null,
+            reopenCount: Number(row.reopenCount ?? 0),
+            updatedBy: row.updatedBy ?? null,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            deletedAt,
+            linkedTestCaseIds: (row.linkedCases ?? []).map((x) => x.testCaseId),
+          },
+        ],
+      });
+      await db.defect.delete({ where: { id: i }, select: { id: true } });
+    });
     revalidatePath("/defects");
     return { ok: true };
   } catch (e) {
@@ -1147,10 +1186,46 @@ export async function bulkDeleteDefects(ids: string[]): Promise<ActionResult> {
   const uniq = Array.from(new Set(ids.map((x) => x.trim()).filter(Boolean)));
   if (uniq.length === 0) return { error: "请选择要删除的缺陷" };
   try {
-    const db = prisma as unknown as {
-      defect: { deleteMany: (args: unknown) => Promise<unknown> };
-    };
-    await db.defect.deleteMany({ where: { id: { in: uniq } } });
+    await prisma.$transaction(async (tx) => {
+      const db = tx as unknown as {
+        defect: {
+          findMany: (args: unknown) => Promise<unknown[]>;
+          deleteMany: (args: unknown) => Promise<unknown>;
+        };
+        defectDeleted: { createMany: (args: unknown) => Promise<unknown> };
+      };
+      const rows = (await db.defect.findMany({
+        where: { id: { in: uniq } },
+        include: { linkedCases: { select: { testCaseId: true } } },
+      })) as unknown as Array<
+        Record<string, unknown> & { linkedCases?: Array<{ testCaseId: string }> }
+      >;
+      const deletedAt = new Date();
+      await db.defectDeleted.createMany({
+        data: rows.map((row) => ({
+          originalId: String(row.id),
+          defectNo: String(row.defectNo),
+          name: String(row.name),
+          status: row.status,
+          severity: row.severity,
+          iterationCode: row.iterationCode ?? null,
+          caseNo: row.caseNo ?? null,
+          devOwner: row.devOwner ?? null,
+          submitter: row.submitter ?? null,
+          foundAt: row.foundAt ?? null,
+          description: row.description ?? null,
+          linkedTestId: row.linkedTestId ?? null,
+          linkedProject: row.linkedProject ?? null,
+          reopenCount: Number(row.reopenCount ?? 0),
+          updatedBy: row.updatedBy ?? null,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+          deletedAt,
+          linkedTestCaseIds: (row.linkedCases ?? []).map((x) => x.testCaseId),
+        })),
+      });
+      await db.defect.deleteMany({ where: { id: { in: uniq } } });
+    });
     revalidatePath("/defects");
     return { ok: true };
   } catch (e) {

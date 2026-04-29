@@ -31,6 +31,7 @@ export default async function RequirementNodePage({
         iterationId={node.iterationId}
         breadcrumb={breadcrumb}
         initialTitle={node.title}
+        initialWbsId={node.wbsId}
         initialDescription={node.description}
         initialTaskProgress={node.taskProgress}
         initialLatestProgress={node.latestProgress}
@@ -41,6 +42,7 @@ export default async function RequirementNodePage({
         initialTestOwner={node.testOwner}
         initialPlanStartAt={node.planStartAt?.toISOString() ?? null}
         initialPlanEndAt={node.planEndAt?.toISOString() ?? null}
+        initialUpdatedAt={node.updatedAt.toISOString()}
         initialAttachments={node.attachments.map((a) => ({
           id: a.id,
           name: a.name,

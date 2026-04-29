@@ -23,6 +23,10 @@ import {
 import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
 import {
+  getGlobalIterationProductPreference,
+  saveGlobalIterationProductPreference,
+} from "@/app/actions/executions";
+import {
   listTestCaseIdOptions,
   searchTestCaseIdOptions,
   type TestCaseIdOption,
@@ -161,6 +165,8 @@ export function DefectManagementClient() {
   const [batchWorking, setBatchWorking] = useState(false);
 
   const [products, setProducts] = useState<ProductOption[]>([]);
+  const [productId, setProductId] = useState("");
+  const productPrefHydratedRef = useRef(false);
   const productLabelById = useMemo(() => {
     const m = new Map<string, string>();
     for (const p of products) {
@@ -172,8 +178,17 @@ export function DefectManagementClient() {
 
   const [caseOptions, setCaseOptions] = useState<TestCaseIdOption[]>([]);
   const [iterationOptions, setIterationOptions] = useState<
-    { code: string; label: string }[]
-  >([{ code: "", label: "baseline（全部迭代）" }]);
+    { code: string; label: string; productId?: string | null }[]
+  >([{ code: "", label: "baseline（全部迭代）", productId: null }]);
+  const visibleIterationOptions = useMemo(
+    () =>
+      productId
+        ? iterationOptions.filter(
+            (o) => o.code === "" || (o.productId ?? "") === productId,
+          )
+        : iterationOptions,
+    [iterationOptions, productId],
+  );
   const iterationLabelByCode = useMemo(() => {
     const m = new Map<string, string>();
     for (const it of iterationOptions) m.set(it.code, it.label);
@@ -283,6 +298,41 @@ export function DefectManagementClient() {
       }
     })();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate) setProductId(candidate);
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, products]);
+
+  useEffect(() => {
+    if (!productPrefHydratedRef.current || !productId) return;
+    setAdv((p) => ({ ...p, linkedProject: productId }));
+    setDraft((p) => ({ ...p, linkedProject: p.linkedProject || productId }));
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [productId]);
+
+  useEffect(() => {
+    if (!visibleIterationOptions.some((o) => o.code === adv.iterationCode)) {
+      setAdv((p) => ({ ...p, iterationCode: "" }));
+    }
+  }, [visibleIterationOptions, adv.iterationCode]);
 
   useEffect(() => {
     const el = selectAllRef.current;
@@ -693,7 +743,10 @@ export function DefectManagementClient() {
   };
 
   const visible = useMemo(() => rows, [rows]);
-  const defectPager = usePagination(visible, { defaultPageSize: 20 });
+  const defectPager = usePagination(visible, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.defects",
+  });
 
   const startResizeCol = useCallback(
     (e: React.MouseEvent, key: DefectColumnKey) => {
@@ -829,6 +882,18 @@ export function DefectManagementClient() {
                 </p>
               </div>
               <div className="flex flex-shrink-0 items-center gap-1.5">
+                <select
+                  className="h-8 rounded-lg border border-zinc-300 bg-white px-2.5 text-sm"
+                  value={productId}
+                  onChange={(e) => setProductId(e.target.value)}
+                  title="切换产品后，仅展示该产品迭代"
+                >
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.code ? `${p.name}（${p.code}）` : p.name}
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
                   onClick={() => setAdvOpen((o) => !o)}
@@ -1029,7 +1094,7 @@ export function DefectManagementClient() {
                           setAdv((p) => ({ ...p, iterationCode: e.target.value }))
                         }
                       >
-                        {iterationOptions.map((o) => (
+                        {visibleIterationOptions.map((o) => (
                           <option key={o.code || "__baseline__"} value={o.code}>
                             {o.label}
                           </option>
@@ -1552,7 +1617,7 @@ export function DefectManagementClient() {
                                           setAddLinkIterCode(e.target.value)
                                         }
                                       >
-                                        {iterationOptions.map((o) => (
+                                        {visibleIterationOptions.map((o) => (
                                           <option
                                             key={o.code || "__baseline__"}
                                             value={o.code}
@@ -1940,7 +2005,7 @@ export function DefectManagementClient() {
                         }
                         title="选择缺陷归属迭代（可用于后续筛选/统计）"
                       >
-                        {iterationOptions.map((o) => (
+                        {visibleIterationOptions.map((o) => (
                           <option key={o.code || "__baseline__"} value={o.code}>
                             {o.label}
                           </option>

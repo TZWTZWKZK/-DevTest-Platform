@@ -87,7 +87,10 @@ export function ProductManagement({
     setProducts(initialProducts);
   }, [initialProducts]);
 
-  const prodPager = usePagination(products, { defaultPageSize: 20 });
+  const prodPager = usePagination(products, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.products",
+  });
 
   const parentChoices = useMemo(() => {
     const selfId = editing?.id;

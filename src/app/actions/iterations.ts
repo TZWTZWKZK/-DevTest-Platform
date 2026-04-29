@@ -2,6 +2,7 @@
 
 import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
+import { archiveTestDesignsBeforeRequirementDelete } from "@/app/actions/test-design";
 import { prisma } from "@/lib/prisma";
 
 export type ActionResult = { ok?: true; error?: string };
@@ -117,16 +118,21 @@ export async function listIterationsByProduct(
 export type IterationCodeOption = { code: string; label: string };
 
 /** baseline + 全部迭代（用于测试设计/用例库按迭代筛选） */
-export async function listIterationCodeOptions(): Promise<IterationCodeOption[]> {
+export async function listIterationCodeOptions(
+  productId?: string | null,
+): Promise<Array<IterationCodeOption & { productId: string | null }>> {
+  const pid = (productId ?? "").trim();
   const rows = await prisma.iteration.findMany({
+    where: pid ? { productId: pid } : undefined,
     include: { product: true },
     orderBy: [{ updatedAt: "desc" }],
   });
   const opts = rows.map((it) => ({
     code: it.code,
     label: `${it.product.name} / ${it.name}（${it.code}）`,
+    productId: it.productId,
   }));
-  return [{ code: "", label: "baseline（全部迭代）" }, ...opts];
+  return [{ code: "", label: "baseline（全部迭代）", productId: null }, ...opts];
 }
 
 function genIterationCode(now = new Date()): string {
@@ -360,7 +366,17 @@ export async function deleteIteration(id: string): Promise<ActionResult> {
   const i = id.trim();
   if (!i) return { error: "无效迭代" };
   try {
-    await prisma.iteration.delete({ where: { id: i }, select: { id: true } });
+    await prisma.$transaction(async (tx) => {
+      const reqs = await tx.requirement.findMany({
+        where: { iterationId: i },
+        select: { id: true },
+      });
+      await archiveTestDesignsBeforeRequirementDelete(
+        tx,
+        reqs.map((r) => r.id),
+      );
+      await tx.iteration.delete({ where: { id: i }, select: { id: true } });
+    });
     revalidatePath("/iterations");
     return { ok: true };
   } catch (e) {

@@ -16,12 +16,17 @@ import {
   bulkDuplicateExecutionTasks,
   bulkMoveExecutionTasksToIteration,
   createExecutionTaskNode,
+  getGlobalExecutionIterationPreference,
+  getGlobalIterationProductPreference,
   getExecutionTaskListColumnConfig,
   listExecutionTasksFlat,
   renameExecutionTaskNode,
+  saveGlobalIterationProductPreference,
+  saveGlobalExecutionIterationPreference,
   saveExecutionTaskListColumnConfig,
   type ExecutionTaskFlat,
 } from "@/app/actions/executions";
+import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
   ModuleWorkspaceCard,
   MODULE_TOOLBAR_BTN_PRIMARY,
@@ -52,14 +57,19 @@ function formatTs(iso: string): string {
   }
 }
 
-type IterOpt = { id: string; label: string; taskCount: number };
+type IterOpt = { id: string; label: string; taskCount: number; productId: string };
 
 function formatIterationOption(it: IterOpt): string {
   return `${it.label} · ${it.taskCount} 个任务`;
 }
 
-/** 执行情况：通过数/导入数（通过率，分母为 0 时按 0%） */
-function formatExecProgress(passed: number, total: number): string {
+/** 比率：num/total（分母为 0 时按 0%） */
+function formatExecProgress(executed: number, total: number): string {
+  const pct = total === 0 ? 0 : Math.round((executed / total) * 100);
+  return `${executed}/${total} (${pct}%)`;
+}
+
+function formatPassRate(passed: number, total: number): string {
   const pct = total === 0 ? 0 : Math.round((passed / total) * 100);
   return `${passed}/${total} (${pct}%)`;
 }
@@ -105,9 +115,14 @@ export function ExecutionTaskTreeClient({
   initialIterationId?: string;
 }) {
   const router = useRouter();
+  const [products, setProducts] = useState<ProductOption[]>([]);
+  const [productId, setProductId] = useState("");
+  const productPrefHydratedRef = useRef(false);
+  const hasUrlIterationId = !!initialIterationId?.trim();
   const [iterationId, setIterationId] = useState(() =>
     resolveInitialIterationId(initialIterations, initialIterationId),
   );
+  const iterationPrefHydratedRef = useRef(false);
 
   useEffect(() => {
     const u = initialIterationId?.trim();
@@ -116,15 +131,101 @@ export function ExecutionTaskTreeClient({
     if (!resolved) return;
     setIterationId((prev) => (prev === resolved ? prev : resolved));
   }, [initialIterationId, initialIterations]);
+
+  useEffect(() => {
+    if (hasUrlIterationId) return;
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalExecutionIterationPreference();
+      if (cancelled) return;
+      const candidate = (pref.iterationId ?? "").trim();
+      if (candidate && initialIterations.some((it) => it.id === candidate)) {
+        setIterationId((prev) => (prev === candidate ? prev : candidate));
+      }
+      iterationPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasUrlIterationId, initialIterations]);
+
+  useEffect(() => {
+    if (hasUrlIterationId || !iterationPrefHydratedRef.current) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalExecutionIterationPreference({ iterationId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [hasUrlIterationId, iterationId]);
   const [flat, setFlat] = useState<ExecutionTaskFlat[]>([]);
+  const visibleIterations = useMemo(
+    () =>
+      productId
+        ? initialIterations.filter((it) => it.productId === productId)
+        : initialIterations,
+    [initialIterations, productId],
+  );
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const ps = await listProductOptions();
+        setProducts(ps);
+      } catch {
+        setProducts([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const hit = initialIterations.find((it) => it.id === iterationId);
+    if (hit?.productId) setProductId((prev) => prev || hit.productId);
+  }, [initialIterations, iterationId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate) setProductId((prev) => prev || candidate);
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, products]);
+
+  useEffect(() => {
+    if (!productPrefHydratedRef.current || !productId) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [productId]);
+
+  useEffect(() => {
+    if (visibleIterations.length === 0) {
+      setIterationId("");
+      return;
+    }
+    if (!visibleIterations.some((it) => it.id === iterationId)) {
+      setIterationId(visibleIterations[0]!.id);
+    }
+  }, [visibleIterations, iterationId]);
+
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const iterationLabel = useMemo(
     () =>
-      initialIterations.find((x) => x.id === iterationId)?.label ??
+      visibleIterations.find((x) => x.id === iterationId)?.label ??
       (iterationId ? "当前迭代" : ""),
-    [initialIterations, iterationId],
+    [visibleIterations, iterationId],
   );
 
   const [createOpen, setCreateOpen] = useState(true);
@@ -139,6 +240,8 @@ export function ExecutionTaskTreeClient({
     config: colConfig,
     setConfig: setColConfig,
     visibleOrdered,
+    setVisible,
+    moveKey,
     setWidth,
     widthFor,
     defaultConfig,
@@ -150,6 +253,8 @@ export function ExecutionTaskTreeClient({
   } | null>(null);
 
   const [listTitleQ, setListTitleQ] = useState("");
+  const [colPanelOpen, setColPanelOpen] = useState(false);
+  const colPanelRef = useRef<HTMLDivElement | null>(null);
   const [pickedIds, setPickedIds] = useState<string[]>([]);
   const pickAllRef = useRef<HTMLInputElement | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
@@ -212,6 +317,19 @@ export function ExecutionTaskTreeClient({
     }, 450);
     return () => clearTimeout(t);
   }, [colConfig]);
+
+  useEffect(() => {
+    if (!colPanelOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const el = colPanelRef.current;
+      if (!el) return;
+      const t = e.target as unknown;
+      if (!(t instanceof Element)) return;
+      if (!el.contains(t)) setColPanelOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [colPanelOpen]);
 
   const reload = useCallback(async () => {
     if (!iterationId) {
@@ -368,7 +486,10 @@ export function ExecutionTaskTreeClient({
     walk(tree, 0);
     return out;
   }, [expanded, tree]);
-  const rowPager = usePagination(visibleRows, { defaultPageSize: 20 });
+  const rowPager = usePagination(visibleRows, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.executions",
+  });
   const pagedRows = rowPager.pagedItems;
   const pagedVisibleIds = useMemo(() => pagedRows.map((x) => x.n.id), [pagedRows]);
   const pickedSet = useMemo(() => new Set(pickedIds), [pickedIds]);
@@ -485,8 +606,7 @@ export function ExecutionTaskTreeClient({
   const runBulkMove = useCallback(async () => {
     if (pickedIds.length === 0 || !moveTargetIterId) return;
     const label =
-      initialIterations.find((x) => x.id === moveTargetIterId)?.label ??
-      "目标迭代";
+      visibleIterations.find((x) => x.id === moveTargetIterId)?.label ?? "目标迭代";
     if (
       !window.confirm(
         `将已选 ${pickedIds.length} 项任务（含子树）转移到「${label}」？`,
@@ -507,7 +627,7 @@ export function ExecutionTaskTreeClient({
     setPickedIds([]);
     setMoveTargetIterId("");
     await reload();
-  }, [initialIterations, moveTargetIterId, pickedIds, reload]);
+  }, [visibleIterations, moveTargetIterId, pickedIds, reload]);
 
   const createRoot = async () => {
     if (!iterationId) return;
@@ -633,9 +753,22 @@ export function ExecutionTaskTreeClient({
                 <td
                   key={k}
                   className="px-3 py-2 align-top text-xs text-zinc-600 tabular-nums"
-                  title="通过：该任务下已导入用例中，最近一条执行记录为「通过」的条数；分母为已导入用例总数；括号为通过占比（四舍五入取整）"
+                  title="执行情况：状态不为空/用例总数。这里“状态不为空”按该任务下该用例的执行结果不为空判定；括号为占比（四舍五入取整）。"
                 >
-                  {formatExecProgress(n.passedCaseCount, n.linkedCaseCount)}
+                  {formatExecProgress(
+                    Math.max(0, n.linkedCaseCount - (n.latestStatusCounts?.NONE ?? 0)),
+                    n.linkedCaseCount,
+                  )}
+                </td>
+              );
+            case "passRate":
+              return (
+                <td
+                  key={k}
+                  className="px-3 py-2 align-top text-xs text-zinc-600 tabular-nums"
+                  title="通过率：成功/用例总数。成功=该任务下该用例的最近一次执行状态为「成功」；括号为成功占比（四舍五入取整）。"
+                >
+                  {formatPassRate(n.passedCaseCount, n.linkedCaseCount)}
                 </td>
               );
             case "createdBy":
@@ -678,6 +811,24 @@ export function ExecutionTaskTreeClient({
         <div className="shrink-0 border-b border-zinc-200 bg-zinc-50/60 px-3 py-2 sm:px-4">
           <div className="flex flex-wrap items-end gap-3 gap-y-2">
             <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
+              <label className="text-xs font-medium text-zinc-600">所属产品</label>
+              <select
+                className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm"
+                value={productId}
+                onChange={(e) => setProductId(e.target.value)}
+              >
+                {products.length === 0 ? (
+                  <option value="">暂无产品，请先在「产品管理」中创建</option>
+                ) : (
+                  products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.code ? `${p.name}（${p.code}）` : p.name}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+            <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
               <label className="text-xs font-medium text-zinc-600">所属迭代</label>
               <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
                 <select
@@ -685,10 +836,10 @@ export function ExecutionTaskTreeClient({
                   value={iterationId}
                   onChange={(e) => setIterationId(e.target.value)}
                 >
-                  {initialIterations.length === 0 ? (
+                  {visibleIterations.length === 0 ? (
                     <option value="">暂无迭代，请先在「产品管理」中创建</option>
                   ) : (
-                    initialIterations.map((it) => (
+                    visibleIterations.map((it) => (
                       <option key={it.id} value={it.id}>
                         {formatIterationOption(it)}
                       </option>
@@ -809,6 +960,91 @@ export function ExecutionTaskTreeClient({
                         : `共 ${filteredFlat.length} 条（筛选后）`}
                     </span>
                     <div className="flex items-center gap-2">
+                      <div className="relative" ref={colPanelRef}>
+                        <button
+                          type="button"
+                          className="rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm text-zinc-700 shadow-sm hover:bg-zinc-50"
+                          title="列表列设置（显隐、顺序；表头可拖竖线调宽）"
+                          aria-expanded={colPanelOpen}
+                          aria-haspopup="true"
+                          aria-label="执行任务列表列设置"
+                          onClick={() => setColPanelOpen((o) => !o)}
+                        >
+                          ⚙
+                        </button>
+                        {colPanelOpen ? (
+                          <div
+                            className="absolute right-0 top-[calc(100%+8px)] z-20 w-[320px] rounded-xl border border-zinc-200 bg-white p-2 shadow-xl"
+                            role="dialog"
+                            aria-label="列设置"
+                          >
+                            <div
+                              className="px-2 pb-2 text-xs font-medium text-zinc-500"
+                              aria-label="列设置标题"
+                            >
+                              列设置
+                            </div>
+                            <div className="max-h-[min(70vh,28rem)] overflow-y-auto p-1">
+                              {colConfig.order.map((key, idx) => (
+                                <div
+                                  key={key}
+                                  className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-zinc-50"
+                                >
+                                  <input
+                                    id={`exec-col-${key}`}
+                                    type="checkbox"
+                                    className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                    checked={colConfig.visible[key] !== false}
+                                    onChange={(e) => setVisible(key, e.target.checked)}
+                                  />
+                                  <label
+                                    htmlFor={`exec-col-${key}`}
+                                    className="min-w-0 flex-1 cursor-pointer text-sm text-zinc-800"
+                                  >
+                                    {EXEC_TASK_COLUMN_LABELS[key]}
+                                  </label>
+                                  <div className="flex shrink-0 gap-0.5">
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
+                                      disabled={idx === 0}
+                                      title="上移"
+                                      onClick={() => moveKey(key, -1)}
+                                    >
+                                      ↑
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
+                                      disabled={idx === colConfig.order.length - 1}
+                                      title="下移"
+                                      onClick={() => moveKey(key, 1)}
+                                    >
+                                      ↓
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                            <div className="mt-2 flex items-center justify-between gap-2 border-t border-zinc-100 pt-2">
+                              <button
+                                type="button"
+                                className="rounded-lg border border-zinc-200 px-2.5 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                                onClick={() => setColConfig(defaultConfig)}
+                              >
+                                重置默认
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-lg bg-zinc-900 px-3 py-2 text-xs font-medium text-white"
+                                onClick={() => setColPanelOpen(false)}
+                              >
+                                关闭
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
                       <button
                         type="button"
                         className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
@@ -847,11 +1083,11 @@ export function ExecutionTaskTreeClient({
                       <select
                         className="max-w-[min(100vw,280px)] rounded-lg border border-zinc-300 bg-white px-2 py-1 text-xs"
                         value={moveTargetIterId}
-                        disabled={batchBusy || initialIterations.length < 2}
+                        disabled={batchBusy || visibleIterations.length < 2}
                         onChange={(e) => setMoveTargetIterId(e.target.value)}
                       >
                         <option value="">选择目标迭代…</option>
-                        {initialIterations
+                        {visibleIterations
                           .filter((it) => it.id !== iterationId)
                           .map((it) => (
                             <option key={it.id} value={it.id}>

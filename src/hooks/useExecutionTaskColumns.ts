@@ -6,6 +6,7 @@ import { normalizeColumnOrder } from "@/lib/normalize-column-order";
 export const EXEC_TASK_COLUMN_KEYS = [
   "title",
   "linkedCaseCount",
+  "passRate",
   "createdBy",
   "updatedBy",
   "updatedAt",
@@ -16,6 +17,7 @@ export type ExecTaskColumnKey = (typeof EXEC_TASK_COLUMN_KEYS)[number];
 export const EXEC_TASK_COLUMN_LABELS: Record<ExecTaskColumnKey, string> = {
   title: "任务名称",
   linkedCaseCount: "执行情况",
+  passRate: "通过率",
   createdBy: "创建人",
   updatedBy: "修改人",
   updatedAt: "更新时间",
@@ -24,6 +26,7 @@ export const EXEC_TASK_COLUMN_LABELS: Record<ExecTaskColumnKey, string> = {
 const DEFAULT_WIDTH: Record<ExecTaskColumnKey, number> = {
   title: 360,
   linkedCaseCount: 140,
+  passRate: 140,
   createdBy: 112,
   updatedBy: 112,
   updatedAt: 180,
@@ -34,6 +37,7 @@ const DEFAULT_ORDER: ExecTaskColumnKey[] = [...EXEC_TASK_COLUMN_KEYS];
 const DEFAULT_VISIBLE: Record<ExecTaskColumnKey, boolean> = {
   title: true,
   linkedCaseCount: true,
+  passRate: true,
   createdBy: true,
   updatedBy: true,
   updatedAt: true,

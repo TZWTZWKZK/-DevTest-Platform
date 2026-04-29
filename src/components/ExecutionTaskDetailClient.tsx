@@ -35,6 +35,7 @@ import { TestCaseLibraryClient } from "@/components/TestCaseLibraryClient";
 import { formatCaseLevelDisplay } from "@/lib/case-level";
 import {
   type ExecImportedCaseColumnKey,
+  EXEC_IMPORTED_CASE_COLUMN_KEYS,
   useExecutionImportedCaseColumns,
 } from "@/hooks/useExecutionImportedCaseColumns";
 import { usePagination } from "@/hooks/usePagination";
@@ -193,7 +194,10 @@ export function ExecutionTaskDetailClient({
     );
   }, [advFilteredRows, q]);
 
-  const importedPager = usePagination(filteredLinkedRows, { defaultPageSize: 20 });
+  const importedPager = usePagination(filteredLinkedRows, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.executionDetailLinked",
+  });
   const pagedImportedRows = importedPager.pagedItems;
 
   useEffect(() => {
@@ -391,6 +395,7 @@ export function ExecutionTaskDetailClient({
   const [idxColW, setIdxColW] = useState(40);
   const importedColPanelRef = useRef<HTMLDivElement | null>(null);
   const [importedColPanelOpen, setImportedColPanelOpen] = useState(false);
+  const importedColSaveSigRef = useRef<string>("");
   const {
     config: importedColConfig,
     mergeFromServer,
@@ -412,7 +417,26 @@ export function ExecutionTaskDetailClient({
 
   useEffect(() => {
     const t = window.setTimeout(() => {
-      void saveExecutionImportedCaseColumnConfig({ config: importedColConfig });
+      const keySet = new Set<string>(EXEC_IMPORTED_CASE_COLUMN_KEYS);
+      const safeOrder = importedColConfig.order.filter(
+        (k): k is ExecImportedCaseColumnKey =>
+          typeof k === "string" && keySet.has(k),
+      );
+      const safeVisible = Object.fromEntries(
+        Object.entries(importedColConfig.visible ?? {}).filter(
+          ([k, v]) => keySet.has(k) && typeof v === "boolean",
+        ),
+      ) as Record<ExecImportedCaseColumnKey, boolean>;
+      const safeWidths = Object.fromEntries(
+        Object.entries(importedColConfig.widths ?? {}).filter(
+          ([k, v]) => keySet.has(k) && typeof v === "number" && Number.isFinite(v),
+        ),
+      ) as Partial<Record<ExecImportedCaseColumnKey, number>>;
+      const safeConfig = { order: safeOrder, visible: safeVisible, widths: safeWidths };
+      const nextSig = JSON.stringify(safeConfig);
+      if (importedColSaveSigRef.current === nextSig) return;
+      importedColSaveSigRef.current = nextSig;
+      void saveExecutionImportedCaseColumnConfig({ config: safeConfig });
     }, 450);
     return () => clearTimeout(t);
   }, [importedColConfig]);

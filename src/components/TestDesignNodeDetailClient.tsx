@@ -127,6 +127,8 @@ export function TestDesignNodeDetailClient({
   const [msg, setMsg] = useState<ActionResult | null>(null);
   const [savingMeta, setSavingMeta] = useState(false);
   const [savingLinks, setSavingLinks] = useState(false);
+  const [savedToastOpen, setSavedToastOpen] = useState(false);
+  const savedToastTimerRef = useRef<number | null>(null);
   const [linkedCasePickIds, setLinkedCasePickIds] = useState<string[]>([]);
   const linkedCaseSelectAllRef = useRef<HTMLInputElement>(null);
   const [pendingLinkPickIds, setPendingLinkPickIds] = useState<string[]>([]);
@@ -138,17 +140,7 @@ export function TestDesignNodeDetailClient({
   const [linkedTblNoW, setLinkedTblNoW] = useState(120);
   const [linkedTblTitleW, setLinkedTblTitleW] = useState(200);
   const [linkedTblFolderW, setLinkedTblFolderW] = useState(128);
-  /** 桌面端左侧导航区宽度（可拖拽右缘调整） */
-  const [navAsidePx, setNavAsidePx] = useState(280);
-  const [navAsideLg, setNavAsideLg] = useState(false);
-
-  useEffect(() => {
-    const mq = window.matchMedia("(min-width: 1024px)");
-    const sync = () => setNavAsideLg(mq.matches);
-    sync();
-    mq.addEventListener("change", sync);
-    return () => mq.removeEventListener("change", sync);
-  }, []);
+  // 左侧导航区已移除：保留详情页专注编辑
 
   useEffect(() => {
     void (async () => {
@@ -410,6 +402,27 @@ export function TestDesignNodeDetailClient({
 
   const setMessageClear = () => setMsg(null);
 
+  const showSavedToast = useCallback(() => {
+    if (savedToastTimerRef.current !== null) {
+      window.clearTimeout(savedToastTimerRef.current);
+      savedToastTimerRef.current = null;
+    }
+    setSavedToastOpen(true);
+    savedToastTimerRef.current = window.setTimeout(() => {
+      setSavedToastOpen(false);
+      savedToastTimerRef.current = null;
+    }, 3000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (savedToastTimerRef.current !== null) {
+        window.clearTimeout(savedToastTimerRef.current);
+        savedToastTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const removeCaseFromLinked = (id: string) => {
     setMessageClear();
     setLinked((prev) => {
@@ -437,7 +450,12 @@ export function TestDesignNodeDetailClient({
           : parseCaseLevelOrNull(Number.parseInt(caseLevel, 10)),
     });
     setSavingMeta(false);
-    setMsg(r);
+    if (r.ok) {
+      setMsg(null);
+      showSavedToast();
+    } else {
+      setMsg(r);
+    }
     if (r.ok) router.refresh();
   };
 
@@ -446,82 +464,50 @@ export function TestDesignNodeDetailClient({
     setMsg(null);
     const r = await setTestDesignLinkedCases(nodeId, [...linked]);
     setSavingLinks(false);
-    setMsg(r);
+    if (r.ok) {
+      setMsg(null);
+      showSavedToast();
+    } else {
+      setMsg(r);
+    }
     if (r.ok) router.refresh();
   };
 
-  const startNavAsideResize = useCallback(
-    (e: ReactMouseEvent) => {
-      if (!navAsideLg) return;
-      e.preventDefault();
-      const startX = e.clientX;
-      const startW = navAsidePx;
-      const maxW = () =>
-        Math.min(560, Math.floor(window.innerWidth * 0.5));
-      const onMove = (ev: MouseEvent) => {
-        const dx = ev.clientX - startX;
-        setNavAsidePx(
-          Math.min(maxW(), Math.max(200, startW + dx)),
-        );
-      };
-      const onUp = () => {
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-      };
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-    },
-    [navAsideLg, navAsidePx],
-  );
-
   return (
     <ModuleWorkspaceCard>
-      <div className="flex min-h-[70vh] flex-col lg:flex-row">
-        <section
-          className={[
-            "relative flex min-h-[200px] flex-col border-b border-zinc-200 bg-zinc-50/60",
-            "lg:min-h-0 lg:shrink-0 lg:border-b-0 lg:border-r lg:border-zinc-200",
-            navAsideLg ? "" : "w-full",
-          ].join(" ")}
-          style={
-            navAsideLg
-              ? {
-                  width: navAsidePx,
-                  minWidth: 200,
-                  maxWidth: "min(560px, 50vw)",
-                }
-              : undefined
-          }
-        >
-          <div className="shrink-0 border-b border-zinc-200/80 p-3 pr-4 lg:pr-5">
-            <h2 className="text-sm font-semibold text-zinc-900">导航</h2>
-            <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">
-              返回树形列表或从面包屑确认当前节点所属需求上下文。宽屏下可拖拽右边缘调整宽度。
-            </p>
-          </div>
-          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3 pr-4 lg:pr-5">
-            <Link
-              href={backToTreeHref}
-              className="inline-flex text-sm font-medium text-blue-700 hover:underline"
-            >
-              ← 返回测试设计树
-            </Link>
-            <div className="rounded-lg border border-zinc-200/80 bg-white p-2.5 text-xs leading-relaxed text-zinc-600">
-              {breadcrumb}
-            </div>
-          </div>
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="拖拽调整导航区宽度"
-            className="absolute right-0 top-0 z-10 hidden h-full w-1.5 shrink-0 cursor-col-resize select-none hover:bg-blue-400/20 active:bg-blue-400/35 lg:block"
-            onMouseDown={startNavAsideResize}
-          />
-        </section>
-
+      <div className="flex min-h-[70vh] flex-col">
         <section className="min-w-0 flex-1 bg-white">
+          {savedToastOpen ? (
+            <div className="pointer-events-none fixed left-0 right-0 top-0 z-50">
+              <div className="mx-auto w-full border-b border-emerald-200 bg-emerald-50/95 px-4 py-3 text-center text-xl font-semibold leading-tight text-emerald-800 shadow-sm backdrop-blur">
+                已保存
+              </div>
+            </div>
+          ) : null}
           <div className="border-b border-zinc-100 px-4 py-3">
-            <h2 className="text-sm font-semibold text-zinc-900">节点编辑</h2>
+            <div className="flex items-start justify-between gap-2">
+              {detailTab === "basic" ? (
+                <div className="min-w-0 flex-1">
+                  <input
+                    className={[
+                      "w-full rounded-lg bg-transparent px-0 py-1 text-xl font-semibold leading-tight text-zinc-900",
+                      "border-0 outline-none ring-0",
+                      "focus-visible:outline-none focus-visible:ring-0",
+                      "focus-visible:underline focus-visible:decoration-zinc-300 focus-visible:underline-offset-4",
+                      "placeholder:text-zinc-400",
+                    ].join(" ")}
+                    value={title}
+                    placeholder="标题"
+                    onChange={(e) => {
+                      setTitle(e.target.value);
+                      setMessageClear();
+                    }}
+                  />
+                </div>
+              ) : (
+                <h2 className="text-sm font-semibold text-zinc-900">节点编辑</h2>
+              )}
+            </div>
             <p className="mt-0.5 text-xs text-zinc-500">
               使用下列标签切换基本信息、关联用例与操作记录。
             </p>
@@ -530,11 +516,6 @@ export function TestDesignNodeDetailClient({
             {msg?.error && (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
                 {msg.error}
-              </div>
-            )}
-            {msg?.ok && (
-              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-                已保存
               </div>
             )}
 
@@ -588,15 +569,29 @@ export function TestDesignNodeDetailClient({
 
             {detailTab === "basic" ? (
             <div className="space-y-4 pb-4">
-              <section className="rounded-xl border border-zinc-200 bg-zinc-50/40 p-4">
-                <div className="space-y-3">
-                  <div>
-                    <label className="text-xs font-medium text-zinc-600">标题</label>
+              <section className="rounded-xl bg-zinc-50/40 p-4">
+                <div className="grid gap-2 sm:grid-cols-2 sm:gap-x-2 sm:gap-y-2">
+                  <div className="sm:col-span-2">
+                    <label className="text-xs font-medium text-zinc-600">描述</label>
                     <input
                       className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                      value={title}
+                      value={description}
                       onChange={(e) => {
-                        setTitle(e.target.value);
+                        setDescription(e.target.value);
+                        setMessageClear();
+                      }}
+                      placeholder="可选：一句话概述/说明"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-zinc-600">
+                      用例等级
+                    </label>
+                    <CaseLevelSelect
+                      className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                      value={caseLevel}
+                      onChange={(v) => {
+                        setCaseLevel(v);
                         setMessageClear();
                       }}
                     />
@@ -621,48 +616,15 @@ export function TestDesignNodeDetailClient({
                       当前：{testDesignTypeLabel[type]}
                     </p>
                   </div>
-                  <div>
-                    <label className="text-xs font-medium text-zinc-600">
-                      用例等级
-                    </label>
-                    <CaseLevelSelect
-                      className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                      value={caseLevel}
-                      onChange={(v) => {
-                        setCaseLevel(v);
-                        setMessageClear();
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-xs font-medium text-zinc-600">描述</label>
-                    <input
-                      className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                      value={description}
-                      onChange={(e) => {
-                        setDescription(e.target.value);
-                        setMessageClear();
-                      }}
-                      placeholder="可选：一句话概述/说明"
-                    />
-                  </div>
-                  <section className="rounded-xl border border-zinc-200 bg-zinc-50/40 p-4">
-                    <div className="mb-3">
-                      <div className="text-sm font-semibold text-zinc-900">
-                        设计正文（前置条件 / 操作步骤 / 预期结果 / 备注）
-                      </div>
-                      <p className="mt-1 text-xs text-zinc-500">
-                        创建时间在首次保存时由系统记录；之后修改不会改变创建时间。
-                      </p>
-                    </div>
-                    <div className="grid gap-3 sm:grid-cols-2">
+                  <section className="rounded-xl bg-zinc-50/40 p-4 sm:col-span-2 min-h-[520px]">
+                    <div className="space-y-3">
                       <div>
                         <label className="text-xs font-medium text-zinc-600">
                           前置条件
                         </label>
                         <textarea
                           className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                          rows={4}
+                          rows={8}
                           value={precondition}
                           onChange={(e) => {
                             setPrecondition(e.target.value);
@@ -676,7 +638,7 @@ export function TestDesignNodeDetailClient({
                         </label>
                         <textarea
                           className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                          rows={4}
+                          rows={8}
                           value={operationSteps}
                           onChange={(e) => {
                             setOperationSteps(e.target.value);
@@ -690,7 +652,7 @@ export function TestDesignNodeDetailClient({
                         </label>
                         <textarea
                           className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                          rows={4}
+                          rows={8}
                           value={expectedResult}
                           onChange={(e) => {
                             setExpectedResult(e.target.value);
@@ -704,7 +666,7 @@ export function TestDesignNodeDetailClient({
                         </label>
                         <textarea
                           className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                          rows={4}
+                          rows={8}
                           value={remark}
                           onChange={(e) => {
                             setRemark(e.target.value);
@@ -714,14 +676,22 @@ export function TestDesignNodeDetailClient({
                       </div>
                     </div>
                   </section>
-                  <button
-                    type="button"
-                    disabled={savingMeta}
-                    onClick={saveMeta}
-                    className="rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white disabled:opacity-50"
-                  >
-                    {savingMeta ? "保存中…" : "保存基本信息"}
-                  </button>
+                  <div className="sm:col-span-2 flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      disabled={savingMeta}
+                      onClick={saveMeta}
+                      className="rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+                    >
+                      {savingMeta ? "保存中…" : "保存基本信息"}
+                    </button>
+                    <Link
+                      href={backToTreeHref}
+                      className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50"
+                    >
+                      返回测试设计树
+                    </Link>
+                  </div>
                 </div>
               </section>
             </div>

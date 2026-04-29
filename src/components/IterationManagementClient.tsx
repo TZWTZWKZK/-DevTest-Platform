@@ -13,6 +13,10 @@ import {
   type ProductOption,
 } from "@/app/actions/iterations";
 import {
+  getGlobalIterationProductPreference,
+  saveGlobalIterationProductPreference,
+} from "@/app/actions/executions";
+import {
   ModuleWorkspaceCard,
   MODULE_TOOLBAR_BTN_PRIMARY,
   MODULE_TOOLBAR_BTN_SECONDARY,
@@ -24,6 +28,7 @@ import {
   type IterationColumnKey,
 } from "@/hooks/useIterationListColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { formatIsoBeijing, isoToBeijingYmd } from "@/lib/timezone-cn";
 
 const iterationStatusLabel: Record<IterationStatus, string> = {
   IN_PROGRESS: "进行中",
@@ -40,50 +45,19 @@ const iterationStatusBadgeClass: Record<IterationStatus, string> = {
 const ITER_ACTIONS_COL_W = 144;
 
 function formatIterOpTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
+  return formatIsoBeijing(iso, { withSeconds: true });
 }
 
 function isoToDateValue(iso: string | null): string {
-  if (!iso) return "";
-  try {
-    return new Date(iso).toISOString().slice(0, 10);
-  } catch {
-    return "";
-  }
+  return isoToBeijingYmd(iso);
 }
 
 function formatTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
+  return formatIsoBeijing(iso);
 }
 
 function iterRowDateKey(iso: string | null): string {
-  if (!iso) return "";
-  try {
-    return new Date(iso).toISOString().slice(0, 10);
-  } catch {
-    return "";
-  }
+  return isoToBeijingYmd(iso);
 }
 
 function inDayRange(
@@ -137,9 +111,11 @@ export function IterationManagementClient({
   /** 来自查询串，列表加载后将翻页并滚动到该迭代行 */
   initialIterationId?: string;
 }) {
+  const hasUrlProductId = !!initialProductId?.trim();
   const [productId, setProductId] = useState(() =>
     resolveInitialProductId(initialProducts, initialProductId),
   );
+  const productPrefHydratedRef = useRef(false);
   /** 仅当 URL 带有 productId 时同步（无查询参数时不覆盖用户在下拉框中的选择） */
   useEffect(() => {
     const u = initialProductId?.trim();
@@ -148,6 +124,31 @@ export function IterationManagementClient({
     if (!resolved) return;
     setProductId((prev) => (prev === resolved ? prev : resolved));
   }, [initialProductId, initialProducts]);
+
+  useEffect(() => {
+    if (hasUrlProductId) return;
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate && initialProducts.some((p) => p.id === candidate)) {
+        setProductId((prev) => (prev === candidate ? prev : candidate));
+      }
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasUrlProductId, initialProducts]);
+
+  useEffect(() => {
+    if (hasUrlProductId || !productPrefHydratedRef.current) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [hasUrlProductId, productId]);
   const [rows, setRows] = useState<IterationRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -270,7 +271,10 @@ export function IterationManagementClient({
     return list;
   }, [rows, iterAdv]);
 
-  const iterPager = usePagination(displayRows, { defaultPageSize: 20 });
+  const iterPager = usePagination(displayRows, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.iterations",
+  });
   const iterationFocusAppliedRef = useRef(false);
   const iterationFocusKeyRef = useRef<string | undefined>(undefined);
 

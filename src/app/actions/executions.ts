@@ -20,10 +20,60 @@ export type ExecutionTaskFlat = {
   linkedCaseCount: number;
   /** 已导入用例中，最近一条执行记录状态为「通过」的条数 */
   passedCaseCount: number;
+  /** 执行情况：按用例“最近一次执行状态”聚合（NONE 表示 executionResult 为空） */
+  latestStatusCounts: {
+    PASSED: number;
+    FAILED: number;
+    BLOCKED: number;
+    DEPRECATED: number;
+    NONE: number;
+  };
 };
 
 const UI_PREF_KEY_EXEC_TASK_COLS = "ui.execTask.columns.v1";
 const UI_PREF_KEY_EXEC_TASK_IMPORTED_COLS = "ui.execTask.importedCase.columns.v1";
+const UI_PREF_KEY_EXEC_TASK_FILTERS = "ui.execTask.filters.v1";
+const UI_PREF_KEY_EXEC_TASK_FILTER_PANEL = "ui.execTask.filterPanel.v1";
+const UI_PREF_KEY_GLOBAL_TEST_CASE_SIDEBAR = "ui.global.testCases.sidebar.v1";
+const UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION = "ui.global.testDesign.iteration.v1";
+const UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION = "ui.global.executions.iteration.v1";
+const UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT = "ui.global.iterations.product.v1";
+const UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION = "ui.global.requirements.iteration.v1";
+const UI_PREF_KEY_GLOBAL_TEST_CASE_EXEC_RESULT_HEIGHT =
+  "ui.global.testCase.execResultTextareaHeight.v1";
+
+async function readUiPreference<T>(
+  key: string,
+  fallback: T,
+): Promise<{ value: T; error?: string }> {
+  try {
+    const row = await prisma.uiPreference.findUnique({
+      where: { key },
+      select: { value: true },
+    });
+    if (!row?.value) return { value: fallback };
+    return { value: JSON.parse(row.value) as T };
+  } catch (e) {
+    return {
+      value: fallback,
+      error: e instanceof Error ? e.message : "读取偏好失败",
+    };
+  }
+}
+
+async function writeUiPreference(key: string, value: unknown): Promise<ActionResult> {
+  try {
+    await prisma.uiPreference.upsert({
+      where: { key },
+      create: { key, value: JSON.stringify(value ?? null) },
+      update: { value: JSON.stringify(value ?? null) },
+      select: { key: true },
+    });
+    return { ok: true };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "保存偏好失败" };
+  }
+}
 
 export async function getExecutionTaskListColumnConfig(): Promise<{
   config?: unknown;
@@ -92,15 +142,261 @@ export async function saveExecutionImportedCaseColumnConfig(input: {
   }
 }
 
+export async function getExecutionTaskListFilterPreference(): Promise<{
+  status?: "" | TestCaseStatus | "NONE";
+  passRateMin?: number | null;
+  passRateMax?: number | null;
+  error?: string;
+}> {
+  const r = await readUiPreference<{
+    status?: unknown;
+    passRateMin?: unknown;
+    passRateMax?: unknown;
+  }>(UI_PREF_KEY_EXEC_TASK_FILTERS, {});
+  const raw = r.value ?? {};
+  const status =
+    raw.status === "" ||
+    raw.status === "PASSED" ||
+    raw.status === "FAILED" ||
+    raw.status === "BLOCKED" ||
+    raw.status === "DEPRECATED" ||
+    raw.status === "NONE"
+      ? (raw.status as "" | TestCaseStatus | "NONE")
+      : "";
+  const passRateMin =
+    typeof raw.passRateMin === "number" && Number.isFinite(raw.passRateMin)
+      ? raw.passRateMin
+      : null;
+  const passRateMax =
+    typeof raw.passRateMax === "number" && Number.isFinite(raw.passRateMax)
+      ? raw.passRateMax
+      : null;
+  return {
+    status,
+    passRateMin,
+    passRateMax,
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveExecutionTaskListFilterPreference(input: {
+  status: "" | TestCaseStatus | "NONE";
+  passRateMin: number | null;
+  passRateMax: number | null;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_EXEC_TASK_FILTERS, {
+    status: input.status ?? "",
+    passRateMin:
+      typeof input.passRateMin === "number" && Number.isFinite(input.passRateMin)
+        ? input.passRateMin
+        : null,
+    passRateMax:
+      typeof input.passRateMax === "number" && Number.isFinite(input.passRateMax)
+        ? input.passRateMax
+        : null,
+  });
+}
+
+export async function getExecutionTaskListFilterPanelPreference(): Promise<{
+  order?: Array<"status" | "passRateRange">;
+  visible?: Partial<Record<"status" | "passRateRange", boolean>>;
+  error?: string;
+}> {
+  const r = await readUiPreference<{
+    order?: unknown;
+    visible?: unknown;
+  }>(UI_PREF_KEY_EXEC_TASK_FILTER_PANEL, {});
+  const raw = r.value ?? {};
+  const allow = new Set(["status", "passRateRange"]);
+  const order = Array.isArray(raw.order)
+    ? (raw.order.filter((x) => typeof x === "string" && allow.has(x)) as Array<
+        "status" | "passRateRange"
+      >)
+    : undefined;
+  const visible: Partial<Record<"status" | "passRateRange", boolean>> = {};
+  if (raw.visible && typeof raw.visible === "object") {
+    for (const k of allow) {
+      const v = (raw.visible as Record<string, unknown>)[k];
+      if (typeof v === "boolean") visible[k as "status" | "passRateRange"] = v;
+    }
+  }
+  return { order, visible, ...(r.error ? { error: r.error } : {}) };
+}
+
+export async function saveExecutionTaskListFilterPanelPreference(input: {
+  order: Array<"status" | "passRateRange">;
+  visible: Partial<Record<"status" | "passRateRange", boolean>>;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_EXEC_TASK_FILTER_PANEL, {
+    order: input.order,
+    visible: input.visible,
+  });
+}
+
+export async function getGlobalTestCaseSidebarPreference(): Promise<{
+  iterationCode?: string;
+  folderExpandedById?: Record<string, boolean>;
+  error?: string;
+}> {
+  const r = await readUiPreference<{
+    iterationCode?: unknown;
+    folderExpandedById?: unknown;
+  }>(UI_PREF_KEY_GLOBAL_TEST_CASE_SIDEBAR, {});
+  const data = r.value ?? {};
+  const iterationCode =
+    typeof data.iterationCode === "string" ? data.iterationCode : "";
+  const folderExpandedById: Record<string, boolean> = {};
+  if (data.folderExpandedById && typeof data.folderExpandedById === "object") {
+    for (const [k, v] of Object.entries(data.folderExpandedById as Record<string, unknown>)) {
+      if (typeof k === "string" && typeof v === "boolean") folderExpandedById[k] = v;
+    }
+  }
+  return {
+    iterationCode,
+    folderExpandedById,
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalTestCaseSidebarPreference(input: {
+  iterationCode: string;
+  folderExpandedById: Record<string, boolean>;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_TEST_CASE_SIDEBAR, {
+    iterationCode: input.iterationCode ?? "",
+    folderExpandedById: input.folderExpandedById ?? {},
+  });
+}
+
+export async function getGlobalTestDesignIterationPreference(): Promise<{
+  iterationCode?: string;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ iterationCode?: unknown }>(
+    UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION,
+    {},
+  );
+  return {
+    iterationCode: typeof r.value?.iterationCode === "string" ? r.value.iterationCode : "",
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalTestDesignIterationPreference(input: {
+  iterationCode: string;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION, {
+    iterationCode: input.iterationCode ?? "",
+  });
+}
+
+export async function getGlobalExecutionIterationPreference(): Promise<{
+  iterationId?: string;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ iterationId?: unknown }>(
+    UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION,
+    {},
+  );
+  return {
+    iterationId: typeof r.value?.iterationId === "string" ? r.value.iterationId : "",
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalExecutionIterationPreference(input: {
+  iterationId: string;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION, {
+    iterationId: input.iterationId ?? "",
+  });
+}
+
+export async function getGlobalIterationProductPreference(): Promise<{
+  productId?: string;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ productId?: unknown }>(
+    UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT,
+    {},
+  );
+  return {
+    productId: typeof r.value?.productId === "string" ? r.value.productId : "",
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalIterationProductPreference(input: {
+  productId: string;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT, {
+    productId: input.productId ?? "",
+  });
+}
+
+export async function getGlobalRequirementIterationPreference(): Promise<{
+  iterationId?: string;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ iterationId?: unknown }>(
+    UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION,
+    {},
+  );
+  return {
+    iterationId: typeof r.value?.iterationId === "string" ? r.value.iterationId : "",
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalRequirementIterationPreference(input: {
+  iterationId: string;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION, {
+    iterationId: input.iterationId ?? "",
+  });
+}
+
+export async function getGlobalTestCaseExecResultHeightPreference(): Promise<{
+  height?: number;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ height?: unknown }>(
+    UI_PREF_KEY_GLOBAL_TEST_CASE_EXEC_RESULT_HEIGHT,
+    {},
+  );
+  const h = r.value?.height;
+  return {
+    height: typeof h === "number" && Number.isFinite(h) ? h : undefined,
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalTestCaseExecResultHeightPreference(input: {
+  height: number;
+}): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_GLOBAL_TEST_CASE_EXEC_RESULT_HEIGHT, {
+    height: input.height,
+  });
+}
+
 export async function listExecutionTaskIterations(): Promise<
-  Array<{ id: string; label: string; taskCount: number }>
+  Array<{ id: string; label: string; taskCount: number; productId: string }>
 > {
+  return listExecutionTaskIterationsByProduct();
+}
+
+export async function listExecutionTaskIterationsByProduct(
+  productId?: string | null,
+): Promise<Array<{ id: string; label: string; taskCount: number; productId: string }>> {
+  const pid = (productId ?? "").trim();
   const rows = await prisma.iteration.findMany({
+    where: pid ? { productId: pid } : undefined,
     orderBy: [{ updatedAt: "desc" }],
     select: {
       id: true,
       name: true,
       code: true,
+      productId: true,
       product: { select: { name: true } },
       _count: { select: { executionTasks: true } },
     },
@@ -109,6 +405,7 @@ export async function listExecutionTaskIterations(): Promise<
     id: r.id,
     label: `${r.product.name} · ${r.name}${r.code ? `（${r.code}）` : ""}`,
     taskCount: r._count.executionTasks,
+    productId: r.productId,
   }));
 }
 
@@ -138,33 +435,34 @@ export async function listExecutionTasksFlat(
 
   const taskIds = rows.map((r) => r.id);
 
+  const emptyCounts = () => ({
+    PASSED: 0,
+    FAILED: 0,
+    BLOCKED: 0,
+    DEPRECATED: 0,
+    NONE: 0,
+  });
+  const countsByTask = new Map<string, ReturnType<typeof emptyCounts>>();
+  for (const tid of taskIds) countsByTask.set(tid, emptyCounts());
+
+  // 口径对齐：执行任务详情页「已导入用例」表格的“状态”列来源于 TestCase.status。
+  // 因此列表汇总也以 TestCase.status 为准：
+  // - 通过率 = PASSED / 总数
+  // - 执行率(执行情况) = status 不为空 / 总数（NONE=为空）
   const links = await prisma.executionTaskTestCase.findMany({
     where: { executionTaskId: { in: taskIds } },
-    select: { executionTaskId: true, testCaseId: true },
+    select: { executionTaskId: true, testCase: { select: { status: true } } },
   });
-
-  const records = await prisma.executionTaskTestCaseExecRecord.findMany({
-    where: { executionTaskId: { in: taskIds } },
-    orderBy: { executedAt: "desc" },
-    select: { executionTaskId: true, testCaseId: true, status: true },
-  });
-
-  const latestStatusByLink = new Map<string, TestCaseStatus>();
-  for (const rec of records) {
-    const key = `${rec.executionTaskId}\0${rec.testCaseId}`;
-    if (!latestStatusByLink.has(key)) latestStatusByLink.set(key, rec.status);
-  }
-
-  const passedByTask = new Map<string, number>();
-  for (const tid of taskIds) passedByTask.set(tid, 0);
   for (const link of links) {
-    const key = `${link.executionTaskId}\0${link.testCaseId}`;
-    if (latestStatusByLink.get(key) === "PASSED") {
-      passedByTask.set(
-        link.executionTaskId,
-        (passedByTask.get(link.executionTaskId) ?? 0) + 1,
-      );
-    }
+    const counts = countsByTask.get(link.executionTaskId) ?? emptyCounts();
+    countsByTask.set(link.executionTaskId, counts);
+    const st = link.testCase.status;
+    if (!st) {
+      counts.NONE += 1;
+    } else if (st === "PASSED") counts.PASSED += 1;
+    else if (st === "FAILED") counts.FAILED += 1;
+    else if (st === "DEPRECATED") counts.DEPRECATED += 1;
+    else counts.BLOCKED += 1;
   }
 
   return rows.map((r) => ({
@@ -179,7 +477,8 @@ export async function listExecutionTasksFlat(
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
     linkedCaseCount: r._count.linkedCases,
-    passedCaseCount: passedByTask.get(r.id) ?? 0,
+    passedCaseCount: countsByTask.get(r.id)?.PASSED ?? 0,
+    latestStatusCounts: countsByTask.get(r.id) ?? emptyCounts(),
   }));
 }
 
@@ -660,6 +959,13 @@ export async function saveExecutionTaskCaseResult(input: {
     if (!taskId) return { error: "缺少任务 id。" };
     if (!caseId) return { error: "缺少用例 id。" };
     const text = input.executionResult?.trim() || null;
+    // 防御：避免误粘贴超大 base64 文本导致数据库列长度错误
+    if (text && text.length > 20000) {
+      return {
+        error:
+          "执行结果文本过长（超过 20000 字符）。请将截图放在截图区域，文字结果保留关键信息后再保存。",
+      };
+    }
     await prisma.executionTaskTestCase.update({
       where: { executionTaskId_testCaseId: { executionTaskId: taskId, testCaseId: caseId } },
       data: { executionResult: text, executedAt: text ? new Date() : null },
@@ -737,6 +1043,31 @@ export async function addExecutionTaskCaseExecRecord(input: {
     if (!taskId) return { error: "缺少任务 id。" };
     if (!caseId) return { error: "缺少用例 id。" };
 
+    let normalizedImages: Prisma.InputJsonValue | typeof Prisma.JsonNull | undefined =
+      undefined;
+    if (input.images !== undefined) {
+      if (input.images === null) {
+        normalizedImages = Prisma.JsonNull;
+      } else if (typeof input.images === "string") {
+        const s = input.images.trim();
+        if (!s) {
+          normalizedImages = Prisma.JsonNull;
+        } else {
+          try {
+            const parsed = JSON.parse(s) as unknown;
+            normalizedImages =
+              parsed === null
+                ? Prisma.JsonNull
+                : (parsed as Prisma.InputJsonValue);
+          } catch {
+            return { error: "执行截图数据格式无效，请重新粘贴截图后再保存。" };
+          }
+        }
+      } else {
+        normalizedImages = input.images as Prisma.InputJsonValue;
+      }
+    }
+
     const row = await prisma.executionTaskTestCaseExecRecord.create({
       data: {
         executionTaskId: taskId,
@@ -744,12 +1075,7 @@ export async function addExecutionTaskCaseExecRecord(input: {
         status: input.status,
         executor: input.executor?.trim() || null,
         result: input.result?.trim() || null,
-        images:
-          input.images === undefined
-            ? undefined
-            : input.images === null
-              ? Prisma.JsonNull
-              : (input.images as Prisma.InputJsonValue),
+        images: normalizedImages,
         note: input.note?.trim() || null,
       },
       select: { id: true, executedAt: true, status: true, executor: true, result: true, note: true },

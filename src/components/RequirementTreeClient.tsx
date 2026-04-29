@@ -43,7 +43,15 @@ import {
   parseTaskProgressPercent,
   taskProgressPercentPillClass,
 } from "@/lib/task-progress-display";
+import {
+  getGlobalIterationProductPreference,
+  getGlobalRequirementIterationPreference,
+  saveGlobalIterationProductPreference,
+  saveGlobalRequirementIterationPreference,
+} from "@/app/actions/executions";
+import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
+import { beijingDatetimeLocalToIsoOrNull, formatIsoBeijing } from "@/lib/timezone-cn";
 import {
   isSortableRequirementColumn,
   type RequirementSortableKey,
@@ -66,26 +74,39 @@ const requirementStatusLabel = {
 const requirementStatusBadgeClass = {
   UNASSIGNED: "border-violet-500/80 bg-violet-50 text-violet-800",
   IN_DEVELOPMENT: "border-red-500/80 bg-red-50 text-red-800",
-  PENDING_VERIFICATION: "border-blue-500/80 bg-blue-50 text-blue-800",
-  CLOSED: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
+  PENDING_VERIFICATION: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
+  CLOSED: "border-blue-500/80 bg-blue-50 text-blue-800",
 } as const;
 
 type RequirementStatus = RequirementFlat["status"];
 
+const DEFAULT_REQUIREMENT_DESCRIPTION_TEMPLATE = [
+  "描述：",
+  "",
+  "前置条件：",
+  "",
+  "正常流程&异常流程：",
+  "",
+  "输入/输出：",
+  "",
+  "验收标准(如何操作界面来实现/复现需求/测试验证)：",
+  "",
+].join("\n");
+
 /** 「1 天」按 24 小时窗口比较计划结束时间（与当前时间差） */
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-/** 整行浅色底：未分配 / 开发中且将逾期或≤1天 → 红；待验证 → 蓝；已上线 → 绿；开发中且距结束>1天 → 黄 */
+/** 整行浅色底：未分配 / 开发中且将逾期或≤1天 → 红；待验证 → 绿；已上线 → 蓝；开发中且距结束>1天 → 黄 */
 function requirementRowSurfaceClass(
   status: RequirementStatus,
   planEndAt: string | null | undefined,
   nowMs: number,
 ): string {
   if (status === "CLOSED") {
-    return "bg-emerald-50/70 hover:bg-emerald-100/80";
+    return "bg-blue-50/70 hover:bg-blue-100/80";
   }
   if (status === "PENDING_VERIFICATION") {
-    return "bg-blue-50/70 hover:bg-blue-100/80";
+    return "bg-emerald-50/70 hover:bg-emerald-100/80";
   }
   if (status === "UNASSIGNED") {
     return "bg-red-50/70 hover:bg-red-100/80";
@@ -103,25 +124,11 @@ function requirementRowSurfaceClass(
 }
 
 function formatTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
+  return formatIsoBeijing(iso);
 }
 
 function datetimeLocalToIsoOrNull(v: string): string | null {
-  const t = v.trim();
-  if (!t) return null;
-  const d = new Date(t);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+  return beijingDatetimeLocalToIsoOrNull(v);
 }
 
 function matchesText(hay: string | null | undefined, needle: string): boolean {
@@ -156,7 +163,24 @@ function requirementCell(n: RequirementFlat, key: RequirementColumnKey) {
   switch (key) {
     case "title":
       return (
-        <span className="block truncate text-zinc-800">{n.title}</span>
+        <span className="flex min-w-0 items-center gap-1">
+          <span className="min-w-0 truncate text-zinc-800">{n.title}</span>
+          {n.status === "PENDING_VERIFICATION" ? (
+            <span
+              className="inline-flex h-4 shrink-0 items-center rounded-full border border-emerald-300 bg-emerald-50 px-1.5 text-[10px] font-semibold leading-none text-emerald-700"
+              title="待验证"
+              aria-label="待验证"
+            >
+              ✓
+            </span>
+          ) : null}
+        </span>
+      );
+    case "wbsId":
+      return (
+        <span className="block truncate font-mono text-xs tabular-nums text-zinc-600">
+          {n.wbsId?.trim() ? n.wbsId : "—"}
+        </span>
       );
     case "submitter":
       return (
@@ -247,7 +271,7 @@ function progressCellsForImport(
   cells: string[],
   headerIndex: Map<string, number>,
 ): Pick<ImportRequirementRow, "任务进度" | "最新进展情况"> {
-  let 任务进度 = cellForImport(cells, headerIndex, "任务进度");
+  const 任务进度 = cellForImport(cells, headerIndex, "任务进度");
   let 最新进展情况 = cellForImport(cells, headerIndex, "最新进展情况");
   const legacy = cellForImport(
     cells,
@@ -288,6 +312,12 @@ function parseRequirementImportTable(
     rows.push({
       节点ID: cellForImport(cells, headerIndex, "节点ID"),
       父节点ID: cellForImport(cells, headerIndex, "父节点ID"),
+      data_id:
+        cellForImport(cells, headerIndex, "data_id") ||
+        cellForImport(cells, headerIndex, "数据ID"),
+      wbs_id:
+        cellForImport(cells, headerIndex, "wbs_id") ||
+        cellForImport(cells, headerIndex, "WBS编号"),
       任务名称: titleCellForImport(cells, headerIndex),
       优先级: cellForImport(cells, headerIndex, "优先级"),
       状态: cellForImport(cells, headerIndex, "状态"),
@@ -366,9 +396,14 @@ export function RequirementTreeClient({
   initialFocusNodeId?: string;
 }) {
   const router = useRouter();
+  const [products, setProducts] = useState<ProductOption[]>([]);
+  const [productId, setProductId] = useState("");
+  const productPrefHydratedRef = useRef(false);
+  const hasUrlIterationId = !!initialIterationId?.trim();
   const [iterationId, setIterationId] = useState(() =>
     resolveInitialIterationId(initialIterations, initialIterationId),
   );
+  const requirementIterPrefHydratedRef = useRef(false);
 
   useEffect(() => {
     const u = initialIterationId?.trim();
@@ -377,6 +412,98 @@ export function RequirementTreeClient({
       setIterationId((prev) => (prev === u ? prev : u));
     }
   }, [initialIterationId, initialIterations]);
+
+  useEffect(() => {
+    if (hasUrlIterationId) {
+      requirementIterPrefHydratedRef.current = true;
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalRequirementIterationPreference();
+      if (cancelled) return;
+      const candidate = (pref.iterationId ?? "").trim();
+      if (candidate && initialIterations.some((it) => it.id === candidate)) {
+        setIterationId((prev) => (prev === candidate ? prev : candidate));
+      }
+      requirementIterPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasUrlIterationId, initialIterations]);
+
+  useEffect(() => {
+    if (hasUrlIterationId || !requirementIterPrefHydratedRef.current) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalRequirementIterationPreference({ iterationId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [hasUrlIterationId, iterationId]);
+  const visibleIterations = useMemo(
+    () =>
+      productId
+        ? initialIterations.filter((it) => it.productId === productId)
+        : initialIterations,
+    [initialIterations, productId],
+  );
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const ps = await listProductOptions();
+        setProducts(ps);
+      } catch {
+        setProducts([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const u = initialIterationId?.trim();
+    if (!u) return;
+    const hit = initialIterations.find((it) => it.id === u);
+    if (!hit) return;
+    setProductId(hit.productId);
+  }, [initialIterationId, initialIterations]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pref = await getGlobalIterationProductPreference();
+      if (cancelled) return;
+      const candidate = (pref.productId ?? "").trim();
+      if (candidate) setProductId((prev) => prev || candidate);
+      productPrefHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, products]);
+
+  useEffect(() => {
+    if (!productPrefHydratedRef.current || !productId) return;
+    const t = window.setTimeout(() => {
+      void saveGlobalIterationProductPreference({ productId });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [productId]);
+
+  useEffect(() => {
+    if (visibleIterations.length === 0) {
+      setIterationId("");
+      return;
+    }
+    if (!visibleIterations.some((it) => it.id === iterationId)) {
+      setIterationId(visibleIterations[0]!.id);
+    }
+  }, [visibleIterations, iterationId]);
+
   const [flat, setFlat] = useState<RequirementFlat[]>([]);
   const [loading, setLoading] = useState(false);
   const [rootErr, setRootErr] = useState<string | null>(null);
@@ -405,10 +532,11 @@ export function RequirementTreeClient({
   const columnPanelRef = useRef<HTMLDivElement | null>(null);
   const columnSortMenuRef = useRef<HTMLDivElement | null>(null);
 
+  /** 默认：WBS 编号升序（自然序 1 < 1.1 < 2） */
   const [sortState, setSortState] = useState<{
     key: RequirementSortableKey;
     dir: "asc" | "desc";
-  } | null>(null);
+  } | null>({ key: "wbsId", dir: "asc" });
   const [columnSortMenu, setColumnSortMenu] =
     useState<RequirementColumnKey | null>(null);
   const [taskProgressValueFilter, setTaskProgressValueFilter] =
@@ -677,7 +805,10 @@ export function RequirementTreeClient({
     walk(sortedTree, 0);
     return out;
   }, [expanded, sortedTree]);
-  const reqPager = usePagination(visibleRows, { defaultPageSize: 20 });
+  const reqPager = usePagination(visibleRows, {
+    defaultPageSize: 20,
+    storageKey: "pm.pageSize.requirements",
+  });
   const pagedRows = reqPager.pagedItems;
   const pagedVisibleIds = useMemo(() => pagedRows.map((x) => x.n.id), [pagedRows]);
 
@@ -756,9 +887,9 @@ export function RequirementTreeClient({
   }, [filteredFlat, visibleNodeIds]);
 
   const iterationLabel = useMemo(() => {
-    const it = initialIterations.find((x) => x.id === iterationId);
+    const it = visibleIterations.find((x) => x.id === iterationId);
     return it?.label ?? "未选择";
-  }, [initialIterations, iterationId]);
+  }, [visibleIterations, iterationId]);
 
   const onStartResize = useCallback(
     (key: RequirementColumnKey, startX: number) => {
@@ -786,7 +917,7 @@ export function RequirementTreeClient({
     setRootSubmitter("");
     setRootDevOwner("");
     setRootTestOwner("");
-    setRootDescription("");
+    setRootDescription(DEFAULT_REQUIREMENT_DESCRIPTION_TEMPLATE);
     setRootPlanStart("");
     setRootPlanEnd("");
     setCreateModalOpen(true);
@@ -991,7 +1122,7 @@ export function RequirementTreeClient({
       }
       if (
         !window.confirm(
-          `确定将 ${parsed.length} 行导入到当前迭代「${iterationLabel}」？将新建节点（不会覆盖已有 ID）。`,
+          `确定将 ${parsed.length} 行导入到当前迭代「${iterationLabel}」？若某行填写了 data_id 且与已有需求一致，将更新该条；其余行将新建。`,
         )
       ) {
         return;
@@ -1265,6 +1396,26 @@ export function RequirementTreeClient({
             <div className="flex flex-wrap items-end gap-3 gap-y-2">
               <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
                 <label className="text-xs font-medium text-zinc-600">
+                  所属产品
+                </label>
+                <select
+                  className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm"
+                  value={productId}
+                  onChange={(e) => setProductId(e.target.value)}
+                >
+                  {products.length === 0 ? (
+                    <option value="">暂无产品，请先在「产品管理」中创建</option>
+                  ) : (
+                    products.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.code ? `${p.name}（${p.code}）` : p.name}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+              <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
+                <label className="text-xs font-medium text-zinc-600">
                   所属迭代
                 </label>
                 <select
@@ -1272,10 +1423,10 @@ export function RequirementTreeClient({
                   value={iterationId}
                   onChange={(e) => setIterationId(e.target.value)}
                 >
-                  {initialIterations.length === 0 ? (
+                  {visibleIterations.length === 0 ? (
                     <option value="">暂无迭代，请先在「产品管理」中创建</option>
                   ) : (
-                    initialIterations.map((it) => (
+                    visibleIterations.map((it) => (
                       <option key={it.id} value={it.id}>
                         {it.label}
                       </option>
@@ -2384,6 +2535,9 @@ export function RequirementTreeClient({
                   value={rootTitle}
                   onChange={(e) => setRootTitle(e.target.value)}
                 />
+                <div className="mt-1 text-xs text-zinc-500">
+                  修改时间：创建后自动生成（以保存时间为准）
+                </div>
               </div>
               <p className="mt-1 text-xs text-zinc-500">
                 编辑任务名称、描述、优先级与团队字段；保存后出现在下方树表，并可进入详情补充附件。

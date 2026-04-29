@@ -22,6 +22,50 @@ import { prisma } from "@/lib/prisma";
 
 export type ActionResult = { ok?: true; error?: string };
 
+type TestCaseWithLinks = Prisma.TestCaseGetPayload<{
+  include: {
+    testDesignLinks: { select: { testDesignId: true } };
+    defectLinks: { select: { defectId: true } };
+    executionTaskLinks: { select: { executionTaskId: true } };
+  };
+}>;
+
+async function insertTestCaseDeletedMany(
+  tx: Prisma.TransactionClient,
+  rows: TestCaseWithLinks[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  const deletedAt = new Date();
+  const db = tx as unknown as {
+    testCaseDeleted: { createMany: (args: unknown) => Promise<unknown> };
+  };
+  await db.testCaseDeleted.createMany({
+    data: rows.map((r) => ({
+      originalId: r.id,
+      caseNo: r.caseNo,
+      title: r.title,
+      testPlan: r.testPlan,
+      iterationCode: r.iterationCode,
+      folderId: r.folderId,
+      priority: r.priority,
+      maintainer: r.maintainer,
+      status: r.status,
+      precondition: r.precondition,
+      operationSteps: r.operationSteps,
+      caseActualResult: r.caseActualResult,
+      caseRemark: r.caseRemark,
+      submitter: r.submitter,
+      submittedAt: r.submittedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      deletedAt,
+      linkedTestDesignIds: r.testDesignLinks.map((x) => x.testDesignId),
+      linkedDefectIds: r.defectLinks.map((x) => x.defectId),
+      linkedExecTaskIds: r.executionTaskLinks.map((x) => x.executionTaskId),
+    })),
+  });
+}
+
 const DEFECT_STATUS_ZH: Record<string, string> = {
   UNASSIGNED: "未分配",
   IN_DEVELOPMENT: "开发中",
@@ -1248,7 +1292,19 @@ export async function getTestCaseFull(id: string) {
 
 export async function deleteTestCase(id: string): Promise<ActionResult> {
   try {
-    await prisma.testCase.delete({ where: { id } });
+    await prisma.$transaction(async (tx) => {
+      const row = await tx.testCase.findUnique({
+        where: { id },
+        include: {
+          testDesignLinks: { select: { testDesignId: true } },
+          defectLinks: { select: { defectId: true } },
+          executionTaskLinks: { select: { executionTaskId: true } },
+        },
+      });
+      if (!row) return;
+      await insertTestCaseDeletedMany(tx, [row]);
+      await tx.testCase.delete({ where: { id } });
+    });
     revalidatePath("/test-cases");
     return { ok: true };
   } catch (e) {
@@ -1260,7 +1316,18 @@ export async function bulkDeleteTestCases(ids: string[]): Promise<ActionResult> 
   const uniq = [...new Set(ids.filter(Boolean))];
   if (uniq.length === 0) return { error: "请先在列表中勾选用例" };
   try {
-    await prisma.testCase.deleteMany({ where: { id: { in: uniq } } });
+    await prisma.$transaction(async (tx) => {
+      const rows = await tx.testCase.findMany({
+        where: { id: { in: uniq } },
+        include: {
+          testDesignLinks: { select: { testDesignId: true } },
+          defectLinks: { select: { defectId: true } },
+          executionTaskLinks: { select: { executionTaskId: true } },
+        },
+      });
+      await insertTestCaseDeletedMany(tx, rows);
+      await tx.testCase.deleteMany({ where: { id: { in: uniq } } });
+    });
     revalidatePath("/test-cases");
     return { ok: true };
   } catch (e) {

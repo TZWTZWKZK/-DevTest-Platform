@@ -1,7 +1,7 @@
 "use server";
 
 import { randomUUID } from "node:crypto";
-import { type Prisma, type TestDesignType } from "@prisma/client";
+import { type Prisma, type RequirementStatus, type TestDesignType } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import {
@@ -79,6 +79,9 @@ export type RequirementOption = { id: string; label: string; depth: number };
 export type RequirementTreeFlat = {
   id: string;
   title: string;
+  wbsId: string | null;
+  status: RequirementStatus;
+  testOwner: string | null;
   parentId: string | null;
   iterationId: string;
   iterationLabel: string;
@@ -97,6 +100,9 @@ export async function listRequirementsForDesignTree(
   return rows.map((r) => ({
     id: r.id,
     title: r.title,
+    wbsId: r.wbsId ?? null,
+    status: r.status,
+    testOwner: r.testOwner ?? null,
     parentId: r.parentId,
     iterationId: r.iterationId,
     iterationLabel: `${r.iteration.product.name} / ${r.iteration.name}`,
@@ -141,6 +147,7 @@ export type TestDesignFlat = {
   id: string;
   title: string;
   type: TestDesignType;
+  dirId: string | null;
   parentId: string | null;
   requirementId: string;
   sortOrder: number;
@@ -151,18 +158,110 @@ export type TestDesignFlat = {
   linkedCaseCount: number;
 };
 
+type TestDesignWithCaseLinks = Prisma.TestDesignGetPayload<{
+  include: { linkedTestCases: { select: { testCaseId: true } } };
+}>;
+
+async function insertTestDesignDeletedMany(
+  tx: Prisma.TransactionClient,
+  rows: TestDesignWithCaseLinks[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  const deletedAt = new Date();
+  await tx.testDesignDeleted.createMany({
+    data: rows.map((row) => ({
+      originalId: row.id,
+      title: row.title,
+      description: row.description,
+      type: row.type,
+      dirId: row.dirId,
+      iterationCode: row.iterationCode,
+      createdBy: row.createdBy,
+      updatedBy: row.updatedBy,
+      precondition: row.precondition,
+      operationSteps: row.operationSteps,
+      expectedResult: row.expectedResult,
+      remark: row.remark,
+      caseLevel: row.caseLevel,
+      requirementId: row.requirementId,
+      parentId: row.parentId,
+      sortOrder: row.sortOrder,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      deletedAt,
+      linkedTestCaseIds: row.linkedTestCases.map((l) => l.testCaseId),
+    })),
+  });
+}
+
+/** 展开根 id 下的整棵子树（删除前需与数据库级联范围一致） */
+async function collectTestDesignSubtreeIds(
+  rootIds: string[],
+  tx: Prisma.TransactionClient,
+): Promise<string[]> {
+  const uniq = Array.from(new Set(rootIds.map((x) => x.trim()).filter(Boolean)));
+  if (uniq.length === 0) return [];
+  const roots = await tx.testDesign.findMany({
+    where: { id: { in: uniq } },
+    select: { requirementId: true },
+  });
+  if (roots.length === 0) return [];
+  const reqIds = [...new Set(roots.map((r) => r.requirementId))];
+  const all = await tx.testDesign.findMany({
+    where: { requirementId: { in: reqIds } },
+    select: { id: true, parentId: true },
+  });
+  const byParent = new Map<string | null, string[]>();
+  for (const row of all) {
+    const k = row.parentId ?? null;
+    const arr = byParent.get(k) ?? [];
+    arr.push(row.id);
+    byParent.set(k, arr);
+  }
+  const out = new Set<string>();
+  const dfs = (id: string) => {
+    if (out.has(id)) return;
+    out.add(id);
+    for (const cid of byParent.get(id) ?? []) dfs(cid);
+  };
+  for (const r of uniq) dfs(r);
+  return [...out];
+}
+
+/** 删除需求前归档其下全部测试设计（与 requirement 删除同事务调用） */
+export async function archiveTestDesignsBeforeRequirementDelete(
+  tx: Prisma.TransactionClient,
+  requirementIds: string[],
+): Promise<void> {
+  const ids = [...new Set(requirementIds.map((x) => x.trim()).filter(Boolean))];
+  if (ids.length === 0) return;
+  const rows = await tx.testDesign.findMany({
+    where: { requirementId: { in: ids } },
+    include: { linkedTestCases: { select: { testCaseId: true } } },
+  });
+  await insertTestDesignDeletedMany(tx, rows);
+}
+
 export async function getTestDesignFlat(input: {
   requirementId: string;
   iterationCode: string; // "" 表示 baseline 模板
   type: TestDesignType;
+  dirId?: string | null;
 }): Promise<TestDesignFlat[]> {
   const requirementId = input.requirementId.trim();
   if (!requirementId) return [];
 
   // baseline 数据需要清空且不再作为模板来源
   if (input.iterationCode === "") {
-    await prisma.testDesign.deleteMany({
-      where: { requirementId, iterationCode: "", type: input.type },
+    await prisma.$transaction(async (tx) => {
+      const victims = await tx.testDesign.findMany({
+        where: { requirementId, iterationCode: "", type: input.type },
+        include: { linkedTestCases: { select: { testCaseId: true } } },
+      });
+      await insertTestDesignDeletedMany(tx, victims);
+      await tx.testDesign.deleteMany({
+        where: { requirementId, iterationCode: "", type: input.type },
+      });
     });
     return [];
   }
@@ -173,12 +272,14 @@ export async function getTestDesignFlat(input: {
         requirementId,
         iterationCode: input.iterationCode,
         type: input.type,
+        ...(input.dirId ? { dirId: input.dirId } : {}),
       },
       orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
       select: {
         id: true,
         title: true,
         type: true,
+        dirId: true,
         parentId: true,
         requirementId: true,
         sortOrder: true,
@@ -191,6 +292,7 @@ export async function getTestDesignFlat(input: {
       id: string;
       title: string;
       type: TestDesignType;
+      dirId: string | null;
       parentId: string | null;
       requirementId: string;
       sortOrder: number;
@@ -213,6 +315,7 @@ export async function getTestDesignFlat(input: {
         id: r.id,
         title: r.title,
         type: r.type,
+        dirId: r.dirId ?? null,
         parentId: r.parentId,
         requirementId: r.requirementId,
         sortOrder: r.sortOrder,
@@ -231,12 +334,14 @@ export async function getTestDesignFlat(input: {
           requirementId,
           iterationCode: input.iterationCode,
           type: input.type,
+          ...(input.dirId ? { dirId: input.dirId } : {}),
         },
         orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
         select: {
           id: true,
           title: true,
           type: true,
+          dirId: true,
           parentId: true,
           requirementId: true,
           sortOrder: true,
@@ -255,11 +360,143 @@ export async function getTestDesignFlat(input: {
       );
       return rows.map((r) => ({
         ...r,
+        dirId: (r as unknown as { dirId?: string | null }).dirId ?? null,
         createdBy: null,
         updatedBy: null,
         createdAt: r.createdAt.toISOString(),
         updatedAt: r.updatedAt.toISOString(),
         linkedCaseCount: countById.get(r.id) ?? 0,
+      }));
+    }
+    throw e;
+  }
+}
+
+export async function getTestDesignFlatForRequirements(input: {
+  requirementIds: string[];
+  iterationCode: string; // "" 表示 baseline 模板
+  type: TestDesignType;
+  dirId?: string | null;
+}): Promise<TestDesignFlat[]> {
+  const requirementIds = Array.from(
+    new Set(input.requirementIds.map((x) => x.trim()).filter(Boolean)),
+  );
+  if (requirementIds.length === 0) return [];
+
+  // baseline 数据需要清空且不再作为模板来源（子树场景按批量处理）
+  if (input.iterationCode === "") {
+    await prisma.$transaction(async (tx) => {
+      const victims = await tx.testDesign.findMany({
+        where: { requirementId: { in: requirementIds }, iterationCode: "", type: input.type },
+        include: { linkedTestCases: { select: { testCaseId: true } } },
+      });
+      await insertTestDesignDeletedMany(tx, victims);
+      await tx.testDesign.deleteMany({
+        where: { requirementId: { in: requirementIds }, iterationCode: "", type: input.type },
+      });
+    });
+    return [];
+  }
+
+  try {
+    const rows = (await prisma.testDesign.findMany({
+      where: {
+        requirementId: { in: requirementIds },
+        iterationCode: input.iterationCode,
+        type: input.type,
+        ...(input.dirId ? { dirId: input.dirId } : {}),
+      },
+      orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+      select: {
+        id: true,
+        title: true,
+        type: true,
+        dirId: true,
+        parentId: true,
+        requirementId: true,
+        sortOrder: true,
+        createdBy: true,
+        updatedBy: true,
+        createdAt: true,
+        updatedAt: true,
+      } as unknown as Record<string, boolean>,
+    })) as unknown as Array<{
+      id: string;
+      title: string;
+      type: TestDesignType;
+      dirId: string | null;
+      parentId: string | null;
+      requirementId: string;
+      sortOrder: number;
+      createdBy?: string | null;
+      updatedBy?: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+    }>;
+    const ids = rows.map((r) => r.id);
+    const counts = await prisma.testDesignTestCase.groupBy({
+      by: ["testDesignId"],
+      where: { testDesignId: { in: ids } },
+      _count: { _all: true },
+    });
+    const countById = new Map<string, number>(
+      counts.map((c) => [c.testDesignId, c._count._all] as const),
+    );
+    return rows.map(
+      (r): TestDesignFlat => ({
+        id: r.id,
+        title: r.title,
+        type: r.type,
+        dirId: r.dirId ?? null,
+        parentId: r.parentId,
+        requirementId: r.requirementId,
+        sortOrder: r.sortOrder,
+        createdBy: r.createdBy ?? null,
+        updatedBy: r.updatedBy ?? null,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+        linkedCaseCount: countById.get(r.id) ?? 0,
+      }),
+    );
+  } catch (e) {
+    if (isUnknownField(e, "createdBy") || isUnknownField(e, "updatedBy")) {
+      const rows = await prisma.testDesign.findMany({
+        where: {
+          requirementId: { in: requirementIds },
+          iterationCode: input.iterationCode,
+          type: input.type,
+          ...(input.dirId ? { dirId: input.dirId } : {}),
+        },
+        orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+        select: {
+          id: true,
+          title: true,
+          type: true,
+          dirId: true,
+          parentId: true,
+          requirementId: true,
+          sortOrder: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+      const ids = rows.map((r) => r.id);
+      const counts = await prisma.testDesignTestCase.groupBy({
+        by: ["testDesignId"],
+        where: { testDesignId: { in: ids } },
+        _count: { _all: true },
+      });
+      const countById = new Map<string, number>(
+        counts.map((c) => [c.testDesignId, c._count._all] as const),
+      );
+      return rows.map((r) => ({
+        ...r,
+        dirId: (r as unknown as { dirId?: string | null }).dirId ?? null,
+        createdBy: null,
+        updatedBy: null,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+        linkedCaseCount: countById.get((r as unknown as { id: string }).id) ?? 0,
       }));
     }
     throw e;
@@ -312,6 +549,147 @@ export async function countTestDesignByType(input: {
   };
   for (const r of rows) out[r.type] = r._count._all;
   return out;
+}
+
+export async function countTestDesignByTypeForRequirements(input: {
+  requirementIds: string[];
+  iterationCode: string;
+}): Promise<Record<TestDesignType, number>> {
+  const requirementIds = Array.from(
+    new Set(input.requirementIds.map((x) => x.trim()).filter(Boolean)),
+  );
+  if (requirementIds.length === 0 || input.iterationCode === "") {
+    return {
+      FUNCTIONAL: 0,
+      PERFORMANCE: 0,
+      SECURITY: 0,
+      COMPATIBILITY: 0,
+      USABILITY: 0,
+      RELIABILITY: 0,
+      OTHER: 0,
+    };
+  }
+  const rows = await prisma.testDesign.groupBy({
+    by: ["type"],
+    where: {
+      requirementId: { in: requirementIds },
+      iterationCode: input.iterationCode,
+    },
+    _count: { _all: true },
+  });
+  const out: Record<TestDesignType, number> = {
+    FUNCTIONAL: 0,
+    PERFORMANCE: 0,
+    SECURITY: 0,
+    COMPATIBILITY: 0,
+    USABILITY: 0,
+    RELIABILITY: 0,
+    OTHER: 0,
+  };
+  for (const r of rows) out[r.type] = r._count._all;
+  return out;
+}
+
+export async function countTestDesignByDirSubtree(input: {
+  requirementId: string;
+  iterationCode: string;
+}): Promise<{ counts?: Record<string, number>; error?: string }> {
+  const requirementId = input.requirementId.trim();
+  const iterationCode = input.iterationCode.trim();
+  if (!requirementId) return { counts: {} };
+  if (!iterationCode) return { counts: {} };
+
+  try {
+    const rows = await prisma.testDesign.findMany({
+      where: { requirementId, iterationCode, dirId: { not: null } },
+      select: { dirId: true } as unknown as Record<string, boolean>,
+    });
+    const typed = rows as unknown as Array<{ dirId: string | null }>;
+    const direct = new Map<string, number>();
+    for (const r of typed) {
+      if (!r.dirId) continue;
+      direct.set(r.dirId, (direct.get(r.dirId) ?? 0) + 1);
+    }
+
+    const it = await prisma.requirement.findUnique({
+      where: { id: requirementId },
+      select: { iterationId: true },
+    });
+    if (!it) return { counts: Object.fromEntries(direct.entries()) };
+
+    const dirs = await prisma.testDesignDir.findMany({
+      where: { iterationId: it.iterationId },
+      select: { id: true, parentId: true },
+    });
+    const parentById = new Map(dirs.map((d) => [d.id, d.parentId ?? null] as const));
+
+    const total = new Map<string, number>(direct);
+    for (const [id, cnt] of direct.entries()) {
+      let cur = parentById.get(id) ?? null;
+      while (cur) {
+        total.set(cur, (total.get(cur) ?? 0) + cnt);
+        cur = parentById.get(cur) ?? null;
+      }
+    }
+    return { counts: Object.fromEntries(total.entries()) };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "统计失败" };
+  }
+}
+
+export async function countTestDesignByDirSubtreeForRequirements(input: {
+  requirementIds: string[];
+  iterationCode: string;
+}): Promise<{ counts?: Record<string, number>; error?: string }> {
+  const requirementIds = Array.from(
+    new Set(input.requirementIds.map((x) => x.trim()).filter(Boolean)),
+  );
+  const iterationCode = input.iterationCode.trim();
+  if (requirementIds.length === 0) return { counts: {} };
+  if (!iterationCode) return { counts: {} };
+
+  try {
+    const rows = await prisma.testDesign.findMany({
+      where: {
+        requirementId: { in: requirementIds },
+        iterationCode,
+        dirId: { not: null },
+      },
+      select: { dirId: true } as unknown as Record<string, boolean>,
+    });
+    const typed = rows as unknown as Array<{ dirId: string | null }>;
+    const direct = new Map<string, number>();
+    for (const r of typed) {
+      if (!r.dirId) continue;
+      direct.set(r.dirId, (direct.get(r.dirId) ?? 0) + 1);
+    }
+
+    const it = await prisma.requirement.findFirst({
+      where: { id: { in: requirementIds } },
+      select: { iterationId: true },
+    });
+    if (!it) return { counts: Object.fromEntries(direct.entries()) };
+
+    const dirs = await prisma.testDesignDir.findMany({
+      where: { iterationId: it.iterationId },
+      select: { id: true, parentId: true },
+    });
+    const parentById = new Map(
+      dirs.map((d) => [d.id, d.parentId ?? null] as const),
+    );
+
+    const total = new Map<string, number>(direct);
+    for (const [id, cnt] of direct.entries()) {
+      let cur = parentById.get(id) ?? null;
+      while (cur) {
+        total.set(cur, (total.get(cur) ?? 0) + cnt);
+        cur = parentById.get(cur) ?? null;
+      }
+    }
+    return { counts: Object.fromEntries(total.entries()) };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "统计失败" };
+  }
 }
 
 /** 隐藏侧栏类别前：仍存在的设计条数（iterationCode 为空则跨全部迭代统计） */
@@ -425,7 +803,20 @@ export async function getTestDesignsExportRows(
 export async function bulkDeleteTestDesignNodes(ids: string[]): Promise<ActionResult> {
   const uniq = Array.from(new Set(ids.map((x) => x.trim()).filter(Boolean)));
   if (uniq.length === 0) return { error: "请选择要删除的数据" };
-  await prisma.testDesign.deleteMany({ where: { id: { in: uniq } } });
+  try {
+    await prisma.$transaction(async (tx) => {
+      const toDelete = await collectTestDesignSubtreeIds(uniq, tx);
+      if (toDelete.length === 0) return;
+      const rows = await tx.testDesign.findMany({
+        where: { id: { in: toDelete } },
+        include: { linkedTestCases: { select: { testCaseId: true } } },
+      });
+      await insertTestDesignDeletedMany(tx, rows);
+      await tx.testDesign.deleteMany({ where: { id: { in: toDelete } } });
+    });
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "批量删除失败" };
+  }
   revalidatePath("/test-design");
   return { ok: true };
 }
@@ -438,9 +829,201 @@ export async function bulkMoveTestDesignNodes(input: {
   const target = input.targetRequirementId.trim();
   if (!target) return { error: "请选择目标需求" };
   if (uniq.length === 0) return { error: "请选择要移动的数据" };
+  const req = await prisma.requirement.findUnique({
+    where: { id: target },
+    select: { id: true, iteration: { select: { code: true } } },
+  });
+  if (!req) return { error: "目标需求不存在或已删除" };
+  const targetIterCode = req.iteration.code;
   await prisma.testDesign.updateMany({
     where: { id: { in: uniq } },
-    data: { requirementId: target, parentId: null },
+    data: { requirementId: target, parentId: null, iterationCode: targetIterCode },
+  });
+  revalidatePath("/test-design");
+  return { ok: true };
+}
+
+/** 将源需求下的全部测试设计迁入目标需求（树结构打平为根，迭代编码随目标需求） */
+export async function bulkMoveAllTestDesignsBetweenRequirements(input: {
+  sourceRequirementId: string;
+  targetRequirementId: string;
+}): Promise<ActionResult & { moved?: number }> {
+  const from = input.sourceRequirementId.trim();
+  const to = input.targetRequirementId.trim();
+  if (!from || !to) return { error: "请选择源需求与目标需求" };
+  if (from === to) return { error: "源需求与目标需求不能相同" };
+  const target = await prisma.requirement.findUnique({
+    where: { id: to },
+    select: { id: true, iteration: { select: { code: true } } },
+  });
+  if (!target) return { error: "目标需求不存在或已删除" };
+  const source = await prisma.requirement.findUnique({
+    where: { id: from },
+    select: { id: true },
+  });
+  if (!source) return { error: "源需求不存在或已删除" };
+  const targetIterCode = target.iteration.code;
+  const r = await prisma.testDesign.updateMany({
+    where: { requirementId: from },
+    data: { requirementId: to, parentId: null, iterationCode: targetIterCode },
+  });
+  revalidatePath("/test-design");
+  return { ok: true, moved: r.count };
+}
+
+export async function bulkDuplicateTestDesignNodes(input: {
+  ids: string[];
+  /** 复制后强制落入的类别（用于“当前类别里复制”） */
+  targetType: TestDesignType;
+  /**
+   * 复制后强制落入的目录：
+   * - string：写入指定目录（会校验该目录属于 targetType）
+   * - null：清空目录（落在类别根）
+   * - undefined：不指定（按原逻辑，可用于未来保留源目录）
+   */
+  targetDirId?: string | null;
+}): Promise<ActionResult & { duplicated?: number }> {
+  const uniq = Array.from(new Set(input.ids.map((x) => x.trim()).filter(Boolean)));
+  if (uniq.length === 0) return { error: "请选择要复制的数据" };
+  const targetType = input.targetType;
+  const targetDirId =
+    input.targetDirId === undefined ? undefined : input.targetDirId?.trim() || null;
+  try {
+    let duplicated = 0;
+    await prisma.$transaction(async (tx) => {
+      // 若指定目标目录：确保目录存在且属于 targetType
+      if (targetDirId) {
+        const dir = await tx.testDesignDir.findUnique({
+          where: { id: targetDirId },
+          select: { id: true, type: true },
+        });
+        if (!dir) throw new Error("目标目录不存在或已删除");
+        if (dir.type !== targetType) throw new Error("目标目录不属于当前类别");
+      }
+
+      const rows = await tx.testDesign.findMany({
+        where: { id: { in: uniq } },
+        select: {
+          id: true,
+          requirementId: true,
+          parentId: true,
+          sortOrder: true,
+          title: true,
+          description: true,
+          type: true,
+          iterationCode: true,
+          dirId: true,
+          createdBy: true,
+          updatedBy: true,
+          precondition: true,
+          operationSteps: true,
+          expectedResult: true,
+          remark: true,
+        } as unknown as Record<string, boolean>,
+      });
+      const typed = rows as unknown as Array<{
+        id: string;
+        requirementId: string;
+        parentId: string | null;
+        sortOrder: number;
+        title: string;
+        description?: string | null;
+        type: TestDesignType;
+        iterationCode?: string | null;
+        dirId?: string | null;
+        createdBy?: string | null;
+        updatedBy?: string | null;
+        precondition?: string | null;
+        operationSteps?: string | null;
+        expectedResult?: string | null;
+        remark?: string | null;
+      }>;
+
+      // 保持顺序：按原 sortOrder 复制，新的节点放到同父节点下末尾
+      const byParent = new Map<string, Array<(typeof typed)[number]>>();
+      for (const r of typed) {
+        const k = r.parentId ?? "__root__";
+        const arr = byParent.get(k) ?? [];
+        arr.push(r);
+        byParent.set(k, arr);
+      }
+      for (const [, arr] of byParent) {
+        arr.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+      }
+
+      for (const [k, arr] of byParent) {
+        const parentId = k === "__root__" ? null : k;
+        const nextDirId =
+          targetDirId === undefined ? (arr[0]!.dirId ?? null) : targetDirId;
+        const max = await tx.testDesign.aggregate({
+          where: {
+            requirementId: arr[0]!.requirementId,
+            parentId,
+            type: targetType,
+            dirId: nextDirId,
+          },
+          _max: { sortOrder: true },
+        });
+        let nextSort = (max._max.sortOrder ?? 0) + 1;
+        for (const r of arr) {
+          await tx.testDesign.create({
+            data: {
+              requirementId: r.requirementId,
+              parentId: r.parentId,
+              sortOrder: nextSort++,
+              title: `${r.title}（复制）`,
+              description: r.description ?? null,
+              type: targetType,
+              iterationCode: r.iterationCode ?? null,
+              dirId: nextDirId,
+              createdBy: r.createdBy ?? null,
+              updatedBy: r.updatedBy ?? null,
+              precondition: r.precondition ?? null,
+              operationSteps: r.operationSteps ?? null,
+              expectedResult: r.expectedResult ?? null,
+              remark: r.remark ?? null,
+            } as Prisma.TestDesignUncheckedCreateInput,
+            select: { id: true },
+          });
+          // 注意：不复制 testDesignTestCase，不写 testDesignOpLog → “操作记录”为空
+          duplicated++;
+        }
+      }
+    });
+    revalidatePath("/test-design");
+    return { ok: true, duplicated };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "复制失败" };
+  }
+}
+
+export async function bulkUpdateTestDesignNodes(input: {
+  ids: string[];
+  type?: TestDesignType | null;
+  dirId?: string | null;
+}): Promise<ActionResult> {
+  const uniq = Array.from(new Set(input.ids.map((x) => x.trim()).filter(Boolean)));
+  if (uniq.length === 0) return { error: "请选择要修改的数据" };
+
+  const patch: Record<string, unknown> = {};
+  if (input.type) patch.type = input.type;
+  if (input.dirId !== undefined) patch.dirId = input.dirId;
+
+  // 若同时传 type + dirId：确保目录类型匹配
+  if (input.type && input.dirId) {
+    const dir = await prisma.testDesignDir.findUnique({
+      where: { id: input.dirId },
+      select: { id: true, type: true },
+    });
+    if (!dir) return { error: "目标目录不存在或已删除" };
+    if (dir.type !== input.type) return { error: "目标目录不属于所选类别" };
+  }
+
+  if (Object.keys(patch).length === 0) return { error: "未选择任何要修改的字段" };
+
+  await prisma.testDesign.updateMany({
+    where: { id: { in: uniq } },
+    data: patch,
   });
   revalidatePath("/test-design");
   return { ok: true };
@@ -597,6 +1180,7 @@ export async function createTestDesignNode(input: {
   title: string;
   type: TestDesignType;
   iterationCode: string; // "" 表示 baseline 模板
+  dirId?: string | null;
   createdBy?: string | null;
 }): Promise<ActionResult> {
   const title = input.title.trim();
@@ -628,6 +1212,7 @@ export async function createTestDesignNode(input: {
         type: input.type,
         sortOrder,
         iterationCode: req.iteration.code,
+        dirId: input.dirId ?? null,
         ...(createdBy ? ({ createdBy } as unknown as Record<string, unknown>) : {}),
         ...(createdBy
           ? ({ updatedBy: createdBy } as unknown as Record<string, unknown>)
@@ -645,6 +1230,7 @@ export async function createTestDesignNode(input: {
           type: input.type,
           sortOrder,
           iterationCode: req.iteration.code,
+          dirId: input.dirId ?? null,
         },
         select: { id: true },
       });
@@ -656,10 +1242,212 @@ export async function createTestDesignNode(input: {
   return { ok: true };
 }
 
+export type TestDesignDirFlat = {
+  id: string;
+  name: string;
+  type: TestDesignType;
+  parentId: string | null;
+  sortOrder: number;
+};
+
+export async function listTestDesignDirs(input: {
+  iterationCode: string;
+}): Promise<{ rows?: TestDesignDirFlat[]; error?: string }> {
+  const code = input.iterationCode.trim();
+  if (!code) return { rows: [] };
+  try {
+    const it = await prisma.iteration.findUnique({
+      where: { code },
+      select: { id: true },
+    });
+    if (!it) return { rows: [] };
+    const rows = await prisma.testDesignDir.findMany({
+      where: { iterationId: it.id },
+      orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
+      select: { id: true, name: true, type: true, parentId: true, sortOrder: true },
+    });
+    return { rows: rows.map((r) => ({ ...r, parentId: r.parentId ?? null })) };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "加载目录失败" };
+  }
+}
+
+export async function createTestDesignDir(input: {
+  iterationCode: string;
+  type: TestDesignType;
+  parentId: string | null;
+  name: string;
+}): Promise<ActionResult & { id?: string }> {
+  const code = input.iterationCode.trim();
+  const name = input.name.trim();
+  if (!code) return { error: "请选择具体迭代（baseline 不支持维护目录）。" };
+  if (!name) return { error: "目录名称不能为空" };
+  const it = await prisma.iteration.findUnique({ where: { code }, select: { id: true } });
+  if (!it) return { error: "迭代不存在" };
+  const max = await prisma.testDesignDir.aggregate({
+    where: { iterationId: it.id, parentId: input.parentId, type: input.type },
+    _max: { sortOrder: true },
+  });
+  const sortOrder = (max._max.sortOrder ?? 0) + 1;
+  try {
+    const row = await prisma.testDesignDir.create({
+      data: {
+        iterationId: it.id,
+        type: input.type,
+        parentId: input.parentId,
+        name,
+        sortOrder,
+      },
+      select: { id: true },
+    });
+    revalidatePath("/test-design");
+    return { ok: true, id: row.id };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "创建目录失败" };
+  }
+}
+
+export async function renameTestDesignDir(input: {
+  id: string;
+  name: string;
+}): Promise<ActionResult> {
+  const id = input.id.trim();
+  const name = input.name.trim();
+  if (!id) return { error: "无效目录" };
+  if (!name) return { error: "目录名称不能为空" };
+  try {
+    await prisma.testDesignDir.update({ where: { id }, data: { name }, select: { id: true } });
+    revalidatePath("/test-design");
+    return { ok: true };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "重命名失败" };
+  }
+}
+
+export async function deleteTestDesignDir(idRaw: string): Promise<ActionResult> {
+  const id = idRaw.trim();
+  if (!id) return { error: "无效目录" };
+  const child = await prisma.testDesignDir.findFirst({ where: { parentId: id }, select: { id: true } });
+  if (child) return { error: "该目录下仍有子节点，无法删除。" };
+  const used = await prisma.testDesign.findFirst({ where: { dirId: id }, select: { id: true } });
+  if (used) return { error: "该目录下仍有关联的测试设计，无法删除。" };
+  try {
+    await prisma.testDesignDir.delete({ where: { id }, select: { id: true } });
+    revalidatePath("/test-design");
+    return { ok: true };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "删除失败" };
+  }
+}
+
+export async function moveTestDesignDir(input: {
+  id: string;
+  iterationCode: string;
+  targetType: TestDesignType;
+  targetParentId: string | null;
+}): Promise<ActionResult> {
+  const id = input.id.trim();
+  const code = input.iterationCode.trim();
+  if (!id) return { error: "无效目录" };
+  if (!code) return { error: "请选择具体迭代（baseline 不支持维护目录）。" };
+
+  const it = await prisma.iteration.findUnique({ where: { code }, select: { id: true } });
+  if (!it) return { error: "迭代不存在" };
+
+  const dir = await prisma.testDesignDir.findUnique({ where: { id }, select: { id: true, iterationId: true } });
+  if (!dir) return { error: "目录不存在" };
+  if (dir.iterationId !== it.id) return { error: "目录不属于当前迭代" };
+
+  if (input.targetParentId) {
+    const p = await prisma.testDesignDir.findUnique({
+      where: { id: input.targetParentId },
+      select: { id: true, iterationId: true },
+    });
+    if (!p) return { error: "目标父节点不存在" };
+    if (p.iterationId !== it.id) return { error: "目标父节点不属于当前迭代" };
+  }
+
+  if (input.targetParentId && input.targetParentId === id) {
+    return { error: "不能移动到自身之下" };
+  }
+
+  // 防止拖拽把节点挂到自己的后代下
+  if (input.targetParentId) {
+    const all = await prisma.testDesignDir.findMany({
+      where: { iterationId: it.id },
+      select: { id: true, parentId: true },
+    });
+    const byId = new Map(all.map((r) => [r.id, r.parentId ?? null] as const));
+    let cur: string | null = input.targetParentId;
+    while (cur) {
+      if (cur === id) return { error: "不能移动到自己的子树下" };
+      cur = byId.get(cur) ?? null;
+    }
+  }
+
+  const max = await prisma.testDesignDir.aggregate({
+    where: { iterationId: it.id, type: input.targetType, parentId: input.targetParentId },
+    _max: { sortOrder: true },
+  });
+  const nextSort = (max._max.sortOrder ?? 0) + 1;
+
+  await prisma.$transaction(async (tx) => {
+    // 取出子树 id，用于跨类型移动时同步更新子树 type
+    const all = await tx.testDesignDir.findMany({
+      where: { iterationId: it.id },
+      select: { id: true, parentId: true },
+    });
+    const children = new Map<string | null, string[]>();
+    for (const r of all) {
+      const k = r.parentId ?? null;
+      const arr = children.get(k) ?? [];
+      arr.push(r.id);
+      children.set(k, arr);
+    }
+    const sub: string[] = [];
+    const dfs = (nid: string) => {
+      sub.push(nid);
+      for (const cid of children.get(nid) ?? []) dfs(cid);
+    };
+    dfs(id);
+
+    await tx.testDesignDir.update({
+      where: { id },
+      data: {
+        type: input.targetType,
+        parentId: input.targetParentId,
+        sortOrder: nextSort,
+      },
+      select: { id: true },
+    });
+    // 若跨类型移动：同步更新整个子树 type，保证同一子树不混类型
+    await tx.testDesignDir.updateMany({
+      where: { id: { in: sub } },
+      data: { type: input.targetType },
+    });
+  });
+
+  revalidatePath("/test-design");
+  return { ok: true };
+}
+
 export async function deleteTestDesignNode(nodeId: string): Promise<ActionResult> {
   const id = nodeId.trim();
   if (!id) return { error: "无效节点" };
-  await prisma.testDesign.delete({ where: { id } });
+  try {
+    await prisma.$transaction(async (tx) => {
+      const toDelete = await collectTestDesignSubtreeIds([id], tx);
+      if (toDelete.length === 0) return;
+      const rows = await tx.testDesign.findMany({
+        where: { id: { in: toDelete } },
+        include: { linkedTestCases: { select: { testCaseId: true } } },
+      });
+      await insertTestDesignDeletedMany(tx, rows);
+      await tx.testDesign.deleteMany({ where: { id: { in: toDelete } } });
+    });
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "删除失败" };
+  }
   revalidatePath("/test-design");
   return { ok: true };
 }
