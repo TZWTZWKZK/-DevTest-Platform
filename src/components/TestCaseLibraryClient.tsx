@@ -12,10 +12,12 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
   bulkDeleteTestCases,
   bulkMoveTestCases,
+  bulkUpdateTestCasesMeta,
   countTestCasesByFolderSubtree,
   createFolder,
   deleteFolder,
@@ -25,9 +27,13 @@ import {
   getTestCasesExportRows,
   linkDefectsToTestCaseBatch,
   listDefectsLinkedToTestCase,
+  listDeletedTestCasesArchive,
   listFoldersFlat,
   listTestCasesInFolder,
+  moveTestCaseFolder,
   renameFolder,
+  reorderTestCaseFolderSiblings,
+  restoreTestCasesFromArchive,
   saveTestCase,
   unlinkDefectFromTestCase,
   unlinkDefectsFromTestCaseBatch,
@@ -43,12 +49,15 @@ import {
   getGlobalTestCaseExecResultHeightPreference,
   getGlobalTestCaseSidebarPreference,
   getExecutionTaskCaseResult,
+  listDeletedTestCaseExecRecords,
   listExecutionTaskCaseExecRecords,
   listTestCaseExecRecords,
+  restoreTestCaseExecRecordsFromArchive,
   saveGlobalTestCaseExecResultHeightPreference,
   saveGlobalIterationProductPreference,
   saveGlobalTestCaseSidebarPreference,
   saveExecutionTaskCaseResult,
+  type DeletedTestCaseExecRecordRow,
   type ExecutionTaskCaseExecRecordDTO,
 } from "@/app/actions/executions";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
@@ -58,11 +67,15 @@ import {
   formatCaseLevelDisplay,
   parseCaseLevelOrNull,
 } from "@/lib/case-level";
-import { folderPathFromFlat } from "@/lib/folder-path";
+import {
+  collectDescendantFolderIds,
+  folderPathFromFlat,
+} from "@/lib/folder-path";
 import {
   testCaseStatusBadgeClass,
   testCaseStatusLabel,
   testCaseStatusOptions,
+  testCaseStatusSelectOptionStyle,
 } from "@/lib/test-labels";
 import { buildTree, type TreeNode } from "@/lib/tree";
 import {
@@ -79,9 +92,28 @@ import {
 import { PaginationBar } from "@/components/PaginationBar";
 import { TableColumnResizeHandle } from "@/components/TableColumnResizeHandle";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 
 /** 与测试设计「批量导入到用例库」共用 */
 const PENDING_TEST_DESIGN_IMPORT_STORAGE = "pm-pending-test-design-import";
+
+/** 拖到目录树顶部「移到顶层」占位 id（非真实文件夹） */
+const FOLDER_TREE_ROOT_DROP = "__folder_tree_root_drop__";
+
+/** 同级目录 id 列表：将 activeId 移动到 overId 的位置 */
+function reorderSiblingFolderIds(
+  ids: string[],
+  activeId: string,
+  overId: string,
+): string[] {
+  const from = ids.indexOf(activeId);
+  const to = ids.indexOf(overId);
+  if (from < 0 || to < 0 || from === to) return ids;
+  const next = [...ids];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
 
 type FolderNode = TreeNode<TestCaseFolderFlat>;
 
@@ -354,9 +386,16 @@ function CaseListDataCell({
   }
 }
 
+/** 用例库左侧栏：「搜索用例」区默认高度（px）；目录树与其之间可拖动分隔条调整 */
+const FOLDER_SEARCH_FOOTER_DEFAULT_H = 148;
+/** 顶部「目录说明 + 筛选 + 导入提示」区默认高度（px）；下沿拖动可调，超出部分在区内滚动 */
+const FOLDER_UPPER_PANE_DEFAULT_H = 300;
+const FOLDER_UPPER_PANE_MIN_H = 100;
+
 export function TestCaseLibraryClient({
   initialFolders,
   embedMode = false,
+  embedProductId = null,
   openCaseId = null,
   onEmbedClose,
   onEmbedSaved,
@@ -364,6 +403,8 @@ export function TestCaseLibraryClient({
 }: {
   initialFolders: TestCaseFolderFlat[];
   embedMode?: boolean;
+  /** 嵌入执行任务页时锁定为迭代所属产品，目录树与该产品的用例库一致 */
+  embedProductId?: string | null;
   openCaseId?: string | null;
   onEmbedClose?: () => void;
   onEmbedSaved?: () => void;
@@ -381,6 +422,10 @@ export function TestCaseLibraryClient({
   const [iterationCode, setIterationCode] = useState<string>("");
   const [products, setProducts] = useState<ProductOption[]>([]);
   const [productId, setProductId] = useState("");
+  const effectiveProductId = useMemo(() => {
+    if (embedMode) return (embedProductId ?? "").trim();
+    return productId.trim();
+  }, [embedMode, embedProductId, productId]);
   const productPrefHydratedRef = useRef(false);
   const [iterationOptions, setIterationOptions] = useState<
     { code: string; label: string; productId?: string | null }[]
@@ -391,6 +436,12 @@ export function TestCaseLibraryClient({
   const [folderSubtreeCounts, setFolderSubtreeCounts] = useState<
     Record<string, number>
   >({});
+  const [folderDragId, setFolderDragId] = useState<string | null>(null);
+  const [folderDragOverId, setFolderDragOverId] = useState<string | null>(null);
+  /** 当前悬停行允许的投放含义（用于描边颜色）；同级时 Ctrl=仅排序，否则=放入其下 */
+  const [folderDropMode, setFolderDropMode] = useState<
+    "nest" | "reorder" | "invalid" | null
+  >(null);
   const [err, setErr] = useState<string | null>(null);
 
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
@@ -547,8 +598,39 @@ export function TestCaseLibraryClient({
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const [moveModalOpen, setMoveModalOpen] = useState(false);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState<string>("");
+  const [restoreArchiveOpen, setRestoreArchiveOpen] = useState(false);
+  const [restoreArchiveRows, setRestoreArchiveRows] = useState<
+    Array<{
+      id: string;
+      originalId: string;
+      caseNo: string;
+      title: string;
+      folderId: string;
+      deletedAt: string;
+    }>
+  >([]);
+  const [restoreArchivePick, setRestoreArchivePick] = useState<string[]>([]);
+  const [restoreArchiveLoading, setRestoreArchiveLoading] = useState(false);
+  const [restoreArchiveWorking, setRestoreArchiveWorking] = useState(false);
+  const [restoreFallbackFolderId, setRestoreFallbackFolderId] = useState("");
+  const [execRestoreOpen, setExecRestoreOpen] = useState(false);
+  const [deletedExecRows, setDeletedExecRows] = useState<
+    DeletedTestCaseExecRecordRow[]
+  >([]);
+  const [execRestorePick, setExecRestorePick] = useState<string[]>([]);
+  const [execRestoreLoading, setExecRestoreLoading] = useState(false);
+  const [execRestoreWorking, setExecRestoreWorking] = useState(false);
   const [batchWorking, setBatchWorking] = useState(false);
+  const [batchEditOpen, setBatchEditOpen] = useState(false);
+  const [batchEditWorking, setBatchEditWorking] = useState(false);
+  const [batchStatusSel, setBatchStatusSel] = useState("keep");
+  const [batchPrioritySel, setBatchPrioritySel] = useState("keep");
+  const [batchMaintainerApply, setBatchMaintainerApply] = useState(false);
+  const [batchMaintainerText, setBatchMaintainerText] = useState("");
+  const [batchSubmitterApply, setBatchSubmitterApply] = useState(false);
+  const [batchSubmitterText, setBatchSubmitterText] = useState("");
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const selectAllFullVisibleRef = useRef<HTMLInputElement>(null);
   const modalLinkedDefectSelectAllRef = useRef<HTMLInputElement>(null);
   const addDefectSelectAllRef = useRef<HTMLInputElement>(null);
   const [addDefectTblChkW, setAddDefectTblChkW] = useState(40);
@@ -609,6 +691,90 @@ export function TestCaseLibraryClient({
       window.addEventListener("mouseup", onUp);
     },
     [folderPaneW],
+  );
+
+  const [folderSearchFooterH, setFolderSearchFooterH] = useState(
+    FOLDER_SEARCH_FOOTER_DEFAULT_H,
+  );
+  const folderSearchFooterHRef = useRef(FOLDER_SEARCH_FOOTER_DEFAULT_H);
+  useEffect(() => {
+    folderSearchFooterHRef.current = folderSearchFooterH;
+  }, [folderSearchFooterH]);
+
+  const startResizeFolderSearchFooter = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const el = e.currentTarget;
+      el.setPointerCapture?.(e.pointerId);
+      const sy = e.clientY;
+      const h0 = folderSearchFooterHRef.current;
+      const move = (ev: PointerEvent) => {
+        const dy = ev.clientY - sy;
+        const next = Math.min(
+          340,
+          Math.max(96, Math.round(h0 + dy)),
+        );
+        setFolderSearchFooterH(next);
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        try {
+          el.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // ignore
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [],
+  );
+
+  const [folderUpperPaneH, setFolderUpperPaneH] = useState(
+    FOLDER_UPPER_PANE_DEFAULT_H,
+  );
+  const folderUpperPaneHRef = useRef(FOLDER_UPPER_PANE_DEFAULT_H);
+  useEffect(() => {
+    folderUpperPaneHRef.current = folderUpperPaneH;
+  }, [folderUpperPaneH]);
+
+  const startResizeFolderUpperPane = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const el = e.currentTarget;
+      el.setPointerCapture?.(e.pointerId);
+      const sy = e.clientY;
+      const h0 = folderUpperPaneHRef.current;
+      const move = (ev: PointerEvent) => {
+        const dy = ev.clientY - sy;
+        const maxCap = Math.max(
+          FOLDER_UPPER_PANE_MIN_H + 80,
+          Math.min(620, Math.floor(window.innerHeight - 200)),
+        );
+        const next = Math.min(
+          maxCap,
+          Math.max(FOLDER_UPPER_PANE_MIN_H, Math.round(h0 + dy)),
+        );
+        setFolderUpperPaneH(next);
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        try {
+          el.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // ignore
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [],
   );
 
   const treeLive = useMemo(() => buildTree(folders), [folders]);
@@ -693,39 +859,79 @@ export function TestCaseLibraryClient({
     defaultPageSize: 20,
     storageKey: "pm.pageSize.testCases",
   });
-
-  const allFilteredSelected =
-    filteredCases.length > 0 &&
-    filteredCases.every((c) => selectedCaseIds.includes(c.id));
-  const someFilteredSelected = filteredCases.some((c) =>
-    selectedCaseIds.includes(c.id),
+  const allFilteredCaseIds = useMemo(
+    () => filteredCases.map((c) => c.id),
+    [filteredCases],
   );
+  const caseListPagedRowIdsRef = useRef<string[]>([]);
+  caseListPagedRowIdsRef.current = casePager.pagedItems.map((c) => c.id);
+  const selectedCaseIdsRef = useRef(selectedCaseIds);
+  selectedCaseIdsRef.current = selectedCaseIds;
+  const { onRowCheckboxPointerDown, tableBodyRef: caseListTableBodyRef } =
+    useRowCheckboxBrushByIds({
+      pagedRowIdsRef: caseListPagedRowIdsRef,
+      selectedIdsRef: selectedCaseIdsRef,
+      setSelectedIds: setSelectedCaseIds,
+    });
 
   useEffect(() => {
     const el = selectAllRef.current;
-    if (el) {
-      el.indeterminate =
-        someFilteredSelected && !allFilteredSelected;
+    if (!el) return;
+    if (selectedCaseIds.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
     }
-  }, [someFilteredSelected, allFilteredSelected]);
+    const pageIds = casePager.pagedItems.map((c) => c.id);
+    const selectedSet = new Set(selectedCaseIds);
+    const allPageSelected =
+      pageIds.length > 0 && pageIds.every((id) => selectedSet.has(id));
+    el.indeterminate = !allPageSelected;
+    el.checked = allPageSelected;
+  }, [casePager.pagedItems, selectedCaseIds]);
 
-  const toggleSelectOne = useCallback((id: string) => {
-    setSelectedCaseIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
-  }, []);
+  useEffect(() => {
+    const el = selectAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allFilteredCaseIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAll =
+      selectedCaseIds.length === ids.length &&
+      selectedCaseIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => selectedCaseIds.includes(id));
+    el.checked = exactAll;
+    el.indeterminate = someInList && !exactAll;
+  }, [allFilteredCaseIds, selectedCaseIds]);
 
-  const toggleSelectAllFiltered = useCallback(() => {
+  const toggleSelectAllFilteredPage = useCallback(() => {
     const ids = casePager.pagedItems.map((c) => c.id);
+    if (ids.length === 0) return;
     setSelectedCaseIds((prev) => {
-      const allOn =
-        ids.length > 0 && ids.every((id) => prev.includes(id));
-      if (allOn) {
-        return prev.filter((id) => !ids.includes(id));
-      }
-      return [...new Set([...prev, ...ids])];
+      const pageSet = new Set(ids);
+      const allOn = ids.every((id) => prev.includes(id));
+      return allOn
+        ? prev.filter((id) => !pageSet.has(id))
+        : [...new Set([...prev, ...ids])];
     });
   }, [casePager.pagedItems]);
+
+  const toggleSelectAllFilteredCasesFull = useCallback(() => {
+    const ids = allFilteredCaseIds;
+    if (ids.length === 0) return;
+    setSelectedCaseIds((prev) => {
+      const fullSet = new Set(ids);
+      const exact =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exact) return [];
+      return [...ids];
+    });
+  }, [allFilteredCaseIds]);
 
   const clearSelection = useCallback(() => setSelectedCaseIds([]), []);
 
@@ -803,9 +1009,13 @@ export function TestCaseLibraryClient({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [columnPanelOpen]);
 
-  const reloadFolders = async () => {
+  const reloadFolders = useCallback(async () => {
+    if (!effectiveProductId) {
+      setFolders([]);
+      return;
+    }
     try {
-      const f = await listFoldersFlat();
+      const f = await listFoldersFlat(effectiveProductId);
       setFolders(f);
     } catch {
       showNotice(
@@ -813,10 +1023,42 @@ export function TestCaseLibraryClient({
         "无法从服务器获取文件夹列表，请检查网络或稍后刷新页面。",
       );
     }
-  };
+  }, [effectiveProductId, showNotice]);
+
+  useEffect(() => {
+    if (!effectiveProductId) {
+      setFolders([]);
+      setSelectedFolderId(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const f = await listFoldersFlat(effectiveProductId);
+        if (cancelled) return;
+        setFolders(f);
+        setSelectedFolderId((prev) => {
+          if (prev && f.some((x) => x.id === prev)) return prev;
+          const roots = buildTree(f);
+          return roots[0]?.id ?? null;
+        });
+      } catch {
+        if (!cancelled) {
+          setFolders([]);
+          showNotice(
+            "加载目录失败",
+            "无法从服务器获取文件夹列表，请检查网络或稍后刷新页面。",
+          );
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveProductId, showNotice]);
 
   const reloadCases = useCallback(async () => {
-    if (!selectedFolderId) {
+    if (!selectedFolderId || !effectiveProductId) {
       setCases([]);
       return;
     }
@@ -825,6 +1067,7 @@ export function TestCaseLibraryClient({
       const list = await listTestCasesInFolder(
         selectedFolderId,
         iterationCode || null,
+        effectiveProductId,
       );
       setCases(list);
     } catch {
@@ -836,18 +1079,73 @@ export function TestCaseLibraryClient({
     } finally {
       setLoadingCases(false);
     }
-  }, [selectedFolderId, iterationCode, showNotice]);
+  }, [selectedFolderId, iterationCode, effectiveProductId, showNotice]);
+
+  const openRestoreArchiveModal = useCallback(async () => {
+    setRestoreArchiveLoading(true);
+    setRestoreArchivePick([]);
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const r = await listDeletedTestCasesArchive({
+      deletedAfter: start.toISOString(),
+    });
+    setRestoreArchiveLoading(false);
+    if (r.error) {
+      showNotice("加载失败", r.error);
+      return;
+    }
+    setRestoreArchiveRows(r.rows);
+    setRestoreFallbackFolderId(selectedFolderId ?? folders[0]?.id ?? "");
+    setRestoreArchiveOpen(true);
+  }, [folders, selectedFolderId, showNotice]);
 
   const reloadFolderCounts = useCallback(async () => {
+    if (!effectiveProductId) {
+      setFolderSubtreeCounts({});
+      return;
+    }
     try {
       const m = await countTestCasesByFolderSubtree(
         iterationCode ? iterationCode : null,
+        effectiveProductId,
       );
       setFolderSubtreeCounts(m);
     } catch {
       setFolderSubtreeCounts({});
     }
-  }, [iterationCode]);
+  }, [iterationCode, effectiveProductId]);
+
+  const runRestoreFromArchive = useCallback(async () => {
+    if (restoreArchivePick.length === 0) {
+      showNotice("恢复", "请先勾选要恢复的条目。");
+      return;
+    }
+    setRestoreArchiveWorking(true);
+    const res = await restoreTestCasesFromArchive(restoreArchivePick, {
+      folderIdIfMissing: restoreFallbackFolderId.trim() || undefined,
+    });
+    setRestoreArchiveWorking(false);
+    if (res.error) {
+      showNotice("未能恢复", res.error);
+      return;
+    }
+    const noteBlock =
+      res.notes && res.notes.length > 0 ? `\n${res.notes.join("\n")}` : "";
+    showNotice(
+      "已恢复",
+      `成功恢复 ${res.restored ?? 0} 条用例。${noteBlock}`,
+    );
+    setRestoreArchiveOpen(false);
+    setRestoreArchivePick([]);
+    await reloadCases();
+    await reloadFolderCounts();
+  }, [
+    reloadCases,
+    reloadFolderCounts,
+    restoreArchivePick,
+    restoreFallbackFolderId,
+    showNotice,
+  ]);
 
   const runPendingDesignImport = useCallback(async () => {
     if (!selectedFolderId || pendingDesignImportIds.length === 0) return;
@@ -857,6 +1155,7 @@ export function TestCaseLibraryClient({
       const r = await bulkImportDesignsToTestCases({
         testDesignIds: pendingDesignImportIds,
         folderId: selectedFolderId,
+        productId: effectiveProductId,
       });
       if (r.error) {
         showNotice("导入失败", r.error);
@@ -868,7 +1167,25 @@ export function TestCaseLibraryClient({
         /* ignore */
       }
       setPendingDesignImportIds([]);
-      showNotice("导入完成", `已将 ${n} 条测试设计导入到当前目录。`);
+      const imported = r.imported ?? n;
+      const skipped = r.skippedDuplicates ?? 0;
+      const lines = r.skippedDuplicateDetails ?? [];
+      let detail = "";
+      if (imported > 0) {
+        detail = `本次成功导入 ${imported} 条到当前目录。`;
+      } else {
+        detail = "本次没有新的用例写入（可能全部为重复名称）。";
+      }
+      if (skipped > 0) {
+        detail += `\n\n因在同一产品与迭代下名称已存在，已跳过 ${skipped} 条：`;
+        if (lines.length > 0) {
+          detail += `\n${lines.join("\n")}`;
+        }
+      }
+      showNotice(
+        imported > 0 || skipped === 0 ? "导入完成" : "导入结束",
+        detail,
+      );
       void reloadCases();
       void reloadFolderCounts();
     } catch {
@@ -879,6 +1196,7 @@ export function TestCaseLibraryClient({
   }, [
     pendingDesignImportIds,
     selectedFolderId,
+    effectiveProductId,
     reloadCases,
     reloadFolderCounts,
     showNotice,
@@ -916,6 +1234,12 @@ export function TestCaseLibraryClient({
         : iterationOptions,
     [iterationOptions, productId],
   );
+
+  const sharedLibraryProductLabel = useMemo(() => {
+    const b = products.find((p) => p.isBaseline);
+    if (!b) return null;
+    return b.code ? `${b.name}（${b.code}）` : b.name;
+  }, [products]);
 
   useEffect(() => {
     void (async () => {
@@ -1460,6 +1784,55 @@ export function TestCaseLibraryClient({
     }
   };
 
+  const loadDeletedExecRows = useCallback(async () => {
+    if (!editingId) {
+      setDeletedExecRows([]);
+      return;
+    }
+    setExecRestoreLoading(true);
+    const r = await listDeletedTestCaseExecRecords({ testCaseId: editingId });
+    setExecRestoreLoading(false);
+    if (r.error) {
+      showNotice("读取失败", r.error);
+      setDeletedExecRows([]);
+      return;
+    }
+    setDeletedExecRows(r.rows ?? []);
+  }, [editingId, showNotice]);
+
+  useEffect(() => {
+    if (!execRestoreOpen || !editingId) return;
+    void loadDeletedExecRows();
+  }, [execRestoreOpen, editingId, loadDeletedExecRows]);
+
+  const runRestoreExecRecords = useCallback(async () => {
+    if (execRestorePick.length === 0) {
+      showNotice("恢复", "请先勾选要恢复的记录。");
+      return;
+    }
+    setExecRestoreWorking(true);
+    const r = await restoreTestCaseExecRecordsFromArchive(execRestorePick);
+    setExecRestoreWorking(false);
+    if (r.error) {
+      showNotice("恢复失败", r.error);
+      return;
+    }
+    showNotice(
+      "已恢复",
+      `成功恢复 ${r.restored ?? execRestorePick.length} 条执行记录。`,
+    );
+    setExecRestorePick([]);
+    setExecRestoreOpen(false);
+    if (embedMode) await reloadExecRecords();
+    else await reloadAllExecRecords();
+  }, [
+    embedMode,
+    execRestorePick,
+    reloadAllExecRecords,
+    reloadExecRecords,
+    showNotice,
+  ]);
+
   const openEdit = useCallback(async (id: string) => {
     setErr(null);
     closeMenus();
@@ -1647,6 +2020,60 @@ export function TestCaseLibraryClient({
     }
   };
 
+  const runBatchEditMeta = useCallback(async () => {
+    const ids = selectedCaseIds.filter((id) => cases.some((c) => c.id === id));
+    if (ids.length === 0) return;
+    const updates: {
+      status?: TestCaseStatus | null;
+      priority?: number | null;
+      maintainer?: string | null;
+      submitter?: string | null;
+    } = {};
+    if (batchStatusSel === "clear") updates.status = null;
+    else if (batchStatusSel !== "keep")
+      updates.status = batchStatusSel as TestCaseStatus;
+    if (batchPrioritySel === "unset") updates.priority = null;
+    else if (batchPrioritySel !== "keep")
+      updates.priority = Number(batchPrioritySel);
+    if (batchMaintainerApply)
+      updates.maintainer = batchMaintainerText.trim() || null;
+    if (batchSubmitterApply)
+      updates.submitter = batchSubmitterText.trim() || null;
+    if (Object.keys(updates).length === 0) {
+      showNotice("批量修改", "请至少选择一项要修改的内容");
+      return;
+    }
+    setBatchEditWorking(true);
+    try {
+      const r = await bulkUpdateTestCasesMeta({ ids, updates });
+      if (r.error) {
+        showNotice("批量修改失败", r.error);
+        return;
+      }
+      setBatchEditOpen(false);
+      clearSelection();
+      void reloadCases();
+      void reloadFolderCounts();
+    } catch {
+      showNotice("批量修改失败", "请求未能完成，请稍后重试。");
+    } finally {
+      setBatchEditWorking(false);
+    }
+  }, [
+    selectedCaseIds,
+    cases,
+    batchStatusSel,
+    batchPrioritySel,
+    batchMaintainerApply,
+    batchMaintainerText,
+    batchSubmitterApply,
+    batchSubmitterText,
+    showNotice,
+    clearSelection,
+    reloadCases,
+    reloadFolderCounts,
+  ]);
+
   const runBatchDelete = async () => {
     if (selectedCaseIds.length === 0) return;
     if (
@@ -1680,7 +2107,11 @@ export function TestCaseLibraryClient({
     }
     setBatchWorking(true);
     try {
-      const r = await bulkMoveTestCases(selectedCaseIds, moveTargetFolderId);
+      const r = await bulkMoveTestCases(
+        selectedCaseIds,
+        moveTargetFolderId,
+        effectiveProductId,
+      );
       if (r.error) {
         showNotice("批量移动失败", r.error);
         return;
@@ -1700,7 +2131,10 @@ export function TestCaseLibraryClient({
     if (selectedCaseIds.length === 0) return;
     setBatchWorking(true);
     try {
-      const r = await getTestCasesExportRows(selectedCaseIds);
+      const r = await getTestCasesExportRows(
+        selectedCaseIds,
+        effectiveProductId,
+      );
       if (r.error || !r.rows?.length) {
         showNotice("导出失败", r.error ?? "没有可导出的数据");
         return;
@@ -1785,7 +2219,11 @@ export function TestCaseLibraryClient({
     setErr(null);
     try {
       if (m.mode === "newChild") {
-        const r = await createFolder({ name, parentId: m.parentId });
+        const r = await createFolder({
+          name,
+          parentId: m.parentId,
+          productId: effectiveProductId,
+        });
         if (r.error) {
           showNotice("新建文件夹失败", r.error);
           return;
@@ -1794,7 +2232,7 @@ export function TestCaseLibraryClient({
         await reloadFolders();
         void reloadFolderCounts();
       } else if (m.mode === "rename") {
-        const r = await renameFolder(m.folderId, name);
+        const r = await renameFolder(m.folderId, name, effectiveProductId);
         if (r.error) {
           showNotice("重命名失败", r.error);
           return;
@@ -1802,7 +2240,11 @@ export function TestCaseLibraryClient({
         await reloadFolders();
         void reloadFolderCounts();
       } else {
-        const r = await createFolder({ name, parentId: null });
+        const r = await createFolder({
+          name,
+          parentId: null,
+          productId: effectiveProductId,
+        });
         if (r.error) {
           showNotice("新建根文件夹失败", r.error);
           return;
@@ -1832,7 +2274,7 @@ export function TestCaseLibraryClient({
     }
     setErr(null);
     try {
-      const r = await deleteFolder(folderId);
+      const r = await deleteFolder(folderId, effectiveProductId);
       if (r.error) {
         showNotice("删除文件夹失败", r.error);
         return;
@@ -1881,112 +2323,295 @@ export function TestCaseLibraryClient({
     setCaseMenu({ caseId, title, x: p.x, y: p.y });
   };
 
+  const runMoveFolderToParent = useCallback(
+    async (dragId: string, newParentId: string | null) => {
+      if (!effectiveProductId.trim()) return;
+      const r = await moveTestCaseFolder({
+        folderId: dragId,
+        newParentId,
+        productId: effectiveProductId,
+      });
+      if (r.error) {
+        showNotice("移动失败", r.error);
+        return;
+      }
+      if (newParentId) {
+        setFolderExpandedById((prev) => ({
+          ...prev,
+          [newParentId]: true,
+        }));
+      }
+      await reloadFolders();
+      void reloadFolderCounts();
+    },
+    [effectiveProductId, reloadFolders, reloadFolderCounts, showNotice],
+  );
+
   const FolderTreeRows = ({
     nodes,
     depth,
     variant = "nested",
+    parentFolderId = null,
   }: {
     nodes: FolderNode[];
     depth: number;
     variant?: "root" | "nested";
-  }) => (
-    <ul
-      className="space-y-0"
-      role={variant === "root" ? "tree" : "group"}
-    >
-      {nodes.map((n) => {
-        const accent = DEPTH_ACCENTS[depth % DEPTH_ACCENTS.length];
-        const hasChildren = n.children.length > 0;
-        const expanded = folderExpandedById[n.id] !== false;
-        return (
-          <li
-            key={n.id}
-            role="treeitem"
-            aria-level={depth + 1}
-            aria-expanded={hasChildren ? expanded : undefined}
-            aria-selected={selectedFolderId === n.id}
-          >
-            <div
-              className={[
-                "group flex items-stretch gap-0 rounded-md transition-colors",
-                selectedFolderId === n.id ? "bg-zinc-200/90" : "hover:bg-zinc-100/80",
-              ].join(" ")}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                showFolderMenu(n.id, e.clientX, e.clientY);
-              }}
+    parentFolderId?: string | null;
+  }) => {
+    const siblingIds = nodes.map((x) => x.id);
+    const showDragHandle = Boolean(effectiveProductId.trim());
+
+    const runSiblingReorder = async (activeId: string, overId: string) => {
+      const next = reorderSiblingFolderIds(siblingIds, activeId, overId);
+      if (next.every((id, i) => id === siblingIds[i])) return;
+      const r = await reorderTestCaseFolderSiblings({
+        productId: effectiveProductId,
+        parentId: parentFolderId,
+        orderedIds: next,
+      });
+      if (r.error) {
+        showNotice("排序失败", r.error);
+        return;
+      }
+      await reloadFolders();
+      void reloadFolderCounts();
+    };
+
+    return (
+      <ul
+        className="space-y-0"
+        role={variant === "root" ? "tree" : "group"}
+      >
+        {nodes.map((n) => {
+          const accent = DEPTH_ACCENTS[depth % DEPTH_ACCENTS.length];
+          const hasChildren = n.children.length > 0;
+          const expanded = folderExpandedById[n.id] !== false;
+          const dragKind =
+            folderDragId &&
+            folderDragOverId === n.id &&
+            folderDragId !== n.id &&
+            folderDropMode
+              ? folderDropMode === "invalid"
+                ? ("invalid" as const)
+                : folderDropMode === "reorder"
+                  ? ("reorder" as const)
+                  : ("nest" as const)
+              : null;
+          const dragRing =
+            dragKind === "reorder"
+              ? "ring-2 ring-blue-400/80 ring-inset"
+              : dragKind === "nest"
+                ? "ring-2 ring-emerald-500/70 ring-inset"
+                : dragKind === "invalid"
+                  ? "ring-2 ring-red-400/70 ring-inset"
+                  : "";
+          return (
+            <li
+              key={n.id}
+              role="treeitem"
+              aria-level={depth + 1}
+              aria-expanded={hasChildren ? expanded : undefined}
+              aria-selected={selectedFolderId === n.id}
             >
               <div
                 className={[
-                  "w-1 shrink-0 rounded-l-md border-l-[3px] bg-transparent",
-                  accent,
+                  "group flex items-stretch gap-0 rounded-md transition-colors",
+                  selectedFolderId === n.id ? "bg-zinc-200/90" : "hover:bg-zinc-100/80",
+                  folderDragId === n.id ? "opacity-60" : "",
+                  dragRing,
                 ].join(" ")}
-                aria-hidden
-              />
-              <button
-                type="button"
-                className={[
-                  "h-7 w-6 shrink-0 self-center rounded text-xs leading-none text-zinc-400 hover:bg-zinc-200/60 hover:text-zinc-700",
-                  hasChildren ? "visible" : "invisible pointer-events-none",
-                ].join(" ")}
-                onClick={(e) => {
-                  e.stopPropagation();
+                onContextMenu={(e) => {
                   e.preventDefault();
-                  toggleFolderExpand(n.id);
+                  showFolderMenu(n.id, e.clientX, e.clientY);
                 }}
-                aria-label={expanded ? "收起子目录" : "展开子目录"}
-                title={expanded ? "收起" : "展开"}
-              >
-                {expanded ? "▾" : "▸"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedFolderId(n.id);
-                  setErr(null);
-                  closeMenus();
+                onDragOver={(e) => {
+                  if (!folderDragId || folderDragId === n.id) return;
+                  const dragId = folderDragId;
+                  const isSibling =
+                    siblingIds.includes(dragId) &&
+                    siblingIds.includes(n.id);
+                  const subtree = collectDescendantFolderIds(folders, dragId);
+                  if (subtree.includes(n.id)) {
+                    e.dataTransfer.dropEffect = "none";
+                    setFolderDragOverId(n.id);
+                    setFolderDropMode("invalid");
+                    return;
+                  }
+                  if (isSibling) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    setFolderDragOverId(n.id);
+                    setFolderDropMode(
+                      e.ctrlKey || e.metaKey ? "reorder" : "nest",
+                    );
+                    return;
+                  }
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  setFolderDragOverId(n.id);
+                  setFolderDropMode("nest");
                 }}
-                className="min-w-0 flex-1 py-1 pl-0.5 pr-0.5 text-left text-xs leading-tight text-zinc-800"
-                style={{ paddingLeft: Math.max(0, depth * 10) }}
+                onDragLeave={(e) => {
+                  if (
+                    e.currentTarget.contains(e.relatedTarget as Node | null)
+                  ) {
+                    return;
+                  }
+                  setFolderDragOverId(null);
+                  setFolderDropMode(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const dragId =
+                    e.dataTransfer.getData("text/plain").trim() ||
+                    folderDragId ||
+                    "";
+                  setFolderDragId(null);
+                  setFolderDragOverId(null);
+                  setFolderDropMode(null);
+                  if (!dragId || !effectiveProductId.trim() || dragId === n.id)
+                    return;
+
+                  const isSibling =
+                    siblingIds.includes(dragId) &&
+                    siblingIds.includes(n.id);
+
+                  const subtree = collectDescendantFolderIds(folders, dragId);
+                  if (subtree.includes(n.id)) {
+                    showNotice(
+                      "无法移动",
+                      "不能将目录移动到其子目录下。",
+                    );
+                    return;
+                  }
+
+                  if (isSibling) {
+                    if (e.ctrlKey || e.metaKey) {
+                      void runSiblingReorder(dragId, n.id);
+                      return;
+                    }
+                    const moved = folders.find((f) => f.id === dragId);
+                    if (moved && (moved.parentId ?? null) === n.id) {
+                      return;
+                    }
+                    void runMoveFolderToParent(dragId, n.id);
+                    return;
+                  }
+
+                  const moved = folders.find((f) => f.id === dragId);
+                  if (moved && (moved.parentId ?? null) === n.id) {
+                    return;
+                  }
+
+                  void runMoveFolderToParent(dragId, n.id);
+                }}
               >
-                {showFolderLevelNumber ? (
-                  <span className="font-medium tabular-nums text-zinc-400">
-                    {depth + 1}.
-                  </span>
-                ) : null}
-                {showFolderLevelNumber ? " " : null}
-                <span className="font-medium">{n.name}</span>
-                <span
-                  className="ml-1 shrink-0 tabular-nums text-zinc-400"
-                  title="该目录及子目录下的用例数（随当前迭代筛选）"
+                <div
+                  className={[
+                    "w-1 shrink-0 rounded-l-md border-l-[3px] bg-transparent",
+                    accent,
+                  ].join(" ")}
+                  aria-hidden
+                />
+                {showDragHandle ? (
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    className="h-7 w-5 shrink-0 cursor-grab select-none self-center rounded-sm active:cursor-grabbing hover:bg-zinc-200/50"
+                    draggable
+                    title="拖动：松开放入该目录下；同级时按住 Ctrl（Mac ⌘）松手则仅排序"
+                    aria-label={`拖动目录：${n.name}`}
+                    onClick={(e) => e.preventDefault()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") e.preventDefault();
+                    }}
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData("text/plain", n.id);
+                      e.dataTransfer.effectAllowed = "move";
+                      setFolderDragId(n.id);
+                      setFolderDragOverId(null);
+                    }}
+                    onDragEnd={() => {
+                      setFolderDragId(null);
+                      setFolderDragOverId(null);
+                      setFolderDropMode(null);
+                    }}
+                  />
+                ) : (
+                  <span className="w-5 shrink-0" aria-hidden />
+                )}
+                <button
+                  type="button"
+                  draggable={false}
+                  className={[
+                    "h-7 w-6 shrink-0 self-center rounded text-xs leading-none text-zinc-400 hover:bg-zinc-200/60 hover:text-zinc-700",
+                    hasChildren ? "visible" : "invisible pointer-events-none",
+                  ].join(" ")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    toggleFolderExpand(n.id);
+                  }}
+                  aria-label={expanded ? "收起子目录" : "展开子目录"}
+                  title={expanded ? "收起" : "展开"}
                 >
-                  ({folderSubtreeCounts[n.id] ?? 0})
-                </span>
-              </button>
-              <button
-                type="button"
-                className="flex shrink-0 items-center px-1.5 text-sm leading-none text-zinc-500 opacity-70 hover:bg-zinc-200/50 hover:text-zinc-900 group-hover:opacity-100"
-                title="更多操作"
-                aria-label={`${n.name} 操作`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.preventDefault();
-                  showFolderMenuBelowButton(n.id, e.currentTarget);
-                }}
-              >
-                <span className="leading-none">⋮</span>
-              </button>
-            </div>
-            {hasChildren && expanded && (
-              <div className="relative ml-1.5 border-l border-dashed border-zinc-200 pl-0.5 pt-0">
-                <FolderTreeRows nodes={n.children} depth={depth + 1} />
+                  {expanded ? "▾" : "▸"}
+                </button>
+                <button
+                  type="button"
+                  draggable={false}
+                  onClick={() => {
+                    setSelectedFolderId(n.id);
+                    setErr(null);
+                    closeMenus();
+                  }}
+                  className="min-w-0 flex-1 py-1 pl-0.5 pr-0.5 text-left text-xs leading-tight text-zinc-800"
+                  style={{ paddingLeft: Math.max(0, depth * 10) }}
+                >
+                  {showFolderLevelNumber ? (
+                    <span className="font-medium tabular-nums text-zinc-400">
+                      {depth + 1}.
+                    </span>
+                  ) : null}
+                  {showFolderLevelNumber ? " " : null}
+                  <span className="font-medium">{n.name}</span>
+                  <span
+                    className="ml-1 shrink-0 tabular-nums text-zinc-400"
+                    title="该目录及子目录下的用例数（随当前迭代筛选）"
+                  >
+                    ({folderSubtreeCounts[n.id] ?? 0})
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  draggable={false}
+                  className="flex shrink-0 items-center px-1.5 text-sm leading-none text-zinc-500 opacity-70 hover:bg-zinc-200/50 hover:text-zinc-900 group-hover:opacity-100"
+                  title="更多操作"
+                  aria-label={`${n.name} 操作`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    showFolderMenuBelowButton(n.id, e.currentTarget);
+                  }}
+                >
+                  <span className="leading-none">⋮</span>
+                </button>
               </div>
-            )}
-          </li>
-        );
-      })}
-    </ul>
-  );
+              {hasChildren && expanded && (
+                <div className="relative ml-1.5 border-l border-dashed border-zinc-200 pl-0.5 pt-0">
+                  <FolderTreeRows
+                    nodes={n.children}
+                    depth={depth + 1}
+                    parentFolderId={n.id}
+                  />
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  };
 
   const selectedFolderName = selectedFolderId
     ? folderPathFromFlat(selectedFolderId, folders)
@@ -2001,11 +2626,25 @@ export function TestCaseLibraryClient({
           className="relative flex min-h-[280px] flex-col border-b border-zinc-200 bg-zinc-50/60 lg:min-h-0 lg:border-b-0 lg:border-r lg:border-zinc-200"
           style={{ width: folderPaneW, maxWidth: "100%" }}
         >
-          <div className="shrink-0 border-b border-zinc-200/80 p-3">
+          <div
+            className="relative flex shrink-0 flex-col overflow-hidden border-b border-zinc-200/80"
+            style={{ height: folderUpperPaneH }}
+          >
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <div className="p-3">
             <h2 className="text-sm font-semibold text-zinc-900">目录</h2>
             <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">
-              左侧 <strong>▸/▾</strong> 可展开或收起子目录；色条与序号区分层级；在目录行上
-              <strong>右键</strong>或点<strong>⋮</strong> 进行新建子文件夹、新建用例、重命名、删除。
+              左侧 <strong>▸/▾</strong> 可展开或收起子目录；拖<strong>三横握把</strong>到某一目录行上<strong>松开</strong>
+              → 放入该目录<strong>之下</strong>（含顶层文件夹之间互相挂靠）；按住{" "}
+              <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px]">
+                Ctrl
+              </kbd>{" "}
+              （Mac：
+              <kbd className="rounded border border-zinc-300 bg-zinc-100 px-1 font-mono text-[10px]">
+                ⌘
+              </kbd>
+              ）再松开 → 仅<strong>同级排序</strong>。拖到顶部<strong>虚线区</strong>→ 移到顶层。
+              右键或<strong>⋮</strong>新建、重命名、删除。
             </p>
             <div className="mt-2">
               <label className="text-xs font-medium text-zinc-600">
@@ -2019,9 +2658,17 @@ export function TestCaseLibraryClient({
                 {products.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.code ? `${p.name}（${p.code}）` : p.name}
+                    {p.isBaseline ? " · 共享用例库" : ""}
                   </option>
                 ))}
               </select>
+              {sharedLibraryProductLabel ? (
+                <p className="mt-1.5 rounded-md border border-amber-200 bg-amber-50/90 px-2 py-1.5 text-[11px] leading-snug text-amber-950">
+                  已启用共享用例库：目录与用例归属「
+                  {sharedLibraryProductLabel}
+                  」。切换上方产品仅影响迭代等筛选，不改变左侧目录树。
+                </p>
+              ) : null}
             </div>
             <div className="mt-2">
               <label className="text-xs font-medium text-zinc-600">
@@ -2091,9 +2738,9 @@ export function TestCaseLibraryClient({
                 )}
               </button>
             </div>
-          </div>
+              </div>
           {!embedMode && pendingDesignImportIds.length > 0 ? (
-            <div className="shrink-0 border-b border-blue-200/80 bg-blue-50/95 px-3 py-2.5">
+            <div className="border-t border-blue-200/80 bg-blue-50/95 px-3 py-2.5">
               <div className="text-xs font-semibold text-zinc-900">
                 从测试设计导入
               </div>
@@ -2132,19 +2779,101 @@ export function TestCaseLibraryClient({
               </div>
             </div>
           ) : null}
+            </div>
+            <div
+              data-testid="case-lib-folder-upper-resize"
+              className="z-30 flex h-3 w-full shrink-0 cursor-row-resize touch-none items-center justify-center border-t border-zinc-200/90 bg-zinc-100/95 hover:bg-zinc-200/70"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="拖动调整目录说明区与目录树高度"
+              title="上下拖动：缩小说明区则目录树变高；说明过长时在上方区域内滚动。双击恢复默认高度"
+              onPointerDown={startResizeFolderUpperPane}
+              onDoubleClick={() =>
+                setFolderUpperPaneH(FOLDER_UPPER_PANE_DEFAULT_H)
+              }
+            >
+              <span
+                className="pointer-events-none h-1 w-9 rounded-full bg-zinc-400/90"
+                aria-hidden
+              />
+            </div>
+          </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
             {err && (
               <p className="mb-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-800">
                 {err}
               </p>
             )}
+            {folderDragId && effectiveProductId.trim() && treeLive.length > 0 ? (
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  setFolderDragOverId(FOLDER_TREE_ROOT_DROP);
+                  setFolderDropMode("nest");
+                }}
+                onDragLeave={(e) => {
+                  if (
+                    e.currentTarget.contains(e.relatedTarget as Node | null)
+                  ) {
+                    return;
+                  }
+                  if (folderDragOverId === FOLDER_TREE_ROOT_DROP) {
+                    setFolderDragOverId(null);
+                    setFolderDropMode(null);
+                  }
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const dragId =
+                    e.dataTransfer.getData("text/plain").trim() ||
+                    folderDragId ||
+                    "";
+                  setFolderDragId(null);
+                  setFolderDragOverId(null);
+                  setFolderDropMode(null);
+                  if (!dragId || !effectiveProductId.trim()) return;
+                  const cur = folders.find((f) => f.id === dragId);
+                  if (cur && (cur.parentId ?? null) === null) return;
+                  void runMoveFolderToParent(dragId, null);
+                }}
+                className={[
+                  "mb-2 rounded-lg border border-dashed px-2 py-2 text-center text-[11px] leading-snug transition-colors",
+                  folderDragOverId === FOLDER_TREE_ROOT_DROP
+                    ? "border-emerald-500 bg-emerald-50 text-emerald-950"
+                    : "border-zinc-300 bg-zinc-50/90 text-zinc-600",
+                ].join(" ")}
+              >
+                ↓ 拖放到此处：移到<strong className="font-semibold">顶层</strong>
+                （与「根目录」同级）
+              </div>
+            ) : null}
             {treeLive.length === 0 ? (
               <p className="text-xs text-zinc-500">暂无目录</p>
             ) : (
-              <FolderTreeRows nodes={treeLive} depth={0} variant="root" />
+              <FolderTreeRows
+                nodes={treeLive}
+                depth={0}
+                variant="root"
+                parentFolderId={null}
+              />
             )}
           </div>
-          <div className="shrink-0 border-t border-zinc-200/90 bg-zinc-50/90 p-3">
+          <div
+            className="relative z-30 flex h-3 shrink-0 cursor-row-resize touch-none border-t border-zinc-200/80 bg-zinc-100/80 hover:bg-zinc-200/60"
+            data-testid="case-lib-folder-tree-footer-resize"
+            role="separator"
+            aria-label="拖动调整目录树与搜索区高度"
+            title="上下拖动调节目录树与「搜索用例」区域高度；双击恢复默认"
+            onPointerDown={startResizeFolderSearchFooter}
+            onDoubleClick={() =>
+              setFolderSearchFooterH(FOLDER_SEARCH_FOOTER_DEFAULT_H)
+            }
+          />
+          <div
+            className="flex min-h-0 shrink-0 flex-col overflow-y-auto bg-zinc-50/90 p-3"
+            style={{ height: folderSearchFooterH }}
+          >
             <label
               htmlFor="case-lib-search"
               className="text-xs font-medium text-zinc-700"
@@ -2165,7 +2894,7 @@ export function TestCaseLibraryClient({
             </p>
           </div>
           <span
-            className="absolute right-0 top-0 hidden h-full w-2 cursor-col-resize hover:bg-zinc-300/40 lg:block"
+            className="absolute right-0 top-0 z-[8] hidden h-full w-2 cursor-col-resize hover:bg-zinc-300/40 lg:block"
             role="separator"
             title="拖动调整左侧宽度"
             onMouseDown={(e) => {
@@ -2279,6 +3008,15 @@ export function TestCaseLibraryClient({
                 </div>
                 <button
                   type="button"
+                  onClick={() => void openRestoreArchiveModal()}
+                  disabled={restoreArchiveLoading}
+                  className={MODULE_TOOLBAR_BTN_SECONDARY}
+                  title="仅恢复「今日 0 点起」删除并已写入归档表的用例；执行任务本身删除后无法从此找回"
+                >
+                  {restoreArchiveLoading ? "加载归档…" : "恢复今日删除"}
+                </button>
+                <button
+                  type="button"
                   onClick={() => openCreate()}
                   disabled={!selectedFolderId}
                   className={MODULE_TOOLBAR_BTN_PRIMARY}
@@ -2310,6 +3048,25 @@ export function TestCaseLibraryClient({
                       条
                     </span>
                     <span className="hidden text-zinc-400 sm:inline">|</span>
+                    <button
+                      type="button"
+                      disabled={batchWorking || batchEditWorking}
+                      className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium hover:bg-zinc-50 disabled:opacity-50"
+                      title="批量修改选中用例在用例库中的状态、等级与维护信息"
+                      onClick={() => {
+                        setBatchStatusSel("keep");
+                        setBatchPrioritySel("keep");
+                        setBatchMaintainerApply(false);
+                        setBatchMaintainerText("");
+                        setBatchSubmitterApply(false);
+                        setBatchSubmitterText("");
+                        setBatchEditOpen(true);
+                      }}
+                    >
+                      {selectedCaseIds.length > 0
+                        ? `批量修改（${selectedCaseIds.length}）`
+                        : "批量修改"}
+                    </button>
                     <button
                       type="button"
                       disabled={batchWorking}
@@ -2369,7 +3126,11 @@ export function TestCaseLibraryClient({
                           >
                             <option value="">全部</option>
                             {testCaseStatusOptions.map((o) => (
-                              <option key={o.value} value={o.value}>
+                              <option
+                                key={o.value}
+                                value={o.value}
+                                style={testCaseStatusSelectOptionStyle[o.value]}
+                              >
                                 {o.label}
                               </option>
                             ))}
@@ -2542,7 +3303,7 @@ export function TestCaseLibraryClient({
                         }}
                       >
                       <colgroup>
-                        <col style={{ width: 40 }} />
+                        <col style={{ width: 56 }} />
                         {visibleOrdered.map((k) => (
                           <col key={k} style={{ width: widthFor(k) }} />
                         ))}
@@ -2550,16 +3311,25 @@ export function TestCaseLibraryClient({
                       </colgroup>
                       <thead className="border-b border-zinc-200 bg-zinc-50/80 text-xs text-zinc-500">
                         <tr>
-                          <th className="w-10 py-2.5 pl-3 pr-1 align-bottom">
-                            <input
-                              ref={selectAllRef}
-                              type="checkbox"
-                              className="h-4 w-4 rounded border-zinc-300"
-                              checked={allFilteredSelected}
-                              onChange={toggleSelectAllFiltered}
-                              title="全选当前列表"
-                              aria-label="全选当前筛选结果"
-                            />
+                          <th className="w-16 min-w-[4rem] py-2.5 pl-3 pr-1 align-bottom">
+                            <div className="flex items-end gap-1">
+                              <input
+                                ref={selectAllRef}
+                                type="checkbox"
+                                className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                onChange={toggleSelectAllFilteredPage}
+                                title="全选当前页（可与其它页已选合并）"
+                                aria-label="全选当前页"
+                              />
+                              <input
+                                ref={selectAllFullVisibleRef}
+                                type="checkbox"
+                                className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                onChange={toggleSelectAllFilteredCasesFull}
+                                title="全选列表：选中当前筛选下全部用例（与分页「/ 总数」一致）"
+                                aria-label="全选全部可见用例"
+                              />
+                            </div>
                           </th>
                           {visibleOrdered.map((k) => (
                             <th
@@ -2588,10 +3358,14 @@ export function TestCaseLibraryClient({
                           <th className="w-12 py-2.5 pr-3 text-right align-bottom font-medium" />
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-zinc-100">
+                      <tbody
+                        ref={caseListTableBodyRef}
+                        className="divide-y divide-zinc-100"
+                      >
                         {casePager.pagedItems.map((c) => (
                           <tr
                             key={c.id}
+                            data-pm-row-select={c.id}
                             className="group cursor-pointer hover:bg-zinc-50/90"
                             title={`打开编辑：${c.caseNo} ${c.title}`}
                             onClick={() => void openEdit(c.id)}
@@ -2608,8 +3382,22 @@ export function TestCaseLibraryClient({
                                 type="checkbox"
                                 className="h-4 w-4 rounded border-zinc-300"
                                 checked={selectedCaseIds.includes(c.id)}
-                                onChange={() => toggleSelectOne(c.id)}
-                                onClick={(e) => e.stopPropagation()}
+                                onChange={() => {}}
+                                onClick={(e) => e.preventDefault()}
+                                onPointerDown={(e) =>
+                                  onRowCheckboxPointerDown(e, c.id)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key !== " " && e.key !== "Enter") return;
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setSelectedCaseIds((prev) =>
+                                    prev.includes(c.id)
+                                      ? prev.filter((x) => x !== c.id)
+                                      : [...prev, c.id],
+                                  );
+                                }}
+                                title="按住并拖动经过多行可连续勾选"
                                 aria-label={`选择 ${c.caseNo}`}
                               />
                             </td>
@@ -2797,7 +3585,8 @@ export function TestCaseLibraryClient({
 
             <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
               <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 pb-3">
-                <div className="inline-flex rounded-lg border border-zinc-200 bg-white p-0.5 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="inline-flex rounded-lg border border-zinc-200 bg-white p-0.5 text-xs">
                   <button
                     type="button"
                     className={[
@@ -2848,6 +3637,19 @@ export function TestCaseLibraryClient({
                   >
                     操作记录
                   </button>
+                  </div>
+                  {editingId && caseModalTab === "execRuns" ? (
+                    <button
+                      type="button"
+                      className="rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                      onClick={() => {
+                        setExecRestorePick([]);
+                        setExecRestoreOpen(true);
+                      }}
+                    >
+                      恢复执行记录
+                    </button>
+                  ) : null}
                 </div>
                 <div className="text-[11px] text-zinc-500">
                   {caseModalTab === "basic"
@@ -3089,7 +3891,11 @@ export function TestCaseLibraryClient({
                           >
                             <option value="">（未选择）</option>
                             {testCaseStatusOptions.map((o) => (
-                              <option key={o.value} value={o.value}>
+                              <option
+                                key={o.value}
+                                value={o.value}
+                                style={testCaseStatusSelectOptionStyle[o.value]}
+                              >
                                 {o.label}
                               </option>
                             ))}
@@ -3431,8 +4237,24 @@ export function TestCaseLibraryClient({
                 ) : (
                   <div className="space-y-4">
                     <div className="rounded-lg border border-zinc-200 bg-white">
-                      <div className="border-b border-zinc-100 px-3 py-2 text-xs font-medium text-zinc-600">
-                        历史记录（{embedMode ? execRecords.length : allExecRecords.length} 条）
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-100 px-3 py-2">
+                        <span className="text-xs font-medium text-zinc-600">
+                          历史记录（
+                          {embedMode ? execRecords.length : allExecRecords.length}{" "}
+                          条）
+                        </span>
+                        {editingId ? (
+                          <button
+                            type="button"
+                            className="shrink-0 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-50"
+                            onClick={() => {
+                              setExecRestorePick([]);
+                              setExecRestoreOpen(true);
+                            }}
+                          >
+                            恢复执行记录
+                          </button>
+                        ) : null}
                       </div>
                       <div className="max-h-[480px] overflow-auto">
                         {(embedMode ? execRecords.length === 0 : allExecRecords.length === 0) ? (
@@ -3473,22 +4295,24 @@ export function TestCaseLibraryClient({
                                         {r.executor?.trim() ? r.executor : "—"}
                                       </td>
                                       <td className="px-3 py-2 align-top">
-                                        <button
-                                          type="button"
-                                          className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
-                                          onClick={() =>
-                                            setExecRecordDetailOpen({
-                                              executedAt: r.executedAt,
-                                              status: r.status,
-                                              executor: r.executor,
-                                              result: r.result ?? null,
-                                              images: r.images ?? null,
-                                              note: r.note ?? null,
-                                            })
-                                          }
-                                        >
-                                          查看
-                                        </button>
+                                        <div className="flex flex-wrap gap-1">
+                                          <button
+                                            type="button"
+                                            className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                            onClick={() =>
+                                              setExecRecordDetailOpen({
+                                                executedAt: r.executedAt,
+                                                status: r.status,
+                                                executor: r.executor,
+                                                result: r.result ?? null,
+                                                images: r.images ?? null,
+                                                note: r.note ?? null,
+                                              })
+                                            }
+                                          >
+                                            查看
+                                          </button>
+                                        </div>
                                       </td>
                                     </tr>
                                   ))
@@ -3516,23 +4340,26 @@ export function TestCaseLibraryClient({
                                           : "—"}
                                       </td>
                                       <td className="px-3 py-2 align-top">
-                                        <button
-                                          type="button"
-                                          className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
-                                          onClick={() =>
-                                            setExecRecordDetailOpen({
-                                              executedAt: r.executedAt,
-                                              status: r.status,
-                                              executor: r.executor,
-                                              result: r.result ?? null,
-                                              images: r.images ?? null,
-                                              note: r.note ?? null,
-                                              executionTaskTitle: r.executionTaskTitle ?? null,
-                                            })
-                                          }
-                                        >
-                                          查看
-                                        </button>
+                                        <div className="flex flex-wrap gap-1">
+                                          <button
+                                            type="button"
+                                            className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                            onClick={() =>
+                                              setExecRecordDetailOpen({
+                                                executedAt: r.executedAt,
+                                                status: r.status,
+                                                executor: r.executor,
+                                                result: r.result ?? null,
+                                                images: r.images ?? null,
+                                                note: r.note ?? null,
+                                                executionTaskTitle:
+                                                  r.executionTaskTitle ?? null,
+                                              })
+                                            }
+                                          >
+                                            查看
+                                          </button>
+                                        </div>
                                       </td>
                                     </tr>
                                   ))}
@@ -3613,6 +4440,447 @@ export function TestCaseLibraryClient({
           </div>
         </div>
       )}
+
+      {restoreArchiveOpen ? (
+        <div
+          className="fixed inset-0 z-[95] flex items-center justify-center overflow-y-auto bg-black/45 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="restore-archive-title"
+          onClick={() => setRestoreArchiveOpen(false)}
+        >
+          <div
+            className="mb-8 w-full max-w-3xl rounded-xl border border-zinc-200 bg-white shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-zinc-100 px-5 py-4">
+              <h3
+                id="restore-archive-title"
+                className="text-lg font-semibold text-zinc-900"
+              >
+                恢复今日删除的用例
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+                列表来自删除时写入的归档表（最多展示 500 条）。勾选后恢复为用例库数据，并尽力重建与测试设计 / 缺陷 /
+                执行任务的关联（对方若已删除则跳过）。
+                <strong className="font-medium text-zinc-800">
+                  「执行任务」节点删除不会进入此归档，须依赖数据库备份找回。
+                </strong>
+              </p>
+              <div className="mt-4">
+                <label className="text-xs font-medium text-zinc-600">
+                  原目录已删除时，恢复到
+                </label>
+                <select
+                  className="mt-1.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                  value={restoreFallbackFolderId}
+                  onChange={(e) => setRestoreFallbackFolderId(e.target.value)}
+                  title="当归档中的文件夹已不存在时，用例会放入此目录；原目录仍在时仍恢复到原目录"
+                >
+                  {folders.length === 0 ? (
+                    <option value="">（无目录，请先在侧栏维护文件夹）</option>
+                  ) : (
+                    folders.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {folderPathFromFlat(f.id, folders)}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
+                  若归档里的目标文件夹仍存在，会优先恢复到原目录；仅当原目录已删时，才使用上面选择的目录。
+                </p>
+              </div>
+            </div>
+            <div className="max-h-[min(60vh,520px)] overflow-auto px-5 py-3">
+              {restoreArchiveRows.length === 0 ? (
+                <p className="py-6 text-center text-sm text-zinc-500">
+                  今日尚无删除归档，或归档已被恢复。
+                </p>
+              ) : (
+                <table className="w-full min-w-[560px] table-fixed text-sm">
+                  <thead className="sticky top-0 border-b border-zinc-100 bg-zinc-50 text-xs text-zinc-500">
+                    <tr>
+                      <th className="w-10 px-2 py-2 text-left font-medium">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 rounded border-zinc-300"
+                          aria-label="全选归档"
+                          checked={
+                            restoreArchiveRows.length > 0 &&
+                            restoreArchivePick.length === restoreArchiveRows.length
+                          }
+                          onChange={() => {
+                            setRestoreArchivePick((prev) => {
+                              if (
+                                prev.length === restoreArchiveRows.length &&
+                                restoreArchiveRows.length > 0
+                              )
+                                return [];
+                              return restoreArchiveRows.map((x) => x.id);
+                            });
+                          }}
+                        />
+                      </th>
+                      <th className="px-2 py-2 text-left font-medium">删除时间</th>
+                      <th className="px-2 py-2 text-left font-medium">编号</th>
+                      <th className="px-2 py-2 text-left font-medium">名称</th>
+                      <th className="px-2 py-2 text-left font-medium">目录</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-100">
+                    {restoreArchiveRows.map((r) => (
+                      <tr key={r.id} className="hover:bg-zinc-50/70">
+                        <td className="px-2 py-2 align-top">
+                          <input
+                            type="checkbox"
+                            className="h-3.5 w-3.5 rounded border-zinc-300"
+                            checked={restoreArchivePick.includes(r.id)}
+                            onChange={() =>
+                              setRestoreArchivePick((prev) =>
+                                prev.includes(r.id)
+                                  ? prev.filter((x) => x !== r.id)
+                                  : [...prev, r.id],
+                              )
+                            }
+                            aria-label={`选择 ${r.caseNo}`}
+                          />
+                        </td>
+                        <td className="px-2 py-2 align-top text-xs text-zinc-600 tabular-nums">
+                          {formatTs(r.deletedAt)}
+                        </td>
+                        <td className="px-2 py-2 align-top font-mono text-xs text-zinc-800">
+                          {r.caseNo}
+                        </td>
+                        <td className="max-w-0 px-2 py-2 align-top">
+                          <div className="truncate" title={r.title}>
+                            {r.title}
+                          </div>
+                        </td>
+                        <td className="max-w-0 px-2 py-2 align-top text-xs text-zinc-500">
+                          <div className="truncate" title={r.folderId}>
+                            {folderPathFromFlat(r.folderId, folders)}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-zinc-100 px-5 py-4">
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm"
+                disabled={restoreArchiveWorking}
+                onClick={() => setRestoreArchiveOpen(false)}
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                disabled={
+                  restoreArchiveWorking ||
+                  restoreArchivePick.length === 0 ||
+                  restoreArchiveRows.length === 0
+                }
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+                onClick={() => void runRestoreFromArchive()}
+              >
+                {restoreArchiveWorking
+                  ? "恢复中…"
+                  : restoreArchivePick.length > 0
+                    ? `恢复已选（${restoreArchivePick.length}）`
+                    : "恢复已选"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {execRestoreOpen ? (
+        <div
+          className="fixed inset-0 z-[96] flex items-center justify-center overflow-y-auto bg-black/45 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="exec-restore-title"
+          onClick={() => setExecRestoreOpen(false)}
+        >
+          <div
+            className="mb-8 w-full max-w-3xl rounded-xl border border-zinc-200 bg-white shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-zinc-100 px-5 py-4">
+              <h3
+                id="exec-restore-title"
+                className="text-lg font-semibold text-zinc-900"
+              >
+                恢复执行记录
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+                下列条目来源于在本弹窗内删除执行记录时写入的误删归档。勾选后可恢复到对应执行任务下的历史记录。
+              </p>
+            </div>
+            <div className="max-h-[min(55vh,480px)] overflow-auto px-5 py-3">
+              {execRestoreLoading ? (
+                <p className="py-8 text-center text-sm text-zinc-500">
+                  加载中…
+                </p>
+              ) : deletedExecRows.length === 0 ? (
+                <p className="py-8 text-center text-sm text-zinc-500">
+                  当前用例暂无待恢复的执行记录归档。
+                </p>
+              ) : (
+                <table className="w-full min-w-[560px] table-fixed text-sm">
+                  <thead className="sticky top-0 border-b border-zinc-100 bg-zinc-50 text-xs text-zinc-500">
+                    <tr>
+                      <th className="w-10 px-2 py-2 text-left font-medium">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 rounded border-zinc-300"
+                          aria-label="全选误删执行记录"
+                          checked={
+                            deletedExecRows.length > 0 &&
+                            execRestorePick.length === deletedExecRows.length
+                          }
+                          onChange={() => {
+                            setExecRestorePick((prev) => {
+                              if (
+                                prev.length === deletedExecRows.length &&
+                                deletedExecRows.length > 0
+                              )
+                                return [];
+                              return deletedExecRows.map((x) => x.archiveId);
+                            });
+                          }}
+                        />
+                      </th>
+                      <th className="px-2 py-2 text-left font-medium">
+                        删除时间
+                      </th>
+                      <th className="px-2 py-2 text-left font-medium">
+                        执行时间
+                      </th>
+                      <th className="px-2 py-2 text-left font-medium">
+                        执行任务
+                      </th>
+                      <th className="w-24 px-2 py-2 text-left font-medium">
+                        状态
+                      </th>
+                      <th className="px-2 py-2 text-left font-medium">
+                        执行人
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-100">
+                    {deletedExecRows.map((r) => (
+                      <tr key={r.archiveId} className="hover:bg-zinc-50/70">
+                        <td className="px-2 py-2 align-top">
+                          <input
+                            type="checkbox"
+                            className="h-3.5 w-3.5 rounded border-zinc-300"
+                            checked={execRestorePick.includes(r.archiveId)}
+                            onChange={() =>
+                              setExecRestorePick((prev) =>
+                                prev.includes(r.archiveId)
+                                  ? prev.filter((x) => x !== r.archiveId)
+                                  : [...prev, r.archiveId],
+                              )
+                            }
+                            aria-label={`选择归档 ${r.archiveId.slice(0, 8)}`}
+                          />
+                        </td>
+                        <td className="px-2 py-2 align-top text-xs text-zinc-600 tabular-nums">
+                          {formatTs(r.deletedAt)}
+                        </td>
+                        <td className="px-2 py-2 align-top text-xs text-zinc-600 tabular-nums">
+                          {formatTs(r.executedAt)}
+                        </td>
+                        <td className="max-w-0 px-2 py-2 align-top text-xs text-zinc-800">
+                          <div className="truncate" title={r.executionTaskTitle ?? ""}>
+                            {r.executionTaskTitle?.trim()
+                              ? r.executionTaskTitle
+                              : r.executionTaskId}
+                          </div>
+                        </td>
+                        <td className="px-2 py-2 align-top text-xs">
+                          <span
+                            className={[
+                              "inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium",
+                              testCaseStatusBadgeClass[r.status],
+                            ].join(" ")}
+                          >
+                            {testCaseStatusLabel[r.status]}
+                          </span>
+                        </td>
+                        <td className="px-2 py-2 align-top text-xs text-zinc-700">
+                          {r.executor?.trim() ? r.executor : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-zinc-100 px-5 py-4">
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm"
+                disabled={execRestoreWorking}
+                onClick={() => setExecRestoreOpen(false)}
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                disabled={
+                  execRestoreWorking ||
+                  execRestorePick.length === 0 ||
+                  deletedExecRows.length === 0
+                }
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white disabled:opacity-50"
+                onClick={() => void runRestoreExecRecords()}
+              >
+                {execRestoreWorking
+                  ? "恢复中…"
+                  : execRestorePick.length > 0
+                    ? `恢复已选（${execRestorePick.length}）`
+                    : "恢复已选"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {batchEditOpen ? (
+        <div className="fixed inset-0 z-[92] flex items-center justify-center overflow-y-auto bg-black/45 p-4">
+          <div
+            className="mb-8 w-full max-w-lg rounded-2xl border border-zinc-200 bg-white shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="case-lib-batch-edit-title"
+          >
+            <div className="flex items-center justify-between border-b border-zinc-100 px-5 py-4">
+              <div>
+                <div
+                  id="case-lib-batch-edit-title"
+                  className="text-sm font-semibold text-zinc-900"
+                >
+                  批量修改用例
+                </div>
+                <div className="mt-0.5 text-xs text-zinc-500">
+                  将写入用例库中对应用例；仅当前勾选的条目会更新（状态可选「清空」）。
+                </div>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                onClick={() => setBatchEditOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <div>
+                <label className="text-xs font-medium text-zinc-600">状态</label>
+                <select
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                  value={batchStatusSel}
+                  onChange={(e) => setBatchStatusSel(e.target.value)}
+                >
+                  <option value="keep">（不修改）</option>
+                  <option value="clear">（清空）</option>
+                  {testCaseStatusOptions.map((o) => (
+                    <option
+                      key={o.value}
+                      value={o.value}
+                      style={testCaseStatusSelectOptionStyle[o.value]}
+                    >
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-zinc-600">用例等级</label>
+                <select
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                  value={batchPrioritySel}
+                  onChange={(e) => setBatchPrioritySel(e.target.value)}
+                >
+                  <option value="keep">（不修改）</option>
+                  <option value="unset">未设置</option>
+                  {[0, 1, 2, 3, 4].map((n) => (
+                    <option key={n} value={String(n)}>
+                      L{n}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2">
+                <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-zinc-700">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-zinc-300"
+                    checked={batchMaintainerApply}
+                    onChange={(e) => setBatchMaintainerApply(e.target.checked)}
+                  />
+                  更新维护人
+                </label>
+                <input
+                  className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm disabled:bg-zinc-100"
+                  disabled={!batchMaintainerApply}
+                  value={batchMaintainerText}
+                  onChange={(e) => setBatchMaintainerText(e.target.value)}
+                  placeholder={
+                    batchMaintainerApply ? "留空则清空维护人" : "先勾选「更新维护人」"
+                  }
+                />
+              </div>
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2">
+                <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-zinc-700">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-zinc-300"
+                    checked={batchSubmitterApply}
+                    onChange={(e) => setBatchSubmitterApply(e.target.checked)}
+                  />
+                  更新提交人
+                </label>
+                <input
+                  className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm disabled:bg-zinc-100"
+                  disabled={!batchSubmitterApply}
+                  value={batchSubmitterText}
+                  onChange={(e) => setBatchSubmitterText(e.target.value)}
+                  placeholder={
+                    batchSubmitterApply ? "留空则清空提交人" : "先勾选「更新提交人」"
+                  }
+                />
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-200 px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  disabled={batchEditWorking}
+                  onClick={() => setBatchEditOpen(false)}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+                  disabled={
+                    batchEditWorking || selectedCaseIds.length === 0
+                  }
+                  onClick={() => void runBatchEditMeta()}
+                >
+                  {batchEditWorking ? "保存中…" : "保存"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {moveModalOpen ? (
         <div

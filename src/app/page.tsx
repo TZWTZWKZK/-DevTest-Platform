@@ -55,6 +55,7 @@ export default async function HomePage() {
     id: p.id,
     name: p.name,
     code: p.code,
+    isBaseline: p.isBaseline,
     level: p.level,
     parentId: p.parentId,
     parentLabel: parentLabel(

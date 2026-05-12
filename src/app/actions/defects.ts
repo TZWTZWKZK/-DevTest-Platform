@@ -625,8 +625,23 @@ export async function removeDefectLinkedTestCases(
   if (!id) return { error: "无效缺陷" };
   if (uniq.length === 0) return { error: "请选择要移除的关联用例" };
   try {
-    const del = await prisma.defectTestCase.deleteMany({
-      where: { defectId: id, testCaseId: { in: uniq } },
+    const del = await prisma.$transaction(async (tx) => {
+      const links = await tx.defectTestCase.findMany({
+        where: { defectId: id, testCaseId: { in: uniq } },
+        select: { defectId: true, testCaseId: true, createdAt: true },
+      });
+      if (links.length > 0) {
+        await tx.defectTestCaseDeleted.createMany({
+          data: links.map((r) => ({
+            defectId: r.defectId,
+            testCaseId: r.testCaseId,
+            createdAt: r.createdAt,
+          })),
+        });
+      }
+      return tx.defectTestCase.deleteMany({
+        where: { defectId: id, testCaseId: { in: uniq } },
+      });
     });
     if (del.count > 0) {
       const total = await prisma.defectTestCase.count({
@@ -662,14 +677,29 @@ export async function replaceDefectLinkedTestCase(
   if (!fromId || !toId) return { error: "请选择要替换的用例" };
   if (fromId === toId) return { ok: true };
   try {
-    await prisma.$transaction([
-      prisma.defectTestCase.deleteMany({
+    await prisma.$transaction(async (tx) => {
+      const link = await tx.defectTestCase.findUnique({
+        where: {
+          defectId_testCaseId: { defectId: id, testCaseId: fromId },
+        },
+        select: { defectId: true, testCaseId: true, createdAt: true },
+      });
+      if (link) {
+        await tx.defectTestCaseDeleted.create({
+          data: {
+            defectId: link.defectId,
+            testCaseId: link.testCaseId,
+            createdAt: link.createdAt,
+          },
+        });
+      }
+      await tx.defectTestCase.deleteMany({
         where: { defectId: id, testCaseId: fromId },
-      }),
-      prisma.defectTestCase.create({
+      });
+      await tx.defectTestCase.create({
         data: { defectId: id, testCaseId: toId },
-      }),
-    ]);
+      });
+    });
     const [fromLines, toLines] = await Promise.all([
       fmtTestCasesForLog([fromId]),
       fmtTestCasesForLog([toId]),

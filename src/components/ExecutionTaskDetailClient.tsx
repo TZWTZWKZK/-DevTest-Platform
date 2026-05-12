@@ -1,6 +1,10 @@
 "use client";
 
 import type { TestCaseStatus } from "@prisma/client";
+import {
+  testCaseStatusOptions,
+  testCaseStatusSelectOptionStyle,
+} from "@/lib/test-labels";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -20,7 +24,9 @@ import {
   type ActionResult,
 } from "@/app/actions/executions";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
+import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
+  bulkUpdateTestCasesMeta,
   searchTestCaseIdOptions,
   type TestCaseFolderFlat,
   type TestCaseIdOption,
@@ -39,6 +45,7 @@ import {
   useExecutionImportedCaseColumns,
 } from "@/hooks/useExecutionImportedCaseColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 
 function formatTs(iso: string): string {
   try {
@@ -59,14 +66,38 @@ const testCaseStatusLabel: Record<TestCaseStatus, string> = {
   FAILED: "失败",
   BLOCKED: "阻塞",
   DEPRECATED: "废弃",
+  REQ_TRANSFER: "转需求",
 };
+
+/** 与「产品」分列时，迭代选项去掉「产品名 / 」前缀 */
+function iterationSelectShortLabel(o: { code: string; label: string }): string {
+  if (!o.code) return o.label;
+  const sep = " / ";
+  const i = o.label.indexOf(sep);
+  if (i >= 0) return o.label.slice(i + sep.length);
+  return o.label;
+}
 
 const testCaseStatusBadgeClass: Record<TestCaseStatus, string> = {
   PASSED: "border-emerald-300 bg-emerald-50 text-emerald-800",
   FAILED: "border-red-300 bg-red-50 text-red-800",
   BLOCKED: "border-amber-300 bg-amber-50 text-amber-900",
   DEPRECATED: "border-zinc-300 bg-zinc-100 text-zinc-600",
+  REQ_TRANSFER: "border-violet-300 bg-violet-50 text-violet-800",
 };
+
+/** 列表头状态筛选：与 advanced 面板共用 detailAdvFilter.status；`__UNSET__` 表示未填 */
+const IMPORTED_STATUS_FILTER_UNSET = "__UNSET__";
+
+const IMPORTED_STATUS_HEADER_CHEVRON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E";
+
+function importedStatusFilterSummary(statusRaw: string): string {
+  const s = statusRaw.trim();
+  if (!s) return "全部";
+  if (s === IMPORTED_STATUS_FILTER_UNSET) return "未填";
+  return testCaseStatusLabel[s as TestCaseStatus] ?? s;
+}
 
 export type ExecutionTaskDetail = {
   id: string;
@@ -125,14 +156,18 @@ export function ExecutionTaskDetailClient({
   );
 
   const [pickedIds, setPickedIds] = useState<string[]>([]);
+  const pickedIdsRef = useRef(pickedIds);
+  pickedIdsRef.current = pickedIds;
   const pickedSet = useMemo(() => new Set(pickedIds), [pickedIds]);
   const pickAllRef = useRef<HTMLInputElement | null>(null);
+  const pickAllFullVisibleRef = useRef<HTMLInputElement | null>(null);
 
   const DEFAULT_DETAIL_ADV = useMemo(
     () => ({
       caseNoContains: "",
       titleContains: "",
-      status: "" as TestCaseStatus | "",
+      /** `__UNSET__`：仅 status 为空的用例 */
+      status: "" as TestCaseStatus | typeof IMPORTED_STATUS_FILTER_UNSET | "",
       priorityText: "",
       maintainer: "",
       submitter: "",
@@ -150,7 +185,14 @@ export function ExecutionTaskDetailClient({
       if (cn && !c.caseNo.toLowerCase().includes(cn)) return false;
       const tn = detailAdvFilter.titleContains.trim().toLowerCase();
       if (tn && !c.title.toLowerCase().includes(tn)) return false;
-      if (detailAdvFilter.status && c.status !== detailAdvFilter.status) return false;
+      if (detailAdvFilter.status === IMPORTED_STATUS_FILTER_UNSET) {
+        if (c.status != null) return false;
+      } else if (
+        detailAdvFilter.status &&
+        c.status !== detailAdvFilter.status
+      ) {
+        return false;
+      }
       const p = detailAdvFilter.priorityText.trim();
       if (p) {
         const rawLow = p.toLowerCase();
@@ -194,11 +236,26 @@ export function ExecutionTaskDetailClient({
     );
   }, [advFilteredRows, q]);
 
+  const allLinkedFilteredIds = useMemo(
+    () => filteredLinkedRows.map((r) => r.id),
+    [filteredLinkedRows],
+  );
+
   const importedPager = usePagination(filteredLinkedRows, {
     defaultPageSize: 20,
     storageKey: "pm.pageSize.executionDetailLinked",
   });
   const pagedImportedRows = importedPager.pagedItems;
+  const pagedImportedRowIdsRef = useRef<string[]>([]);
+  pagedImportedRowIdsRef.current = pagedImportedRows.map((r) => r.id);
+  const {
+    onRowCheckboxPointerDown: onLinkedImportedCheckboxPointerDown,
+    tableBodyRef: linkedImportedTableBodyRef,
+  } = useRowCheckboxBrushByIds({
+    pagedRowIdsRef: pagedImportedRowIdsRef,
+    selectedIdsRef: pickedIdsRef,
+    setSelectedIds: setPickedIds,
+  });
 
   useEffect(() => {
     // 过滤变化时，尽量保持选择仅包含仍可见的行
@@ -209,36 +266,71 @@ export function ExecutionTaskDetailClient({
   useEffect(() => {
     const el = pickAllRef.current;
     if (!el) return;
+    if (pickedIds.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
     if (pagedImportedRows.length === 0) {
       el.indeterminate = false;
       el.checked = false;
       return;
     }
-    const all = pagedImportedRows.every((r) => pickedSet.has(r.id));
-    const some = pagedImportedRows.some((r) => pickedSet.has(r.id));
-    el.indeterminate = some && !all;
-    el.checked = all;
-  }, [pagedImportedRows, pickedSet]);
+    const pageIds = pagedImportedRows.map((r) => r.id);
+    const picked = new Set(pickedIds);
+    const allPageSelected =
+      pageIds.length > 0 && pageIds.every((id) => picked.has(id));
+    el.indeterminate = !allPageSelected;
+    el.checked = allPageSelected;
+  }, [pagedImportedRows, pickedIds]);
+
+  useEffect(() => {
+    const el = pickAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allLinkedFilteredIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAll =
+      pickedIds.length === ids.length &&
+      pickedIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => pickedIds.includes(id));
+    el.checked = exactAll;
+    el.indeterminate = someInList && !exactAll;
+  }, [allLinkedFilteredIds, pickedIds]);
 
   const togglePickAll = useCallback(() => {
     const ids = pagedImportedRows.map((r) => r.id);
-    const all = ids.length > 0 && ids.every((id) => pickedSet.has(id));
-    setPickedIds(all ? [] : ids);
-  }, [pagedImportedRows, pickedSet]);
-
-  const togglePickOne = useCallback((id: string) => {
+    if (ids.length === 0) return;
     setPickedIds((prev) => {
-      const s = new Set(prev);
-      if (s.has(id)) s.delete(id);
-      else s.add(id);
-      return Array.from(s);
+      const pageSet = new Set(ids);
+      const allOn = ids.every((id) => prev.includes(id));
+      return allOn
+        ? prev.filter((id) => !pageSet.has(id))
+        : [...new Set([...prev, ...ids])];
     });
-  }, []);
+  }, [pagedImportedRows]);
+
+  const togglePickAllLinkedFullVisible = useCallback(() => {
+    const ids = allLinkedFilteredIds;
+    if (ids.length === 0) return;
+    setPickedIds((prev) => {
+      const fullSet = new Set(ids);
+      const exact =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exact) return [];
+      return [...ids];
+    });
+  }, [allLinkedFilteredIds]);
 
   const removePicked = useCallback(async () => {
     const ids = pickedIds.filter((id) => filteredLinkedRows.some((r) => r.id === id));
     if (ids.length === 0) return;
-    if (!window.confirm(`确定移除已选 ${ids.length} 条导入用例？（不会影响历史执行记录）`)) return;
+    if (!window.confirm(`确定移除已选 ${ids.length} 条导入用例？将同时删除本任务下这些用例的执行记录。`)) return;
     const r = await removeExecutionTaskLinkedTestCases(initial.id, ids);
     setMsg(r);
     if (r.ok) {
@@ -253,29 +345,100 @@ export function ExecutionTaskDetailClient({
   );
 
   const [importOpen, setImportOpen] = useState(false);
+  const [batchEditOpen, setBatchEditOpen] = useState(false);
+  const [batchEditWorking, setBatchEditWorking] = useState(false);
+  const [batchStatusSel, setBatchStatusSel] = useState("keep");
+  const [batchPrioritySel, setBatchPrioritySel] = useState("keep");
+  const [batchMaintainerApply, setBatchMaintainerApply] = useState(false);
+  const [batchMaintainerText, setBatchMaintainerText] = useState("");
+  const [batchSubmitterApply, setBatchSubmitterApply] = useState(false);
+  const [batchSubmitterText, setBatchSubmitterText] = useState("");
+  const [products, setProducts] = useState<ProductOption[]>([]);
   const [iterOptions, setIterOptions] = useState<
-    Array<{ code: string; label: string }>
-  >([{ code: "", label: "baseline（全部迭代）" }]);
+    Array<{ code: string; label: string; productId?: string | null }>
+  >([{ code: "", label: "baseline（全部迭代）", productId: null }]);
+
+  /** 导入弹窗内所选产品（可与任务产品不一致，便于跨产品搜库） */
+  const [importProductId, setImportProductId] = useState("");
   const [importIterCode, setImportIterCode] = useState("");
   const [importQuery, setImportQuery] = useState("");
   const [importResults, setImportResults] = useState<TestCaseIdOption[]>([]);
   const [importLoading, setImportLoading] = useState(false);
   const [importPickIds, setImportPickIds] = useState<string[]>([]);
+  const importPickIdsRef = useRef(importPickIds);
+  importPickIdsRef.current = importPickIds;
   const importPickSet = useMemo(() => new Set(importPickIds), [importPickIds]);
   const importSelectAllRef = useRef<HTMLInputElement | null>(null);
   const [importTblChkW, setImportTblChkW] = useState(40);
   const [importTblNoW, setImportTblNoW] = useState(128);
   const [importTblNameW, setImportTblNameW] = useState(320);
 
+  const submitBatchEdit = useCallback(async () => {
+    const ids = pickedIds.filter((id) => filteredLinkedRows.some((r) => r.id === id));
+    if (ids.length === 0) return;
+    const updates: {
+      status?: TestCaseStatus | null;
+      priority?: number | null;
+      maintainer?: string | null;
+      submitter?: string | null;
+    } = {};
+    if (batchStatusSel === "clear") updates.status = null;
+    else if (batchStatusSel !== "keep") updates.status = batchStatusSel as TestCaseStatus;
+    if (batchPrioritySel === "unset") updates.priority = null;
+    else if (batchPrioritySel !== "keep") updates.priority = Number(batchPrioritySel);
+    if (batchMaintainerApply) updates.maintainer = batchMaintainerText.trim() || null;
+    if (batchSubmitterApply) updates.submitter = batchSubmitterText.trim() || null;
+    if (Object.keys(updates).length === 0) {
+      setMsg({ error: "请至少选择一项要修改的内容" });
+      return;
+    }
+    setBatchEditWorking(true);
+    setMsg(null);
+    try {
+      const r = await bulkUpdateTestCasesMeta({ ids, updates });
+      setMsg(r);
+      if (r.ok) {
+        setBatchEditOpen(false);
+        router.refresh();
+      }
+    } finally {
+      setBatchEditWorking(false);
+    }
+  }, [
+    pickedIds,
+    filteredLinkedRows,
+    batchStatusSel,
+    batchPrioritySel,
+    batchMaintainerApply,
+    batchMaintainerText,
+    batchSubmitterApply,
+    batchSubmitterText,
+    router,
+  ]);
+
   const importPendingRows = useMemo(
     () => importResults.filter((r) => !linkedIdSet.has(r.id)),
     [importResults, linkedIdSet],
   );
+  const importPendingRowIdsRef = useRef<string[]>([]);
+  importPendingRowIdsRef.current = importPendingRows.map((r) => r.id);
+  const {
+    onRowCheckboxPointerDown: onImportPickCheckboxPointerDown,
+    tableBodyRef: importPickTableBodyRef,
+  } = useRowCheckboxBrushByIds({
+    pagedRowIdsRef: importPendingRowIdsRef,
+    selectedIdsRef: importPickIdsRef,
+    setSelectedIds: setImportPickIds,
+  });
 
   useEffect(() => {
     void (async () => {
       try {
-        const opts = await listIterationCodeOptions();
+        const [ps, opts] = await Promise.all([
+          listProductOptions(),
+          listIterationCodeOptions(),
+        ]);
+        setProducts(ps);
         setIterOptions(opts);
       } catch {
         // ignore
@@ -283,16 +446,33 @@ export function ExecutionTaskDetailClient({
     })();
   }, []);
 
+  const importIterationSelectOptions = useMemo(() => {
+    const pid = importProductId.trim();
+    if (!pid) {
+      return iterOptions;
+    }
+    return iterOptions.filter(
+      (o) => o.code === "" || (o.productId ?? "") === pid,
+    );
+  }, [importProductId, iterOptions]);
+
+  useEffect(() => {
+    if (!importOpen) return;
+    setImportProductId((prev) => prev || initial.iteration.productId);
+  }, [importOpen, initial.iteration.productId]);
+
   useEffect(() => {
     if (!importOpen) return;
     const t = window.setTimeout(() => {
       void (async () => {
         setImportLoading(true);
         try {
+          const rawPid = importProductId.trim();
           const rows = await searchTestCaseIdOptions({
             q: importQuery,
             iterationCode: importIterCode || null,
             take: 200,
+            productId: rawPid !== "" ? rawPid : null,
           });
           setImportResults(rows);
         } finally {
@@ -301,7 +481,7 @@ export function ExecutionTaskDetailClient({
       })();
     }, 220);
     return () => clearTimeout(t);
-  }, [importIterCode, importOpen, importQuery]);
+  }, [importIterCode, importOpen, importProductId, importQuery]);
 
   useEffect(() => {
     setImportPickIds([]);
@@ -502,7 +682,7 @@ export function ExecutionTaskDetailClient({
 
   const removeOne = useCallback(
     async (testCaseId: string) => {
-      if (!window.confirm("确定移除该导入用例？")) return;
+      if (!window.confirm("确定移除该导入用例？将同时删除本任务下该用例的执行记录。")) return;
       const r = await removeExecutionTaskLinkedTestCases(initial.id, [testCaseId]);
       setMsg(r);
       if (r.ok) router.refresh();
@@ -769,9 +949,28 @@ export function ExecutionTaskDetailClient({
                   <button
                     type="button"
                     disabled={pickedIds.length === 0}
+                    className={MODULE_TOOLBAR_BTN_SECONDARY}
+                    title="批量修改选中用例在用例库中的状态、等级与维护信息"
+                    onClick={() => {
+                      setBatchStatusSel("keep");
+                      setBatchPrioritySel("keep");
+                      setBatchMaintainerApply(false);
+                      setBatchMaintainerText("");
+                      setBatchSubmitterApply(false);
+                      setBatchSubmitterText("");
+                      setBatchEditOpen(true);
+                    }}
+                  >
+                    {pickedIds.length > 0
+                      ? `批量修改（${pickedIds.length}）`
+                      : "批量修改"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pickedIds.length === 0}
                     className="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
                     onClick={() => void removePicked()}
-                    title="批量从本任务移除（不影响历史执行记录）"
+                    title="批量从本任务移除（会删除本任务下对应执行记录）"
                   >
                     {pickedIds.length > 0 ? `批量移除（${pickedIds.length}）` : "批量移除"}
                   </button>
@@ -827,14 +1026,22 @@ export function ExecutionTaskDetailClient({
                         onChange={(e) =>
                           setDetailAdvFilter((p) => ({
                             ...p,
-                            status: e.target.value as TestCaseStatus | "",
+                            status: e.target.value as
+                              | TestCaseStatus
+                              | typeof IMPORTED_STATUS_FILTER_UNSET
+                              | "",
                           }))
                         }
                       >
                         <option value="">全部</option>
+                        <option value={IMPORTED_STATUS_FILTER_UNSET}>未填</option>
                         {(Object.keys(testCaseStatusLabel) as TestCaseStatus[]).map(
                           (s) => (
-                            <option key={s} value={s}>
+                            <option
+                              key={s}
+                              value={s}
+                              style={testCaseStatusSelectOptionStyle[s]}
+                            >
                               {testCaseStatusLabel[s]}
                             </option>
                           ),
@@ -934,14 +1141,14 @@ export function ExecutionTaskDetailClient({
                 </div>
               ) : null}
               <div className="max-h-[min(85vh,960px)] overflow-auto">
-                {filteredLinkedRows.length === 0 ? (
+                {linkedRows.length === 0 ? (
                   <div className="px-3 py-3 text-sm text-zinc-500">
                     暂无已导入用例。
                   </div>
                 ) : (
                   <table className="w-max min-w-[720px] table-fixed text-sm">
                     <colgroup>
-                      <col style={{ width: 36 }} />
+                      <col style={{ width: 52 }} />
                       <col style={{ width: idxColW }} />
                       {importedVisibleOrdered.map((k) => (
                         <col key={k} style={{ width: importedWidthFor(k) }} />
@@ -949,14 +1156,25 @@ export function ExecutionTaskDetailClient({
                     </colgroup>
                     <thead className="sticky top-0 z-[1] border-b border-zinc-100 bg-zinc-50 text-xs text-zinc-500">
                       <tr>
-                        <th className="px-2 py-2 text-left">
-                          <input
-                            ref={pickAllRef}
-                            type="checkbox"
-                            className="h-3.5 w-3.5 rounded border-zinc-300"
-                            aria-label="全选当前列表"
-                            onChange={() => togglePickAll()}
-                          />
+                        <th className="min-w-[3.25rem] px-2 py-2 text-left">
+                          <div className="flex items-end gap-1">
+                            <input
+                              ref={pickAllRef}
+                              type="checkbox"
+                              className="h-3.5 w-3.5 shrink-0 rounded border-zinc-300"
+                              aria-label="全选当前页"
+                              title="全选当前页（可与其它页已选合并）"
+                              onChange={() => togglePickAll()}
+                            />
+                            <input
+                              ref={pickAllFullVisibleRef}
+                              type="checkbox"
+                              className="h-3.5 w-3.5 shrink-0 rounded border-zinc-300"
+                              aria-label="全选全部可见已导入用例"
+                              title="全选列表：选中当前筛选下全部已导入用例（与分页「/ 总数」一致）"
+                              onChange={() => togglePickAllLinkedFullVisible()}
+                            />
+                          </div>
                         </th>
                         <th className="relative px-2 py-2 text-left">
                           #
@@ -980,7 +1198,59 @@ export function ExecutionTaskDetailClient({
                                 !isLast ? "relative" : "",
                               ].join(" ")}
                             >
-                              {importedColLabels[k]}
+                              {k === "status" ? (
+                                <div className="group/st inline-flex min-w-0 max-w-full items-center gap-0.5 pr-1">
+                                  <span className="min-w-0 shrink truncate leading-tight">
+                                    {importedColLabels[k]}
+                                  </span>
+                                  <div className="relative h-4 w-4 shrink-0 rounded-sm focus-within:ring-2 focus-within:ring-zinc-400/50">
+                                    <select
+                                      className="absolute inset-0 z-10 cursor-pointer opacity-0 focus:outline-none"
+                                      value={detailAdvFilter.status}
+                                      title={`筛选状态（当前：${importedStatusFilterSummary(detailAdvFilter.status)}）`}
+                                      aria-label={`筛选状态，当前为${importedStatusFilterSummary(detailAdvFilter.status)}`}
+                                      onChange={(e) =>
+                                        setDetailAdvFilter((p) => ({
+                                          ...p,
+                                          status: e.target.value as
+                                            | TestCaseStatus
+                                            | typeof IMPORTED_STATUS_FILTER_UNSET
+                                            | "",
+                                        }))
+                                      }
+                                      onClick={(e) => e.stopPropagation()}
+                                      onMouseDown={(e) =>
+                                        e.stopPropagation()
+                                      }
+                                    >
+                                      <option value="">全部</option>
+                                      <option
+                                        value={IMPORTED_STATUS_FILTER_UNSET}
+                                      >
+                                        未填
+                                      </option>
+                                      {(
+                                        Object.keys(
+                                          testCaseStatusLabel,
+                                        ) as TestCaseStatus[]
+                                      ).map((s) => (
+                                        <option key={s} value={s}>
+                                          {testCaseStatusLabel[s]}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <span
+                                      aria-hidden
+                                      className="pointer-events-none block h-4 w-4 bg-[length:14px_14px] bg-[position:center] bg-no-repeat opacity-70 transition-opacity group-hover/st:opacity-100"
+                                      style={{
+                                        backgroundImage: `url("${IMPORTED_STATUS_HEADER_CHEVRON}")`,
+                                      }}
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                importedColLabels[k]
+                              )}
                               {!isLast && next ? (
                                 <TableColumnResizeHandle
                                   onResizeStart={startResizeImportedPair(k, next)}
@@ -991,31 +1261,64 @@ export function ExecutionTaskDetailClient({
                         })}
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-zinc-100">
-                      {pagedImportedRows.map((c, idx) => (
-                        <tr
-                          key={c.id}
-                          className="cursor-pointer hover:bg-zinc-50/70"
-                          onClick={() => setEditCaseId(c.id)}
-                        >
-                          <td className="px-2 py-2 align-top">
-                            <input
-                              type="checkbox"
-                              className="h-3.5 w-3.5 rounded border-zinc-300"
-                              checked={pickedSet.has(c.id)}
-                              aria-label={`选择用例 ${c.caseNo}`}
-                              onChange={() => togglePickOne(c.id)}
-                              onClick={(e) => e.stopPropagation()}
-                            />
+                    <tbody
+                      ref={linkedImportedTableBodyRef}
+                      className="divide-y divide-zinc-100"
+                    >
+                      {filteredLinkedRows.length === 0 ? (
+                        <tr>
+                          <td
+                            colSpan={2 + importedVisibleOrdered.length}
+                            className="px-3 py-10 text-center text-sm text-zinc-500"
+                          >
+                            当前筛选条件下暂无数据，请调整筛选或搜索。
                           </td>
-                          <td className="px-2 py-2 align-top text-xs text-zinc-400 tabular-nums">
-                            {(importedPager.page - 1) * importedPager.pageSize + idx + 1}
-                          </td>
-                          {importedVisibleOrdered.map((k) =>
-                            renderImportedCell(c, k),
-                          )}
                         </tr>
-                      ))}
+                      ) : (
+                        pagedImportedRows.map((c, idx) => (
+                          <tr
+                            key={c.id}
+                            data-pm-row-select={c.id}
+                            className="cursor-pointer hover:bg-zinc-50/70"
+                            onClick={() => setEditCaseId(c.id)}
+                          >
+                            <td className="px-2 py-2 align-top">
+                              <input
+                                type="checkbox"
+                                className="h-3.5 w-3.5 rounded border-zinc-300"
+                                checked={pickedSet.has(c.id)}
+                                aria-label={`选择用例 ${c.caseNo}`}
+                                onChange={() => {}}
+                                onClick={(e) => e.preventDefault()}
+                                onPointerDown={(e) =>
+                                  onLinkedImportedCheckboxPointerDown(e, c.id)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key !== " " && e.key !== "Enter") return;
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setPickedIds((prev) => {
+                                    const s = new Set(prev);
+                                    if (s.has(c.id)) s.delete(c.id);
+                                    else s.add(c.id);
+                                    return Array.from(s);
+                                  });
+                                }}
+                                title="按住并拖动经过多行可连续勾选"
+                              />
+                            </td>
+                            <td className="px-2 py-2 align-top text-xs text-zinc-400 tabular-nums">
+                              {(importedPager.page - 1) *
+                                importedPager.pageSize +
+                                idx +
+                                1}
+                            </td>
+                            {importedVisibleOrdered.map((k) =>
+                              renderImportedCell(c, k),
+                            )}
+                          </tr>
+                        ))
+                      )}
                     </tbody>
                   </table>
                 )}
@@ -1055,18 +1358,42 @@ export function ExecutionTaskDetailClient({
 
             <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
               <div className="flex flex-wrap items-end gap-2">
-                <div className="min-w-[220px] flex-1">
+                <div className="min-w-[200px] flex-1">
                   <label className="text-[11px] font-medium text-zinc-500">
-                    迭代筛选
+                    产品
+                  </label>
+                  <select
+                    className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
+                    value={importProductId}
+                    onChange={(e) => {
+                      setImportProductId(e.target.value);
+                      setImportIterCode("");
+                    }}
+                  >
+                    <option value="">
+                      全部产品（不按产品过滤）
+                    </option>
+                    {products.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.code ? `${p.name}（${p.code}）` : p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="min-w-[200px] flex-1">
+                  <label className="text-[11px] font-medium text-zinc-500">
+                    迭代
                   </label>
                   <select
                     className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
                     value={importIterCode}
                     onChange={(e) => setImportIterCode(e.target.value)}
                   >
-                    {iterOptions.map((o) => (
+                    {importIterationSelectOptions.map((o) => (
                       <option key={o.code || "__baseline__"} value={o.code}>
-                        {o.label}
+                        {importProductId.trim() && o.code
+                          ? iterationSelectShortLabel(o)
+                          : o.label}
                       </option>
                     ))}
                   </select>
@@ -1085,6 +1412,7 @@ export function ExecutionTaskDetailClient({
                   type="button"
                   className="rounded-lg border border-zinc-200 px-2.5 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
                   onClick={() => {
+                    setImportProductId(initial.iteration.productId);
                     setImportIterCode("");
                     setImportQuery("");
                     setImportPickIds([]);
@@ -1147,10 +1475,14 @@ export function ExecutionTaskDetailClient({
                           <th className="px-2 py-2 text-left font-medium">名称 / 目录</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-zinc-100">
+                      <tbody
+                        ref={importPickTableBodyRef}
+                        className="divide-y divide-zinc-100"
+                      >
                         {importPendingRows.map((c) => (
                           <tr
                             key={c.id}
+                            data-pm-row-select={c.id}
                             className="cursor-pointer hover:bg-zinc-50/70"
                             onClick={() => toggleImportPick(c.id)}
                           >
@@ -1163,8 +1495,23 @@ export function ExecutionTaskDetailClient({
                                 className="h-3.5 w-3.5 rounded border-zinc-300"
                                 checked={importPickSet.has(c.id)}
                                 aria-label={`选择用例 ${c.caseNo}`}
-                                onChange={() => toggleImportPick(c.id)}
-                                onClick={(e) => e.stopPropagation()}
+                                onChange={() => {}}
+                                onClick={(e) => e.preventDefault()}
+                                onPointerDown={(e) =>
+                                  onImportPickCheckboxPointerDown(e, c.id)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key !== " " && e.key !== "Enter") return;
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setImportPickIds((prev) => {
+                                    const s = new Set(prev);
+                                    if (s.has(c.id)) s.delete(c.id);
+                                    else s.add(c.id);
+                                    return Array.from(s);
+                                  });
+                                }}
+                                title="按住并拖动经过多行可连续勾选"
                               />
                             </td>
                             <td className="px-2 py-2 font-mono text-xs text-zinc-700">
@@ -1190,9 +1537,131 @@ export function ExecutionTaskDetailClient({
         </div>
       ) : null}
 
+      {batchEditOpen ? (
+        <div className="fixed inset-0 z-[55] flex items-center justify-center overflow-y-auto bg-black/45 p-4">
+          <div
+            className="mb-8 w-full max-w-lg rounded-2xl border border-zinc-200 bg-white shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="batch-edit-title"
+          >
+            <div className="flex items-center justify-between border-b border-zinc-100 px-5 py-4">
+              <div>
+                <div id="batch-edit-title" className="text-sm font-semibold text-zinc-900">
+                  批量修改用例
+                </div>
+                <div className="mt-0.5 text-xs text-zinc-500">
+                  将写入用例库中对应用例；仅下方勾选的项会更新（状态可选「清空」）。
+                </div>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                onClick={() => setBatchEditOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <div>
+                <label className="text-xs font-medium text-zinc-600">状态</label>
+                <select
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                  value={batchStatusSel}
+                  onChange={(e) => setBatchStatusSel(e.target.value)}
+                >
+                  <option value="keep">（不修改）</option>
+                  <option value="clear">（清空）</option>
+                  {testCaseStatusOptions.map((o) => (
+                    <option
+                      key={o.value}
+                      value={o.value}
+                      style={testCaseStatusSelectOptionStyle[o.value]}
+                    >
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-zinc-600">用例等级</label>
+                <select
+                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                  value={batchPrioritySel}
+                  onChange={(e) => setBatchPrioritySel(e.target.value)}
+                >
+                  <option value="keep">（不修改）</option>
+                  <option value="unset">未设置</option>
+                  {[0, 1, 2, 3, 4].map((n) => (
+                    <option key={n} value={String(n)}>
+                      L{n}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2">
+                <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-zinc-700">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-zinc-300"
+                    checked={batchMaintainerApply}
+                    onChange={(e) => setBatchMaintainerApply(e.target.checked)}
+                  />
+                  更新维护人
+                </label>
+                <input
+                  className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm disabled:bg-zinc-100"
+                  disabled={!batchMaintainerApply}
+                  value={batchMaintainerText}
+                  onChange={(e) => setBatchMaintainerText(e.target.value)}
+                  placeholder={batchMaintainerApply ? "留空则清空维护人" : "先勾选「更新维护人」"}
+                />
+              </div>
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2">
+                <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-zinc-700">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-zinc-300"
+                    checked={batchSubmitterApply}
+                    onChange={(e) => setBatchSubmitterApply(e.target.checked)}
+                  />
+                  更新提交人
+                </label>
+                <input
+                  className="mt-2 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm disabled:bg-zinc-100"
+                  disabled={!batchSubmitterApply}
+                  value={batchSubmitterText}
+                  onChange={(e) => setBatchSubmitterText(e.target.value)}
+                  placeholder={batchSubmitterApply ? "留空则清空提交人" : "先勾选「更新提交人」"}
+                />
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-200 px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  disabled={batchEditWorking}
+                  onClick={() => setBatchEditOpen(false)}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+                  disabled={batchEditWorking || pickedIds.length === 0}
+                  onClick={() => void submitBatchEdit()}
+                >
+                  {batchEditWorking ? "保存中…" : "保存"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <Suspense fallback={null}>
         <TestCaseLibraryClient
           embedMode
+          embedProductId={initial.iteration.productId}
           initialFolders={testCaseFolders}
           openCaseId={editCaseId}
           executionTaskId={initial.id}

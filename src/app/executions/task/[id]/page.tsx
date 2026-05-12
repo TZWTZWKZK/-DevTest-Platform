@@ -18,7 +18,7 @@ export default async function ExecutionTaskPage({
   }
   const [tasks, folders] = await Promise.all([
     listExecutionTasksFlat(task.iterationId),
-    listFoldersFlat(),
+    listFoldersFlat(task.iteration.productId),
   ]);
   return (
     <div className="p-8">

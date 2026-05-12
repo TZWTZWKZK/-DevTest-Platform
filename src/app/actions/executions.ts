@@ -18,7 +18,7 @@ export type ExecutionTaskFlat = {
   createdAt: string;
   updatedAt: string;
   linkedCaseCount: number;
-  /** 已导入用例中，最近一条执行记录状态为「通过」的条数 */
+  /** 通过率分子：导入用例中 TestCase.status 为通过、废弃、转需求的条数之和 */
   passedCaseCount: number;
   /** 执行情况：按用例“最近一次执行状态”聚合（NONE 表示 executionResult 为空） */
   latestStatusCounts: {
@@ -26,6 +26,7 @@ export type ExecutionTaskFlat = {
     FAILED: number;
     BLOCKED: number;
     DEPRECATED: number;
+    REQ_TRANSFER: number;
     NONE: number;
   };
 };
@@ -36,6 +37,8 @@ const UI_PREF_KEY_EXEC_TASK_FILTERS = "ui.execTask.filters.v1";
 const UI_PREF_KEY_EXEC_TASK_FILTER_PANEL = "ui.execTask.filterPanel.v1";
 const UI_PREF_KEY_GLOBAL_TEST_CASE_SIDEBAR = "ui.global.testCases.sidebar.v1";
 const UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION = "ui.global.testDesign.iteration.v1";
+/** 测试设计页需求目录：各迭代下需求节点的展开/收起（全局共享，写入 DB） */
+const UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND = "ui.testDesign.reqTree.expand.v1";
 const UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION = "ui.global.executions.iteration.v1";
 const UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT = "ui.global.iterations.product.v1";
 const UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION = "ui.global.requirements.iteration.v1";
@@ -160,6 +163,7 @@ export async function getExecutionTaskListFilterPreference(): Promise<{
     raw.status === "FAILED" ||
     raw.status === "BLOCKED" ||
     raw.status === "DEPRECATED" ||
+    raw.status === "REQ_TRANSFER" ||
     raw.status === "NONE"
       ? (raw.status as "" | TestCaseStatus | "NONE")
       : "";
@@ -288,6 +292,43 @@ export async function saveGlobalTestDesignIterationPreference(input: {
   return writeUiPreference(UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION, {
     iterationCode: input.iterationCode ?? "",
   });
+}
+
+export async function getTestDesignReqTreeExpandPreference(): Promise<{
+  byIteration: Record<string, Record<string, boolean>>;
+  error?: string;
+}> {
+  const r = await readUiPreference<{ byIteration?: unknown }>(
+    UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND,
+    { byIteration: {} },
+  );
+  const byIteration: Record<string, Record<string, boolean>> = {};
+  const raw = r.value?.byIteration;
+  if (raw && typeof raw === "object") {
+    for (const [ik, iv] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof ik !== "string" || typeof iv !== "object" || !iv) continue;
+      const inner: Record<string, boolean> = {};
+      for (const [k, v] of Object.entries(iv as Record<string, unknown>)) {
+        if (typeof k === "string" && typeof v === "boolean") inner[k] = v;
+      }
+      byIteration[ik] = inner;
+    }
+  }
+  return { byIteration, ...(r.error ? { error: r.error } : {}) };
+}
+
+export async function saveTestDesignReqTreeExpandPreference(input: {
+  iterationCode: string;
+  expandedByReqId: Record<string, boolean>;
+}): Promise<ActionResult> {
+  const ic = input.iterationCode.trim();
+  const cur = await readUiPreference<{ byIteration?: Record<string, Record<string, boolean>> }>(
+    UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND,
+    { byIteration: {} },
+  );
+  const byIteration = { ...(cur.value?.byIteration ?? {}) };
+  byIteration[ic] = input.expandedByReqId ?? {};
+  return writeUiPreference(UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND, { byIteration });
 }
 
 export async function getGlobalExecutionIterationPreference(): Promise<{
@@ -440,6 +481,7 @@ export async function listExecutionTasksFlat(
     FAILED: 0,
     BLOCKED: 0,
     DEPRECATED: 0,
+    REQ_TRANSFER: 0,
     NONE: 0,
   });
   const countsByTask = new Map<string, ReturnType<typeof emptyCounts>>();
@@ -447,7 +489,7 @@ export async function listExecutionTasksFlat(
 
   // 口径对齐：执行任务详情页「已导入用例」表格的“状态”列来源于 TestCase.status。
   // 因此列表汇总也以 TestCase.status 为准：
-  // - 通过率 = PASSED / 总数
+  // - 通过率分子 = PASSED + DEPRECATED + REQ_TRANSFER（废弃/转需求视同达标）
   // - 执行率(执行情况) = status 不为空 / 总数（NONE=为空）
   const links = await prisma.executionTaskTestCase.findMany({
     where: { executionTaskId: { in: taskIds } },
@@ -462,27 +504,31 @@ export async function listExecutionTasksFlat(
     } else if (st === "PASSED") counts.PASSED += 1;
     else if (st === "FAILED") counts.FAILED += 1;
     else if (st === "DEPRECATED") counts.DEPRECATED += 1;
+    else if (st === "REQ_TRANSFER") counts.REQ_TRANSFER += 1;
     else counts.BLOCKED += 1;
   }
 
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    description: r.description,
-    iterationId: r.iterationId,
-    parentId: r.parentId,
-    sortOrder: r.sortOrder,
-    createdBy: r.createdBy ?? null,
-    updatedBy: r.updatedBy ?? null,
-    createdAt: r.createdAt.toISOString(),
-    updatedAt: r.updatedAt.toISOString(),
-    linkedCaseCount: r._count.linkedCases,
-    passedCaseCount: countsByTask.get(r.id)?.PASSED ?? 0,
-    latestStatusCounts: countsByTask.get(r.id) ?? emptyCounts(),
-  }));
+  return rows.map((r) => {
+    const c = countsByTask.get(r.id) ?? emptyCounts();
+    return {
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      iterationId: r.iterationId,
+      parentId: r.parentId,
+      sortOrder: r.sortOrder,
+      createdBy: r.createdBy ?? null,
+      updatedBy: r.updatedBy ?? null,
+      createdAt: r.createdAt.toISOString(),
+      updatedAt: r.updatedAt.toISOString(),
+      linkedCaseCount: r._count.linkedCases,
+      passedCaseCount: c.PASSED + c.DEPRECATED + c.REQ_TRANSFER,
+      latestStatusCounts: c,
+    };
+  });
 }
 
-/** 批量删除：无子任务、无已导入用例、无执行记录脚本的叶子方可删；否则整批拒绝 */
+/** 批量删除：无子任务、无已导入用例的叶子方可删；删除任务时执行记录表会随任务级联删除 */
 export async function bulkDeleteExecutionTasks(input: {
   ids: string[];
 }): Promise<ActionResult> {
@@ -533,17 +579,15 @@ export async function bulkDeleteExecutionTasks(input: {
     };
   }
 
-  const blockedData = picked.filter(
-    (r) => r._count.linkedCases > 0 || r._count.execCaseRecords > 0,
-  );
+  const blockedData = picked.filter((r) => r._count.linkedCases > 0);
   if (blockedData.length > 0) {
     const names = blockedData.map((r) => `「${r.title}」`).slice(0, 8);
     const suffix =
       blockedData.length > 8
-        ? ` …（共 ${blockedData.length} 项含导入用例或执行记录）`
+        ? ` …（共 ${blockedData.length} 项仍含已导入用例）`
         : "";
     return {
-      error: `以下任务仍有关联数据（已导入用例或执行记录），请先移除用例/记录后再删除任务：${names.join("、")}${suffix}`,
+      error: `以下任务仍有已导入用例，请先在任务详情中移除后再删除：${names.join("、")}${suffix}`,
     };
   }
 
@@ -891,6 +935,35 @@ export async function addExecutionTaskLinkedTestCases(
   const ids = Array.from(new Set(testCaseIds.map((x) => x.trim()).filter(Boolean)));
   if (ids.length === 0) return { error: "请选择要导入的用例。" };
 
+  const task = await prisma.executionTask.findUnique({
+    where: { id: taskId },
+    select: { iteration: { select: { productId: true } } },
+  });
+  const expectedPid = task?.iteration.productId;
+  if (!expectedPid) return { error: "任务或迭代数据不完整。" };
+
+  const caseRows = await prisma.testCase.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, folder: { select: { productId: true } } },
+  });
+  if (caseRows.length !== ids.length) {
+    return { error: "部分用例不存在或已被删除。" };
+  }
+  const baseline = await prisma.product.findFirst({
+    where: { isBaseline: true },
+    select: { id: true },
+  });
+
+  for (const c of caseRows) {
+    const fp = c.folder.productId;
+    if (fp === expectedPid) continue;
+    if (baseline && fp === baseline.id) continue;
+    return {
+      error:
+        "只能导入当前迭代所属产品用例库中的用例，或共享 Baseline 用例库中的用例。",
+    };
+  }
+
   // SQLite 下 createMany 的 skipDuplicates 不可用，需手动去重
   const existed = await prisma.executionTaskTestCase.findMany({
     where: { executionTaskId: taskId, testCaseId: { in: ids } },
@@ -917,8 +990,35 @@ export async function removeExecutionTaskLinkedTestCases(
   const ids = Array.from(new Set(testCaseIds.map((x) => x.trim()).filter(Boolean)));
   if (ids.length === 0) return { error: "未选择要移除的用例。" };
 
-  await prisma.executionTaskTestCase.deleteMany({
-    where: { executionTaskId: taskId, testCaseId: { in: ids } },
+  // 先归档再删执行记录；再删导入链接
+  await prisma.$transaction(async (tx) => {
+    const execRows = await tx.executionTaskTestCaseExecRecord.findMany({
+      where: { executionTaskId: taskId, testCaseId: { in: ids } },
+    });
+    if (execRows.length > 0) {
+      await tx.executionTaskTestCaseExecRecordDeleted.createMany({
+        data: execRows.map((r) => ({
+          originalId: r.id,
+          executionTaskId: r.executionTaskId,
+          testCaseId: r.testCaseId,
+          executedAt: r.executedAt,
+          status: r.status,
+          executor: r.executor,
+          result: r.result,
+          images:
+            r.images === null || r.images === undefined
+              ? Prisma.JsonNull
+              : (r.images as Prisma.InputJsonValue),
+          note: r.note,
+        })),
+      });
+    }
+    await tx.executionTaskTestCaseExecRecord.deleteMany({
+      where: { executionTaskId: taskId, testCaseId: { in: ids } },
+    });
+    await tx.executionTaskTestCase.deleteMany({
+      where: { executionTaskId: taskId, testCaseId: { in: ids } },
+    });
   });
   revalidatePath(`/executions/task/${taskId}`);
   revalidatePath("/executions");
@@ -1152,6 +1252,147 @@ export async function listTestCaseExecRecords(input: {
     };
   } catch (e) {
     return { error: e instanceof Error ? e.message : "读取执行记录失败" };
+  }
+}
+
+/** 删除单条执行任务内执行记录：先写入误删归档表 */
+export async function deleteExecutionTaskCaseExecRecord(
+  recordId: string,
+): Promise<ActionResult> {
+  const id = recordId.trim();
+  if (!id) return { error: "无效记录" };
+  try {
+    let taskId: string | null = null;
+    await prisma.$transaction(async (tx) => {
+      const r = await tx.executionTaskTestCaseExecRecord.findUnique({
+        where: { id },
+      });
+      if (!r) return;
+      taskId = r.executionTaskId;
+      await tx.executionTaskTestCaseExecRecordDeleted.create({
+        data: {
+          originalId: r.id,
+          executionTaskId: r.executionTaskId,
+          testCaseId: r.testCaseId,
+          executedAt: r.executedAt,
+          status: r.status,
+          executor: r.executor,
+          result: r.result,
+          images:
+            r.images === null || r.images === undefined
+              ? Prisma.JsonNull
+              : (r.images as Prisma.InputJsonValue),
+          note: r.note,
+        },
+      });
+      await tx.executionTaskTestCaseExecRecord.delete({ where: { id } });
+    });
+    revalidatePath("/test-cases");
+    revalidatePath("/executions");
+    if (taskId) revalidatePath(`/executions/task/${taskId}`);
+    return { ok: true };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "删除失败" };
+  }
+}
+
+export type DeletedTestCaseExecRecordRow = {
+  /** 误删归档表主键，用于恢复勾选 */
+  archiveId: string;
+  originalId: string;
+  executionTaskId: string;
+  executionTaskTitle: string | null;
+  executedAt: string;
+  status: TestCaseStatus;
+  executor: string | null;
+  deletedAt: string;
+};
+
+/** 某用例在误删归档中的执行记录（从本弹窗删除单条时写入） */
+export async function listDeletedTestCaseExecRecords(input: {
+  testCaseId: string;
+}): Promise<{ rows?: DeletedTestCaseExecRecordRow[]; error?: string }> {
+  const caseId = input.testCaseId.trim();
+  if (!caseId) return { rows: [] };
+  try {
+    const rows = await prisma.executionTaskTestCaseExecRecordDeleted.findMany({
+      where: { testCaseId: caseId },
+      orderBy: { deletedAt: "desc" },
+      take: 200,
+    });
+    if (rows.length === 0) return { rows: [] };
+    const taskIds = [...new Set(rows.map((r) => r.executionTaskId))];
+    const tasks = await prisma.executionTask.findMany({
+      where: { id: { in: taskIds } },
+      select: { id: true, title: true },
+    });
+    const titleById = new Map(tasks.map((t) => [t.id, t.title ?? ""]));
+    return {
+      rows: rows.map((r) => ({
+        archiveId: r.id,
+        originalId: r.originalId,
+        executionTaskId: r.executionTaskId,
+        executionTaskTitle: titleById.get(r.executionTaskId) ?? null,
+        executedAt: r.executedAt.toISOString(),
+        status: r.status,
+        executor: r.executor,
+        deletedAt: r.deletedAt.toISOString(),
+      })),
+    };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "读取误删执行记录失败" };
+  }
+}
+
+export async function restoreTestCaseExecRecordsFromArchive(
+  archiveIds: string[],
+): Promise<ActionResult & { restored?: number }> {
+  const ids = Array.from(
+    new Set(archiveIds.map((x) => x.trim()).filter(Boolean)),
+  );
+  if (ids.length === 0) return { error: "请选择要恢复的记录" };
+  const taskIdsToRevalidate = new Set<string>();
+  let restored = 0;
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const aid of ids) {
+        const arc = await tx.executionTaskTestCaseExecRecordDeleted.findUnique({
+          where: { id: aid },
+        });
+        if (!arc) continue;
+        await tx.executionTaskTestCaseExecRecord.create({
+          data: {
+            executionTaskId: arc.executionTaskId,
+            testCaseId: arc.testCaseId,
+            executedAt: arc.executedAt,
+            status: arc.status,
+            executor: arc.executor,
+            result: arc.result,
+            images:
+              arc.images === null || arc.images === undefined
+                ? Prisma.JsonNull
+                : (arc.images as Prisma.InputJsonValue),
+            note: arc.note,
+          },
+        });
+        await tx.executionTaskTestCaseExecRecordDeleted.delete({
+          where: { id: aid },
+        });
+        taskIdsToRevalidate.add(arc.executionTaskId);
+        restored += 1;
+      }
+    });
+    revalidatePath("/test-cases");
+    revalidatePath("/executions");
+    for (const tid of taskIdsToRevalidate) {
+      revalidatePath(`/executions/task/${tid}`);
+    }
+    if (restored === 0) {
+      return { error: "未找到可恢复的记录（可能已被恢复或 id 无效）" };
+    }
+    return { ok: true, restored };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "恢复失败" };
   }
 }
 

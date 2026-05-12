@@ -1,10 +1,8 @@
 import { Suspense } from "react";
-import { listFoldersFlat } from "@/app/actions/test-cases";
 import { ModulePageHeader } from "@/components/PageModuleLayout";
 import { TestCaseLibraryClient } from "@/components/TestCaseLibraryClient";
 
 export default async function TestCasesPage() {
-  const folders = await listFoldersFlat();
   return (
     <div className="p-8">
       <ModulePageHeader
@@ -14,7 +12,7 @@ export default async function TestCasesPage() {
       <Suspense
         fallback={<p className="text-sm text-zinc-500">加载用例库…</p>}
       >
-        <TestCaseLibraryClient initialFolders={folders} />
+        <TestCaseLibraryClient initialFolders={[]} />
       </Suspense>
     </div>
   );

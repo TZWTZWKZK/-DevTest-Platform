@@ -38,6 +38,7 @@ import {
   useRequirementTreeColumns,
 } from "@/hooks/useRequirementTreeColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 import {
   formatTaskProgressAsPercentIfNumeric,
   parseTaskProgressPercent,
@@ -598,6 +599,7 @@ export function RequirementTreeClient({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [batchWorking, setBatchWorking] = useState(false);
   const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const selectAllFullVisibleRef = useRef<HTMLInputElement | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
   const [moveModalOpen, setMoveModalOpen] = useState(false);
   const [moveTargetId, setMoveTargetId] = useState<string>("__root__");
@@ -811,6 +813,21 @@ export function RequirementTreeClient({
   });
   const pagedRows = reqPager.pagedItems;
   const pagedVisibleIds = useMemo(() => pagedRows.map((x) => x.n.id), [pagedRows]);
+  /** 与分页「显示 1–20 / 67」中分母一致：当前筛选+展开下全部可见行 */
+  const allVisibleRowIds = useMemo(
+    () => visibleRows.map(({ n }) => n.id),
+    [visibleRows],
+  );
+  const pagedReqPickRowIdsRef = useRef<string[]>([]);
+  pagedReqPickRowIdsRef.current = pagedVisibleIds;
+  const selectedIdsRef = useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
+  const { onRowCheckboxPointerDown, tableBodyRef: reqTreeTableBodyRef } =
+    useRowCheckboxBrushByIds({
+      pagedRowIdsRef: pagedReqPickRowIdsRef,
+      selectedIdsRef,
+      setSelectedIds: setSelectedIds,
+    });
 
   const focusScrollDoneRef = useRef<string | null>(null);
   useEffect(() => {
@@ -963,19 +980,32 @@ export function RequirementTreeClient({
     }
     const allIds = pagedVisibleIds;
     const selectedSet = new Set(selectedIds);
-    const allSelected = allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
+    const allSelected =
+      allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
     el.indeterminate = !allSelected;
     el.checked = allSelected;
   }, [pagedVisibleIds, selectedIds]);
 
+  useEffect(() => {
+    const el = selectAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allVisibleRowIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAllVisible =
+      selectedIds.length === ids.length &&
+      selectedIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => selectedIds.includes(id));
+    el.checked = exactAllVisible;
+    el.indeterminate = someInList && !exactAllVisible;
+  }, [allVisibleRowIds, selectedIds]);
+
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((p) => ({ ...p, [id]: !(p[id] ?? true) }));
-  }, []);
-
-  const toggleSelectOne = useCallback((id: string) => {
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
   }, []);
 
   const toggleSelectAll = useCallback(() => {
@@ -989,6 +1019,20 @@ export function RequirementTreeClient({
         : Array.from(new Set([...prev, ...allIds]));
     });
   }, [pagedVisibleIds]);
+
+  /** 全部可见行（与分页栏「/ 总数」一致）；已全选则清空 */
+  const toggleSelectAllFullVisible = useCallback(() => {
+    const ids = allVisibleRowIds;
+    if (ids.length === 0) return;
+    setSelectedIds((prev) => {
+      const fullSet = new Set(ids);
+      const exactAllVisible =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exactAllVisible) return [];
+      return [...ids];
+    });
+  }, [allVisibleRowIds]);
 
   const runDuplicateAsChild = useCallback(
     async (id: string) => {
@@ -1167,23 +1211,33 @@ export function RequirementTreeClient({
       <tr
         key={n.id}
         data-requirement-row-id={n.id}
+        data-pm-row-select={n.id}
         className={[
           "group cursor-pointer border-b border-zinc-100",
           rowSurface || "hover:bg-zinc-50/70",
         ].join(" ")}
         onClick={() => router.push(`/requirements/node/${n.id}`)}
       >
-        <td className="w-12 py-2.5 pl-3 pr-2 align-top">
+        <td className="w-16 min-w-[4rem] py-2.5 pl-3 pr-2 align-top">
           <input
             type="checkbox"
             className="mt-1 h-4 w-4 rounded border-zinc-300"
             checked={selectedIds.includes(n.id)}
-            onChange={(e) => {
+            onChange={() => {}}
+            onClick={(e) => e.preventDefault()}
+            onPointerDown={(e) => onRowCheckboxPointerDown(e, n.id)}
+            onKeyDown={(e) => {
+              if (e.key !== " " && e.key !== "Enter") return;
+              e.preventDefault();
               e.stopPropagation();
-              toggleSelectOne(n.id);
+              setSelectedIds((prev) =>
+                prev.includes(n.id)
+                  ? prev.filter((x) => x !== n.id)
+                  : [...prev, n.id],
+              );
             }}
+            title="按住并拖动经过多行可连续勾选"
             aria-label={`选择需求：${n.title}`}
-            onClick={(e) => e.stopPropagation()}
           />
         </td>
         {visibleOrdered.map((k) => {
@@ -1837,14 +1891,25 @@ export function RequirementTreeClient({
                       <table className="min-w-[960px] table-fixed">
                         <thead className="sticky top-0 z-20 border-b border-zinc-200 bg-zinc-50 text-xs text-zinc-500 shadow-[0_1px_0_0_rgb(228_228_231)]">
                           <tr>
-                            <th className="w-12 py-2.5 pl-3 pr-2 text-left align-bottom font-medium">
-                              <input
-                                ref={selectAllRef}
-                                type="checkbox"
-                                className="h-4 w-4 rounded border-zinc-300"
-                                onChange={toggleSelectAll}
-                                aria-label="全选"
-                              />
+                            <th className="w-16 min-w-[4rem] py-2.5 pl-3 pr-2 text-left align-bottom font-medium">
+                              <div className="flex items-end gap-1">
+                                <input
+                                  ref={selectAllRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={toggleSelectAll}
+                                  title="全选当前页（可与其它页已选合并）"
+                                  aria-label="全选当前页"
+                                />
+                                <input
+                                  ref={selectAllFullVisibleRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={toggleSelectAllFullVisible}
+                                  title="全选列表：选中当前筛选下全部可见需求（与分页「/ 总数」一致），不含折叠子树"
+                                  aria-label="全选全部可见需求"
+                                />
+                              </div>
                             </th>
                           {visibleOrdered.map((k) => {
                             const w = colConfig.widths[k];
@@ -2490,7 +2555,7 @@ export function RequirementTreeClient({
                           })}
                         </tr>
                         </thead>
-                        <tbody>
+                        <tbody ref={reqTreeTableBodyRef}>
                           {pagedRows.map(({ n, depth }) => renderRow(n, depth))}
                         </tbody>
                       </table>

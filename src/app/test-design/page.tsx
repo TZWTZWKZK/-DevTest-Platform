@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
+import { listProductOptions } from "@/app/actions/products";
 import { ModulePageHeader } from "@/components/PageModuleLayout";
 import { TestDesignTreeClient } from "@/components/TestDesignTreeClient";
 
@@ -14,14 +15,21 @@ export default async function TestDesignPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const iterations = await listIterationCodeOptions();
+  const [iterations, products] = await Promise.all([
+    listIterationCodeOptions(),
+    listProductOptions(),
+  ]);
   const sp = await searchParams;
   const icRaw = firstQuery(sp.iterationCode).trim();
   const rqRaw = firstQuery(sp.requirementId).trim();
+  const pidRaw = firstQuery(sp.productId).trim();
   const validCodes = new Set(iterations.map((it) => it.code));
+  const validProductIds = new Set(products.map((p) => p.id));
   const initialIterationCode =
     icRaw && validCodes.has(icRaw) ? icRaw : "";
   const initialRequirementId = rqRaw;
+  const initialProductId =
+    pidRaw && validProductIds.has(pidRaw) ? pidRaw : "";
 
   return (
     <div className="p-8">
@@ -34,6 +42,7 @@ export default async function TestDesignPage({
       >
         <TestDesignTreeClient
           iterations={iterations}
+          initialProductId={initialProductId}
           initialIterationCode={initialIterationCode}
           initialRequirementId={initialRequirementId}
         />

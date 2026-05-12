@@ -55,6 +55,7 @@ export type PickerCase = {
 
 export function TestDesignNodeDetailClient({
   nodeId,
+  pickerProductId,
   backToTreeContext,
   breadcrumb,
   initialTitle,
@@ -70,8 +71,14 @@ export function TestDesignNodeDetailClient({
   initialOpLogs,
 }: {
   nodeId: string;
-  /** 返回树页时恢复对应迭代与需求节点 */
-  backToTreeContext?: { iterationCode: string; requirementId: string };
+  /** 关联用例搜索范围：与需求所属迭代的产品用例库一致 */
+  pickerProductId: string;
+  /** 返回树页时恢复产品、迭代与需求节点（与 ModuleWorkspaceCard 下拉一致） */
+  backToTreeContext?: {
+    productId: string;
+    iterationCode: string;
+    requirementId: string;
+  };
   breadcrumb: string;
   initialTitle: string;
   initialDescription: string | null;
@@ -89,6 +96,7 @@ export function TestDesignNodeDetailClient({
   const backToTreeHref = useMemo(() => {
     if (!backToTreeContext) return "/test-design";
     const q = new URLSearchParams({
+      productId: backToTreeContext.productId,
       iterationCode: backToTreeContext.iterationCode,
       requirementId: backToTreeContext.requirementId,
     });
@@ -163,6 +171,7 @@ export function TestDesignNodeDetailClient({
             q: caseLinkQuery,
             iterationCode: caseLinkIterCode || null,
             take: 200,
+            productId: pickerProductId,
           });
           setCaseLinkResults(rows);
         } finally {
@@ -171,7 +180,7 @@ export function TestDesignNodeDetailClient({
       })();
     }, 220);
     return () => clearTimeout(t);
-  }, [caseLinkIterCode, caseLinkQuery, detailTab]);
+  }, [caseLinkIterCode, caseLinkQuery, detailTab, pickerProductId]);
 
   const linkedCaseRows = useMemo(
     () => pickerCases.filter((c) => linked.has(c.id)),
