@@ -41,10 +41,13 @@ import {
 import {
   getGlobalIterationProductPreference,
   getGlobalTestDesignIterationPreference,
+  getGlobalTestDesignLayoutPreference,
   getTestDesignReqTreeExpandPreference,
   saveGlobalIterationProductPreference,
   saveGlobalTestDesignIterationPreference,
+  saveGlobalTestDesignLayoutPreference,
   saveTestDesignReqTreeExpandPreference,
+  type TestDesignLayoutPreference,
 } from "@/app/actions/executions";
 import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
@@ -65,6 +68,7 @@ import { compareWbsId } from "@/lib/wbs-id";
 import { buildTree, type TreeNode } from "@/lib/tree";
 
 const PENDING_TEST_DESIGN_IMPORT_STORAGE = "pm-pending-test-design-import";
+const TEST_DESIGN_TREE_CONTEXT_STORAGE = "pm-test-design-tree-context";
 
 /** 关联用例列表头筛选（当前选项展示于 title） */
 const LINKED_CASES_HEADER_FILTER_LABEL: Record<
@@ -122,6 +126,29 @@ function expandRequirementAncestors(
   return patch;
 }
 
+function parseDesignTypeParam(raw: string): TestDesignType | null {
+  const t = raw.trim();
+  if (!t) return null;
+  return testDesignTypeOptions.some((o) => o.value === t)
+    ? (t as TestDesignType)
+    : null;
+}
+
+/** 展开侧栏目录树中通往 dirId 的各级父节点 */
+function expandCustomDirAncestors(
+  dirId: string,
+  dirs: CustomDir[],
+): Record<string, boolean> {
+  const byId = new Map(dirs.map((d) => [d.id, d]));
+  const patch: Record<string, boolean> = { [dirId]: true };
+  let cur = byId.get(dirId);
+  while (cur?.parentId) {
+    patch[cur.parentId] = true;
+    cur = byId.get(cur.parentId);
+  }
+  return patch;
+}
+
 /** 仅保留当前需求列表中仍存在的节点 id（切换迭代或刷新树时用） */
 function filterReqExpandToKnownIds(
   exp: Record<string, boolean>,
@@ -153,6 +180,140 @@ type CategoryItem = {
 };
 
 const CATEGORY_STORAGE_KEY = "pm-test-design-categories-v1";
+const LAYOUT_STORAGE_KEY = "pm-test-design-layout-v1";
+const TOP_PANE_DEFAULT_H = 138;
+/** 需求目录独占全屏（隐藏下方设计区） */
+const TOP_PANE_MAXIMIZED = -1;
+const TOP_PANE_RESIZE_H = 8;
+const TOP_PANE_SNAP_THRESHOLD = 4;
+/** 右侧设计表格区域至少保留高度 */
+const MIN_DESIGN_LIST_AREA_H = 200;
+const TOP_PANE_VIEWPORT_CHROME = 140;
+
+function maxTopPaneHeightFromLayout(layoutHeight: number): number {
+  return Math.max(96, layoutHeight - TOP_PANE_RESIZE_H);
+}
+
+function maxTopPaneHeight(): number {
+  if (typeof window === "undefined") return 480;
+  return Math.max(
+    96,
+    Math.floor(window.innerHeight - TOP_PANE_VIEWPORT_CHROME - TOP_PANE_RESIZE_H),
+  );
+}
+
+function maxListToolbarHeight(parentClientHeight: number): number {
+  return Math.max(0, parentClientHeight - MIN_DESIGN_LIST_AREA_H);
+}
+
+function clampLayoutPersist(
+  data: LayoutPersist,
+  rightPanelClientHeight?: number,
+  workspaceLayoutHeight?: number,
+): LayoutPersist {
+  const maxTop =
+    typeof workspaceLayoutHeight === "number" && workspaceLayoutHeight > 0
+      ? maxTopPaneHeightFromLayout(workspaceLayoutHeight)
+      : maxTopPaneHeight();
+  const topPaneH =
+    data.topPaneH === TOP_PANE_MAXIMIZED
+      ? TOP_PANE_MAXIMIZED
+      : Math.min(maxTop, Math.max(0, data.topPaneH));
+  const topPaneLastNonZero =
+    data.topPaneLastNonZero > 0
+      ? Math.min(maxTop, data.topPaneLastNonZero)
+      : topPaneH > 0
+        ? topPaneH
+        : TOP_PANE_DEFAULT_H;
+
+  let listToolbarPaneH = data.listToolbarPaneH;
+  if (
+    listToolbarPaneH !== null &&
+    typeof rightPanelClientHeight === "number" &&
+    rightPanelClientHeight > 0
+  ) {
+    listToolbarPaneH = Math.min(
+      maxListToolbarHeight(rightPanelClientHeight),
+      listToolbarPaneH,
+    );
+  }
+
+  return {
+    topPaneH,
+    topPaneLastNonZero,
+    listToolbarPaneH,
+    listToolbarPaneLastNonZero: data.listToolbarPaneLastNonZero,
+  };
+}
+
+type LayoutPersist = TestDesignLayoutPreference;
+
+const LAYOUT_DEFAULTS: LayoutPersist = {
+  topPaneH: TOP_PANE_DEFAULT_H,
+  topPaneLastNonZero: TOP_PANE_DEFAULT_H,
+  listToolbarPaneH: null,
+  listToolbarPaneLastNonZero: 0,
+};
+
+function parseLayoutPersist(
+  raw: Partial<LayoutPersist> | null | undefined,
+): LayoutPersist | null {
+  if (!raw || typeof raw !== "object") return null;
+  const hasAny =
+    typeof raw.topPaneH === "number" ||
+    typeof raw.topPaneLastNonZero === "number" ||
+    typeof raw.listToolbarPaneH === "number" ||
+    typeof raw.listToolbarPaneLastNonZero === "number";
+  if (!hasAny) return null;
+
+  const topPaneH =
+    typeof raw.topPaneH === "number" &&
+    (raw.topPaneH === TOP_PANE_MAXIMIZED || raw.topPaneH >= 0)
+      ? raw.topPaneH
+      : LAYOUT_DEFAULTS.topPaneH;
+  const topPaneLastNonZero =
+    typeof raw.topPaneLastNonZero === "number" && raw.topPaneLastNonZero > 0
+      ? raw.topPaneLastNonZero
+      : topPaneH > 24
+        ? topPaneH
+        : LAYOUT_DEFAULTS.topPaneLastNonZero;
+  const listToolbarPaneH =
+    typeof raw.listToolbarPaneH === "number" && raw.listToolbarPaneH >= 0
+      ? raw.listToolbarPaneH
+      : null;
+  const listToolbarPaneLastNonZero =
+    typeof raw.listToolbarPaneLastNonZero === "number" &&
+    raw.listToolbarPaneLastNonZero > 0
+      ? raw.listToolbarPaneLastNonZero
+      : LAYOUT_DEFAULTS.listToolbarPaneLastNonZero;
+
+  return {
+    topPaneH,
+    topPaneLastNonZero,
+    listToolbarPaneH,
+    listToolbarPaneLastNonZero,
+  };
+}
+
+function loadLayoutPersist(): LayoutPersist {
+  if (typeof window === "undefined") return LAYOUT_DEFAULTS;
+  try {
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (!raw) return LAYOUT_DEFAULTS;
+    return parseLayoutPersist(JSON.parse(raw) as Partial<LayoutPersist>) ?? LAYOUT_DEFAULTS;
+  } catch {
+    return LAYOUT_DEFAULTS;
+  }
+}
+
+function saveLayoutPersist(data: LayoutPersist) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // ignore
+  }
+}
 type CustomDir = {
   id: string;
   label: string;
@@ -414,6 +575,9 @@ export function TestDesignTreeClient({
   initialProductId = "",
   initialIterationCode = "",
   initialRequirementId = "",
+  initialCategory = "",
+  initialDirId = "",
+  onImmersiveLayoutChange,
 }: {
   iterations: { code: string; label: string; productId?: string | null }[];
   /** 由服务端 page 解析 query，与详情「返回测试设计树」上的产品一致 */
@@ -421,6 +585,12 @@ export function TestDesignTreeClient({
   /** 由服务端 page 解析 query，避免首屏 iterationCode 为空时误请求空列表 */
   initialIterationCode?: string;
   initialRequirementId?: string;
+  /** 详情链回时恢复侧栏类别（如 PERFORMANCE） */
+  initialCategory?: TestDesignType | "";
+  /** 详情链回时恢复侧栏自定义目录 */
+  initialDirId?: string;
+  /** 需求目录收至顶时隐藏页眉，设计区铺满 */
+  onImmersiveLayoutChange?: (immersive: boolean) => void;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -433,9 +603,13 @@ export function TestDesignTreeClient({
   const urlPendingRequirementIdRef = useRef<string | null>(
     initialRequirementId.trim() || null,
   );
+  const urlPendingDirIdRef = useRef<string | null>(
+    initialDirId.trim() || null,
+  );
   const deeplinkScrollReqIdRef = useRef<string | null>(null);
   /** 需求目录滚动容器：链回 / URL 带 requirementId 时将选中项滚入可视区域 */
   const reqTreeScrollRef = useRef<HTMLDivElement | null>(null);
+  const workspaceLayoutRef = useRef<HTMLDivElement | null>(null);
   const lastSyncedLocationSearchRef = useRef<string | undefined>(undefined);
   const [iterationCode, setIterationCode] = useState<string>(() => {
     const ic = initialIterationCode.trim();
@@ -512,7 +686,8 @@ export function TestDesignTreeClient({
       setIterationCode("");
     }
   }, [visibleIterations, iterationCode]);
-  const [topPaneH, setTopPaneH] = useState(138);
+  const persistedLayoutRef = useRef<LayoutPersist>(LAYOUT_DEFAULTS);
+  const [topPaneH, setTopPaneH] = useState(LAYOUT_DEFAULTS.topPaneH);
   const [reqFlat, setReqFlat] = useState<RequirementTreeFlat[]>([]);
   const [selectedReqId, setSelectedReqId] = useState<string>("");
   const [flat, setFlat] = useState<TestDesignFlat[]>([]);
@@ -520,7 +695,10 @@ export function TestDesignTreeClient({
   const [rootErr, setRootErr] = useState<string | null>(null);
   const [rootTitle, setRootTitle] = useState("");
   const [rootBusy, setRootBusy] = useState(false);
-  const [category, setCategory] = useState<TestDesignType>("FUNCTIONAL");
+  const [category, setCategory] = useState<TestDesignType>(() => {
+    const fromUrl = parseDesignTypeParam(initialCategory);
+    return fromUrl ?? "FUNCTIONAL";
+  });
   const [categoryEditOpen, setCategoryEditOpen] = useState(false);
   const [categories, setCategories] = useState<CategoryItem[]>(() =>
     defaultCategoriesForHydration(),
@@ -593,8 +771,80 @@ export function TestDesignTreeClient({
     linkedCases: "all" as "all" | "linked" | "unlinked",
   });
 
-  const TOP_PANE_DEFAULT_H = 138;
-  const topPaneLastNonZeroRef = useRef<number>(TOP_PANE_DEFAULT_H);
+  const topPaneLastNonZeroRef = useRef<number>(LAYOUT_DEFAULTS.topPaneLastNonZero);
+  const listToolbarPaneRef = useRef<HTMLDivElement | null>(null);
+  const rightPanelRef = useRef<HTMLElement | null>(null);
+  const listToolbarPaneFullHRef = useRef(0);
+  const listToolbarPaneLastNonZeroRef = useRef<number>(
+    LAYOUT_DEFAULTS.listToolbarPaneLastNonZero,
+  );
+  /** 右侧列表上方工具区可视高度；null 表示随内容自然撑开 */
+  const [listToolbarPaneH, setListToolbarPaneH] = useState<number | null>(
+    LAYOUT_DEFAULTS.listToolbarPaneH,
+  );
+  const skipLayoutPersistRef = useRef(true);
+  const layoutPrefHydratedRef = useRef(false);
+  const [layoutHydrated, setLayoutHydrated] = useState(false);
+
+  const applyLayoutPersist = useCallback((data: LayoutPersist) => {
+    skipLayoutPersistRef.current = true;
+    const clamped = clampLayoutPersist(
+      data,
+      rightPanelRef.current?.clientHeight,
+      workspaceLayoutRef.current?.clientHeight,
+    );
+    topPaneLastNonZeroRef.current = clamped.topPaneLastNonZero;
+    listToolbarPaneLastNonZeroRef.current = clamped.listToolbarPaneLastNonZero;
+    setTopPaneH(clamped.topPaneH);
+    setListToolbarPaneH(clamped.listToolbarPaneH);
+    saveLayoutPersist(clamped);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const local = loadLayoutPersist();
+      const pref = await getGlobalTestDesignLayoutPreference();
+      if (cancelled) return;
+      const layout = pref.layout ?? local;
+      persistedLayoutRef.current = layout;
+      applyLayoutPersist(layout);
+      if (
+        !pref.layout &&
+        typeof window !== "undefined" &&
+        localStorage.getItem(LAYOUT_STORAGE_KEY) !== null
+      ) {
+        void saveGlobalTestDesignLayoutPreference(layout);
+      }
+      layoutPrefHydratedRef.current = true;
+      setLayoutHydrated(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyLayoutPersist]);
+
+  useEffect(() => {
+    const clampToViewport = () => {
+      const layoutH = workspaceLayoutRef.current?.clientHeight ?? 0;
+      const maxTop =
+        layoutH > 0 ? maxTopPaneHeightFromLayout(layoutH) : maxTopPaneHeight();
+      setTopPaneH((cur) => {
+        if (cur <= 0) return cur;
+        return Math.min(cur, maxTop);
+      });
+      const parentH = rightPanelRef.current?.clientHeight;
+      if (!parentH) return;
+      setListToolbarPaneH((cur) => {
+        if (cur === null) return null;
+        const max = maxListToolbarHeight(parentH);
+        return Math.min(cur, max);
+      });
+    };
+    clampToViewport();
+    window.addEventListener("resize", clampToViewport);
+    return () => window.removeEventListener("resize", clampToViewport);
+  }, [selectedReqId, advOpen]);
 
   const [catPaneW, setCatPaneW] = useState(140);
   const {
@@ -693,6 +943,20 @@ export function TestDesignTreeClient({
       });
     })();
   }, [iterationCode]);
+
+  useEffect(() => {
+    const pending = urlPendingDirIdRef.current;
+    if (!pending) return;
+    const dir = customDirs.find((d) => d.id === pending);
+    if (!dir) return;
+    setCategory(dir.parentType);
+    setSelectedCustomDirId(pending);
+    setDirExpandedById((prev) => ({
+      ...prev,
+      ...expandCustomDirAncestors(pending, customDirs),
+    }));
+    urlPendingDirIdRef.current = null;
+  }, [customDirs]);
 
   const visibleCategories = useMemo(
     () => categories.filter((c) => !c.hidden),
@@ -892,14 +1156,28 @@ export function TestDesignTreeClient({
     const el = e.currentTarget as HTMLElement;
     el.setPointerCapture?.(e.pointerId);
     const sy = e.clientY;
-    const h0 = topPaneH;
+    const layoutH = workspaceLayoutRef.current?.clientHeight ?? 0;
+    const fullMax =
+      layoutH > 0 ? maxTopPaneHeightFromLayout(layoutH) : maxTopPaneHeight();
+    const h0 =
+      topPaneH === TOP_PANE_MAXIMIZED
+        ? fullMax
+        : topPaneH <= 0
+          ? 0
+          : topPaneH;
     const move = (ev: PointerEvent) => {
       const dy = ev.clientY - sy;
-      // 允许把下方区域“压到底”：最大高度跟随窗口高度
-      // 约减掉页面外层 padding + 卡片边框等，避免拖拽到完全超出可视
-      const maxH = Math.max(0, Math.floor(window.innerHeight - 140));
-      const next = Math.min(maxH, Math.max(0, h0 + dy));
-      if (next > 24) topPaneLastNonZeroRef.current = next;
+      const next = Math.min(fullMax, Math.max(0, h0 + dy));
+      if (next <= 0) {
+        setTopPaneH(0);
+        return;
+      }
+      if (next >= fullMax - TOP_PANE_SNAP_THRESHOLD) {
+        if (next < fullMax) topPaneLastNonZeroRef.current = next;
+        setTopPaneH(TOP_PANE_MAXIMIZED);
+        return;
+      }
+      topPaneLastNonZeroRef.current = next;
       setTopPaneH(next);
     };
     const up = () => {
@@ -917,10 +1195,14 @@ export function TestDesignTreeClient({
     window.addEventListener("pointercancel", up);
   }, [topPaneH]);
 
-  const topPaneCollapsed = topPaneH <= 24;
+  const topPaneCollapsed = topPaneH === 0;
+  const topPaneMaximized = topPaneH === TOP_PANE_MAXIMIZED;
   const restoreTopPane = useCallback(() => {
     setTopPaneH((cur) => {
-      if (cur > 24) {
+      if (cur === TOP_PANE_MAXIMIZED) {
+        return Math.max(96, topPaneLastNonZeroRef.current || TOP_PANE_DEFAULT_H);
+      }
+      if (cur > 0) {
         topPaneLastNonZeroRef.current = cur;
         return 0;
       }
@@ -929,8 +1211,140 @@ export function TestDesignTreeClient({
   }, []);
 
   useEffect(() => {
+    if (!layoutHydrated) return;
+    onImmersiveLayoutChange?.(topPaneCollapsed || topPaneMaximized);
+  }, [layoutHydrated, topPaneCollapsed, topPaneMaximized, onImmersiveLayoutChange]);
+
+  useLayoutEffect(() => {
+    const el = listToolbarPaneRef.current;
+    if (!el) return;
+    if (listToolbarPaneH !== null && listToolbarPaneH <= 0) return;
+    const natural = el.scrollHeight;
+    if (natural <= 0) return;
+    const prevFull = listToolbarPaneFullHRef.current;
+    listToolbarPaneFullHRef.current = natural;
+    if (listToolbarPaneLastNonZeroRef.current <= 0) {
+      listToolbarPaneLastNonZeroRef.current = natural;
+    }
+    setListToolbarPaneH((cur) => {
+      if (cur === null) return null;
+      if (cur <= 0) return cur;
+      if (prevFull > 0 && cur >= prevFull - 1) return natural;
+      return Math.min(cur, natural);
+    });
+  }, [advOpen, rootErr, selectedReqId, category, designSearch, listToolbarPaneH]);
+
+  useEffect(() => {
+    if (!layoutPrefHydratedRef.current) return;
+    if (skipLayoutPersistRef.current) {
+      skipLayoutPersistRef.current = false;
+      return;
+    }
+    const data: LayoutPersist = clampLayoutPersist(
+      {
+        topPaneH,
+        topPaneLastNonZero: topPaneLastNonZeroRef.current,
+        listToolbarPaneH,
+        listToolbarPaneLastNonZero: listToolbarPaneLastNonZeroRef.current,
+      },
+      rightPanelRef.current?.clientHeight,
+      workspaceLayoutRef.current?.clientHeight,
+    );
+    const t = window.setTimeout(() => {
+      saveLayoutPersist(data);
+      void saveGlobalTestDesignLayoutPreference(data);
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [topPaneH, listToolbarPaneH]);
+
+  const startResizeListToolbarPane = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture?.(e.pointerId);
+      const sy = e.clientY;
+      const fullH = listToolbarPaneFullHRef.current;
+      const h0 = listToolbarPaneH ?? fullH;
+      const move = (ev: PointerEvent) => {
+        const dy = ev.clientY - sy;
+        const parentH = rightPanelRef.current?.clientHeight ?? 0;
+        const maxToolbarH =
+          parentH > 0
+            ? Math.min(fullH, maxListToolbarHeight(parentH))
+            : fullH;
+        const next = Math.min(maxToolbarH, Math.max(0, h0 + dy));
+        if (next > 0) listToolbarPaneLastNonZeroRef.current = next;
+        setListToolbarPaneH(next);
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        try {
+          el.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // ignore
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [listToolbarPaneH],
+  );
+
+  const listToolbarPaneCollapsed =
+    listToolbarPaneH !== null && listToolbarPaneH <= 0;
+  const restoreListToolbarPane = useCallback(() => {
+    setListToolbarPaneH((cur) => {
+      const full = listToolbarPaneFullHRef.current;
+      const parentH = rightPanelRef.current?.clientHeight ?? 0;
+      const maxToolbarH =
+        parentH > 0
+          ? Math.min(full, maxListToolbarHeight(parentH))
+          : full;
+      const h = cur ?? maxToolbarH;
+      if (h > 0) {
+        listToolbarPaneLastNonZeroRef.current = h;
+        return 0;
+      }
+      return Math.max(
+        48,
+        Math.min(
+          listToolbarPaneLastNonZeroRef.current || maxToolbarH || 120,
+          maxToolbarH || full || 120,
+        ),
+      );
+    });
+  }, []);
+
+  useEffect(() => {
     reload();
   }, [reload]);
+
+  useEffect(() => {
+    if (!selectedReqId) return;
+    try {
+      sessionStorage.setItem(
+        TEST_DESIGN_TREE_CONTEXT_STORAGE,
+        JSON.stringify({
+          productId: productId.trim(),
+          iterationCode: iterationCode.trim(),
+          requirementId: selectedReqId,
+          type: category,
+          dirId: selectedCustomDirId,
+        }),
+      );
+    } catch {
+      // ignore
+    }
+  }, [
+    productId,
+    iterationCode,
+    selectedReqId,
+    category,
+    selectedCustomDirId,
+  ]);
 
   /** 从地址栏同步产品/迭代/需求（详情链回）；首帧用 location 避免 useSearchParams 滞后。qs 未变则不再覆盖，避免下拉改迭代后被 URL 打回 */
   useLayoutEffect(() => {
@@ -954,7 +1368,44 @@ export function TestDesignTreeClient({
       return;
     }
 
-    if (!ic && !rq) {
+    const typeRaw = sp.get("type")?.trim() ?? searchParams.get("type")?.trim() ?? "";
+    let parsedType = parseDesignTypeParam(typeRaw);
+    if (parsedType) {
+      setCategory(parsedType);
+    } else {
+      try {
+        const raw = sessionStorage.getItem(TEST_DESIGN_TREE_CONTEXT_STORAGE);
+        if (raw) {
+          const j = JSON.parse(raw) as {
+            type?: string;
+            dirId?: string | null;
+            requirementId?: string;
+          };
+          const matchReq = !rq || j.requirementId === rq;
+          if (matchReq) {
+            const storedType = parseDesignTypeParam(j.type ?? "");
+            if (storedType) {
+              parsedType = storedType;
+              setCategory(storedType);
+            }
+            const storedDir = (j.dirId ?? "").trim();
+            if (storedDir) urlPendingDirIdRef.current = storedDir;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const dirRaw = sp.get("dirId")?.trim() ?? searchParams.get("dirId")?.trim() ?? "";
+    if (dirRaw) {
+      urlPendingDirIdRef.current = dirRaw;
+    } else if (parsedType && !urlPendingDirIdRef.current) {
+      urlPendingDirIdRef.current = null;
+      setSelectedCustomDirId(null);
+    }
+
+    if (!ic && !rq && !parsedType && !dirRaw) {
       lastSyncedLocationSearchRef.current = qs;
       return;
     }
@@ -1665,27 +2116,39 @@ export function TestDesignTreeClient({
 
   return (
     <>
-    <ModuleWorkspaceCard>
-      <div className="flex min-h-[70vh] flex-col">
+    <ModuleWorkspaceCard
+      className={[
+        "flex h-full min-h-0 flex-col",
+        topPaneCollapsed || topPaneMaximized ? "rounded-lg" : "",
+      ].join(" ")}
+    >
+      <div
+        ref={workspaceLayoutRef}
+        className="flex h-full min-h-0 flex-col overflow-hidden"
+      >
         <div
           className={[
-            "relative shrink-0 overflow-hidden border-b border-zinc-200 bg-zinc-50/60 px-3 sm:px-4",
-            topPaneCollapsed ? "py-0" : "py-2",
+            "relative overflow-hidden bg-zinc-50/60 px-3 sm:px-4",
+            topPaneCollapsed
+              ? "h-0 shrink-0 overflow-visible border-0 p-0"
+              : topPaneMaximized
+                ? "flex min-h-0 flex-1 flex-col overflow-hidden py-2"
+                : "shrink-0 overflow-hidden border-b border-zinc-200 py-2",
           ].join(" ")}
-          style={{ height: topPaneH, minHeight: 0 }}
+          style={
+            topPaneCollapsed || topPaneMaximized
+              ? undefined
+              : { height: topPaneH, minHeight: 0 }
+          }
         >
-          {topPaneCollapsed ? (
-            <button
-              type="button"
-              onClick={restoreTopPane}
-              className="absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-700 shadow-sm hover:bg-zinc-50"
-              title="展开顶部区域"
-              aria-label="展开顶部区域"
+          {!topPaneCollapsed ? (
+            <div
+              className={
+                topPaneMaximized
+                  ? "flex min-h-0 flex-1 flex-col overflow-hidden"
+                  : undefined
+              }
             >
-              ↑
-            </button>
-          ) : (
-            <>
               <div className="flex flex-wrap items-baseline justify-between gap-2 gap-y-1">
                 <h2 className="text-xs font-semibold text-zinc-900">需求目录</h2>
                 <p className="hidden max-w-2xl text-[11px] leading-snug text-zinc-500 sm:block">
@@ -1743,8 +2206,15 @@ export function TestDesignTreeClient({
               </div>
               <div
                 ref={reqTreeScrollRef}
-                className="mt-2 min-h-0 overflow-y-auto rounded-md border border-zinc-200/90 bg-white/90 px-2 py-1.5 text-xs leading-tight"
-                style={{ height: Math.max(0, topPaneH - 88) }}
+                className={[
+                  "mt-2 min-h-0 overflow-y-auto rounded-md border border-zinc-200/90 bg-white/90 px-2 py-1.5 text-xs leading-tight",
+                  topPaneMaximized ? "flex-1" : "",
+                ].join(" ")}
+                style={
+                  topPaneMaximized
+                    ? undefined
+                    : { height: Math.max(0, topPaneH - 88) }
+                }
               >
                 {reqTree.length === 0 ? (
                   <p className="text-xs text-zinc-500">
@@ -1769,22 +2239,42 @@ export function TestDesignTreeClient({
                   </ul>
                 )}
               </div>
-            </>
-          )}
+            </div>
+          ) : null}
           <div
-            className="absolute bottom-0 left-0 right-0 z-20 h-2 cursor-row-resize hover:bg-zinc-300/30"
+            className={[
+              "absolute left-0 right-0 z-30 h-2 cursor-row-resize hover:bg-zinc-300/30",
+              topPaneCollapsed ? "top-0" : "bottom-0",
+            ].join(" ")}
             role="separator"
-            aria-label="拖动调整顶部区域高度"
-            title="拖动调整高度"
+            aria-label="拖动调整顶部需求目录高度"
+            title={
+              topPaneCollapsed
+                ? "向下拖展开需求目录"
+                : topPaneMaximized
+                  ? "向上拖展开类别与设计列表"
+                  : "拖动调整高度（向上可收至顶部以扩大设计区，向下可拉满仅展示需求目录）"
+            }
             onPointerDown={startResizeTopPane}
             onDoubleClick={() => restoreTopPane()}
           />
         </div>
 
-        <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
-          <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        {!topPaneMaximized ? (
+        <section className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white">
+          {topPaneCollapsed ? (
+            <button
+              type="button"
+              onClick={restoreTopPane}
+              className="absolute left-0 top-0 z-40 hidden h-full w-2 shrink-0 cursor-col-resize border-0 bg-zinc-200/90 p-0 hover:bg-sky-400/35 lg:block"
+              title="点击展开需求目录与类别侧栏"
+              aria-label="点击展开需求目录与类别侧栏"
+            />
+          ) : null}
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
+            {!topPaneCollapsed ? (
             <section
-              className="relative flex min-h-[180px] flex-col bg-zinc-50/60 lg:min-h-0 lg:border-r lg:border-zinc-200"
+              className="relative flex min-h-0 flex-col bg-zinc-50/60 lg:min-h-0 lg:min-h-[180px] lg:border-r lg:border-zinc-200"
               style={{ width: catPaneW }}
             >
               <div className="shrink-0 border-b border-zinc-200/80 px-3 py-2">
@@ -2199,8 +2689,15 @@ export function TestDesignTreeClient({
                 }}
               />
             </section>
+            ) : null}
 
-            <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white p-4">
+            <section
+              ref={rightPanelRef}
+              className={[
+                "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white p-4",
+                topPaneCollapsed ? "w-full min-w-0" : "",
+              ].join(" ")}
+            >
               {!selectedReqId ? (
                 <div className="min-h-0 flex-1">
                   <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-zinc-50/40 p-6">
@@ -2209,6 +2706,15 @@ export function TestDesignTreeClient({
                 </div>
               ) : (
                 <>
+                  <div
+                    ref={listToolbarPaneRef}
+                    className="shrink-0 overflow-hidden"
+                    style={
+                      listToolbarPaneH !== null
+                        ? { height: listToolbarPaneH, minHeight: 0 }
+                        : undefined
+                    }
+                  >
                   <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
                     <div className="min-w-[min(100%,18rem)] flex-1">
                       <label className="text-xs font-medium text-zinc-600">
@@ -2373,7 +2879,7 @@ export function TestDesignTreeClient({
                   </div>
 
                   {advOpen ? (
-                    <div className="mb-3 rounded-lg border border-zinc-200 bg-zinc-50/60">
+                    <div className="rounded-lg border border-zinc-200 bg-zinc-50/60">
                       <div className="px-3 pb-3 pt-3">
                         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                           <div>
@@ -2509,7 +3015,28 @@ export function TestDesignTreeClient({
                       </div>
                     </div>
                   ) : null}
+                  </div>
 
+                  <div className="relative flex min-h-0 flex-1 flex-col pt-1">
+                    {listToolbarPaneCollapsed ? (
+                      <button
+                        type="button"
+                        onClick={restoreListToolbarPane}
+                        className="absolute left-1/2 top-0 z-30 -translate-x-1/2 -translate-y-1/2 rounded-full border border-zinc-200 bg-white px-3 py-0.5 text-xs font-semibold text-zinc-700 shadow-sm hover:bg-zinc-50"
+                        title="展开查询与工具栏"
+                        aria-label="展开查询与工具栏"
+                      >
+                        ↓
+                      </button>
+                    ) : null}
+                    <div
+                      className="absolute left-0 right-0 top-0 z-20 h-2 -translate-y-1/2 cursor-row-resize hover:bg-zinc-300/30"
+                      role="separator"
+                      aria-label="拖动调整查询与工具栏区域高度"
+                      title="向上拖：收起查询/工具栏以扩大列表；向下拖：展开工具栏（列表至少保留约 200px）"
+                      onPointerDown={startResizeListToolbarPane}
+                      onDoubleClick={() => restoreListToolbarPane()}
+                    />
                   {loading ? (
                     <div className="min-h-0 flex-1">
                       <div className="flex h-full items-center justify-center">
@@ -2603,10 +3130,13 @@ export function TestDesignTreeClient({
                       ) : null}
 
                       <div className="flex min-h-0 flex-1 flex-col">
-                        <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-zinc-200 bg-white">
+                        <div className="min-h-0 flex-1 overflow-auto overscroll-contain rounded-lg border border-zinc-200 bg-white">
                           <table
                             className="table-fixed text-left text-sm"
-                            style={{ minWidth: designTableMinW }}
+                            style={{
+                              width: designTableMinW,
+                              minWidth: designTableMinW,
+                            }}
                           >
                           <thead className="border-b border-zinc-200 bg-zinc-50/80 text-xs text-zinc-500">
                             <tr>
@@ -2709,13 +3239,19 @@ export function TestDesignTreeClient({
                                 className="group cursor-pointer border-b border-zinc-100 hover:bg-zinc-50/70"
                                 onClick={() => router.push(`/test-design/node/${r.id}`)}
                               >
-                                <td className="w-16 min-w-[4rem] py-2.5 pr-2 align-top">
+                                <td
+                                  className="w-16 min-w-[4rem] py-2.5 pr-2 align-top"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
                                   <input
                                     type="checkbox"
                                     className="mt-1 h-4 w-4 rounded border-zinc-300"
                                     checked={selectedDesignIds.includes(r.id)}
                                     onChange={() => {}}
-                                    onClick={(e) => e.preventDefault()}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                    }}
                                     onPointerDown={(e) =>
                                       onRowCheckboxPointerDown(e, r.id)
                                     }
@@ -2855,11 +3391,13 @@ export function TestDesignTreeClient({
                       </div>
                     </>
                   )}
+                  </div>
                 </>
               )}
             </section>
           </div>
         </section>
+        ) : null}
       </div>
     </ModuleWorkspaceCard>
     {bulkEditOpen ? (

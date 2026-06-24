@@ -41,8 +41,9 @@ type Node = TreeNode<RequirementFlat>;
 const STATUS_ORDER: Record<RequirementFlat["status"], number> = {
   UNASSIGNED: 0,
   IN_DEVELOPMENT: 1,
-  PENDING_VERIFICATION: 2,
-  CLOSED: 3,
+  IN_RD: 2,
+  PENDING_VERIFICATION: 3,
+  CLOSED: 4,
 };
 
 function normPriority(p: number | null | undefined): number {

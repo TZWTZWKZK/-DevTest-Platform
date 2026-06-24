@@ -2,5 +2,5 @@
   "watch": ["src", "prisma/schema.prisma"],
   "ext": "ts,tsx,js,jsx,css,mjs,cjs,json",
   "delay": "2000",
-  "exec": "kill-port 3000 && next dev --turbopack -p 3000"
+  "exec": "kill-port 3000 && node -r ./skywalking.cjs ./node_modules/next/dist/bin/next dev --turbopack -p 3000"
 }

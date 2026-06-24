@@ -37,15 +37,8 @@ const DEFAULT_WIDTH: Record<TestDesignColumnKey, number> = {
   updatedAt: 180,
 };
 
-const WIDTH_BOUNDS: Record<TestDesignColumnKey, { min: number; max: number }> = {
-  title: { min: 120, max: 800 },
-  linkedCases: { min: 112, max: 220 },
-  type: { min: 96, max: 280 },
-  createdBy: { min: 72, max: 360 },
-  updatedBy: { min: 72, max: 360 },
-  createdAt: { min: 100, max: 360 },
-  updatedAt: { min: 100, max: 360 },
-};
+/** 仅保留最小宽度，避免列被拖没；不设上限以便左右无限延伸 */
+const MIN_COL_WIDTH = 48;
 
 const DEFAULT_ORDER: TestDesignColumnKey[] = [...TEST_DESIGN_COLUMN_KEYS];
 
@@ -117,9 +110,8 @@ function saveStored(c: TestDesignColumnConfig) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 }
 
-function clampDesignWidth(key: TestDesignColumnKey, px: number): number {
-  const { min, max } = WIDTH_BOUNDS[key];
-  return Math.max(min, Math.min(max, Math.round(px)));
+function clampDesignWidth(_key: TestDesignColumnKey, px: number): number {
+  return Math.max(MIN_COL_WIDTH, Math.round(px));
 }
 
 export function useTestDesignListColumns() {

@@ -73,11 +73,12 @@ export function TestDesignNodeDetailClient({
   nodeId: string;
   /** 关联用例搜索范围：与需求所属迭代的产品用例库一致 */
   pickerProductId: string;
-  /** 返回树页时恢复产品、迭代与需求节点（与 ModuleWorkspaceCard 下拉一致） */
+  /** 返回树页时恢复产品、迭代、需求节点与侧栏类别（与 ModuleWorkspaceCard 下拉一致） */
   backToTreeContext?: {
     productId: string;
     iterationCode: string;
     requirementId: string;
+    dirId?: string | null;
   };
   breadcrumb: string;
   initialTitle: string;
@@ -93,15 +94,6 @@ export function TestDesignNodeDetailClient({
   initialOpLogs: TestDesignOpLogRow[];
 }) {
   const router = useRouter();
-  const backToTreeHref = useMemo(() => {
-    if (!backToTreeContext) return "/test-design";
-    const q = new URLSearchParams({
-      productId: backToTreeContext.productId,
-      iterationCode: backToTreeContext.iterationCode,
-      requirementId: backToTreeContext.requirementId,
-    });
-    return `/test-design?${q.toString()}`;
-  }, [backToTreeContext]);
   const [detailTab, setDetailTab] = useState<"basic" | "cases" | "ops">("basic");
   const [title, setTitle] = useState(initialTitle);
   const [description, setDescription] = useState(initialDescription ?? "");
@@ -114,6 +106,18 @@ export function TestDesignNodeDetailClient({
   );
   const [remark, setRemark] = useState(initialRemark ?? "");
   const [type, setType] = useState<TestDesignType>(initialType);
+  const backToTreeHref = useMemo(() => {
+    if (!backToTreeContext) return "/test-design";
+    const q = new URLSearchParams({
+      productId: backToTreeContext.productId,
+      iterationCode: backToTreeContext.iterationCode,
+      requirementId: backToTreeContext.requirementId,
+      type,
+    });
+    const dirId = backToTreeContext.dirId?.trim();
+    if (dirId) q.set("dirId", dirId);
+    return `/test-design?${q.toString()}`;
+  }, [backToTreeContext, type]);
   const [caseLevel, setCaseLevel] = useState(() =>
     caseLevelToFormValue(initialCaseLevel ?? null),
   );
@@ -854,6 +858,12 @@ export function TestDesignNodeDetailClient({
                     >
                       {savingLinks ? "保存中…" : "保存关联"}
                     </button>
+                    <Link
+                      href={backToTreeHref}
+                      className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50"
+                    >
+                      返回测试设计树
+                    </Link>
                     <button
                       type="button"
                       disabled={pendingLinkPickIds.length === 0}

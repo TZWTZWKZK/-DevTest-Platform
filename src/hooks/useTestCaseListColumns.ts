@@ -118,6 +118,94 @@ function saveStored(c: ColumnConfig) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 }
 
+/** 批量导出 CSV 可选字段（键与 TestCaseExportRow 一致） */
+export const TEST_CASE_EXPORT_COLUMN_KEYS = [
+  "caseNo",
+  "title",
+  "folderPath",
+  "statusLabel",
+  "priority",
+  "maintainer",
+  "submitter",
+  "createdAt",
+  "updatedAt",
+  "testPlan",
+  "precondition",
+  "operationSteps",
+  "expectedResult",
+  "remark",
+] as const;
+
+export type TestCaseExportColumnKey = (typeof TEST_CASE_EXPORT_COLUMN_KEYS)[number];
+
+export const TEST_CASE_EXPORT_COLUMN_LABELS: Record<
+  TestCaseExportColumnKey,
+  string
+> = {
+  caseNo: "用例编号",
+  title: "用例名称",
+  folderPath: "所在目录",
+  statusLabel: "状态",
+  priority: "用例等级",
+  maintainer: "维护人",
+  submitter: "提交人",
+  createdAt: "创建时间",
+  updatedAt: "更新时间",
+  testPlan: "测试计划",
+  precondition: "前置条件",
+  operationSteps: "操作步骤",
+  expectedResult: "预期结果",
+  remark: "备注",
+};
+
+const EXPORT_FIELDS_STORAGE_KEY = "pm-testcase-export-fields-v1";
+
+export const DEFAULT_TEST_CASE_EXPORT_FIELDS: Record<
+  TestCaseExportColumnKey,
+  boolean
+> = {
+  caseNo: true,
+  title: true,
+  folderPath: true,
+  statusLabel: true,
+  priority: true,
+  maintainer: true,
+  submitter: true,
+  createdAt: true,
+  updatedAt: true,
+  testPlan: true,
+  precondition: true,
+  operationSteps: true,
+  expectedResult: true,
+  remark: true,
+};
+
+export function parseStoredTestCaseExportFields(): Record<
+  TestCaseExportColumnKey,
+  boolean
+> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(EXPORT_FIELDS_STORAGE_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw) as Record<string, boolean>;
+    const out = { ...DEFAULT_TEST_CASE_EXPORT_FIELDS };
+    for (const key of TEST_CASE_EXPORT_COLUMN_KEYS) {
+      if (typeof j[key] === "boolean") out[key] = j[key];
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export function saveStoredTestCaseExportFields(
+  fields: Record<TestCaseExportColumnKey, boolean>,
+) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(fields));
+}
+
 export function useTestCaseListColumns() {
   const [config, setConfig] = useState<ColumnConfig>(() => ({
     order: DEFAULT_ORDER,

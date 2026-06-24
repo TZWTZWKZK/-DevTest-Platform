@@ -40,6 +40,7 @@ export default async function TestDesignNodePage({
           productId: requirement.iteration.productId,
           iterationCode: requirement.iteration.code,
           requirementId: requirement.id,
+          dirId: node.dirId,
         }}
         breadcrumb={breadcrumb}
         initialTitle={node.title}

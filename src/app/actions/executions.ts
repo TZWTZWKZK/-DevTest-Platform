@@ -39,6 +39,8 @@ const UI_PREF_KEY_GLOBAL_TEST_CASE_SIDEBAR = "ui.global.testCases.sidebar.v1";
 const UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION = "ui.global.testDesign.iteration.v1";
 /** 测试设计页需求目录：各迭代下需求节点的展开/收起（全局共享，写入 DB） */
 const UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND = "ui.testDesign.reqTree.expand.v1";
+/** 测试设计页：顶部需求区与右侧工具栏拉伸高度（全局共享，写入 DB） */
+const UI_PREF_KEY_TEST_DESIGN_LAYOUT = "ui.testDesign.layout.v1";
 const UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION = "ui.global.executions.iteration.v1";
 const UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT = "ui.global.iterations.product.v1";
 const UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION = "ui.global.requirements.iteration.v1";
@@ -418,6 +420,81 @@ export async function saveGlobalTestCaseExecResultHeightPreference(input: {
   return writeUiPreference(UI_PREF_KEY_GLOBAL_TEST_CASE_EXEC_RESULT_HEIGHT, {
     height: input.height,
   });
+}
+
+export type TestDesignLayoutPreference = {
+  topPaneH: number;
+  topPaneLastNonZero: number;
+  listToolbarPaneH: number | null;
+  listToolbarPaneLastNonZero: number;
+};
+
+const TEST_DESIGN_LAYOUT_DEFAULT: TestDesignLayoutPreference = {
+  topPaneH: 138,
+  topPaneLastNonZero: 138,
+  listToolbarPaneH: null,
+  listToolbarPaneLastNonZero: 0,
+};
+
+function parseTestDesignLayoutPreference(
+  raw: Partial<TestDesignLayoutPreference> | null | undefined,
+): TestDesignLayoutPreference | null {
+  if (!raw || typeof raw !== "object") return null;
+  const hasAny =
+    typeof raw.topPaneH === "number" ||
+    typeof raw.topPaneLastNonZero === "number" ||
+    typeof raw.listToolbarPaneH === "number" ||
+    typeof raw.listToolbarPaneLastNonZero === "number";
+  if (!hasAny) return null;
+
+  const topPaneH =
+    typeof raw.topPaneH === "number" &&
+    (raw.topPaneH === -1 || raw.topPaneH >= 0)
+      ? raw.topPaneH
+      : TEST_DESIGN_LAYOUT_DEFAULT.topPaneH;
+  const topPaneLastNonZero =
+    typeof raw.topPaneLastNonZero === "number" && raw.topPaneLastNonZero > 0
+      ? raw.topPaneLastNonZero
+      : topPaneH > 24
+        ? topPaneH
+        : TEST_DESIGN_LAYOUT_DEFAULT.topPaneLastNonZero;
+  const listToolbarPaneH =
+    typeof raw.listToolbarPaneH === "number" && raw.listToolbarPaneH >= 0
+      ? raw.listToolbarPaneH
+      : null;
+  const listToolbarPaneLastNonZero =
+    typeof raw.listToolbarPaneLastNonZero === "number" &&
+    raw.listToolbarPaneLastNonZero > 0
+      ? raw.listToolbarPaneLastNonZero
+      : TEST_DESIGN_LAYOUT_DEFAULT.listToolbarPaneLastNonZero;
+
+  return {
+    topPaneH,
+    topPaneLastNonZero,
+    listToolbarPaneH,
+    listToolbarPaneLastNonZero,
+  };
+}
+
+export async function getGlobalTestDesignLayoutPreference(): Promise<{
+  layout?: TestDesignLayoutPreference;
+  error?: string;
+}> {
+  const r = await readUiPreference<Partial<TestDesignLayoutPreference>>(
+    UI_PREF_KEY_TEST_DESIGN_LAYOUT,
+    {},
+  );
+  const layout = parseTestDesignLayoutPreference(r.value);
+  return {
+    ...(layout ? { layout } : {}),
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalTestDesignLayoutPreference(
+  input: TestDesignLayoutPreference,
+): Promise<ActionResult> {
+  return writeUiPreference(UI_PREF_KEY_TEST_DESIGN_LAYOUT, input);
 }
 
 export async function listExecutionTaskIterations(): Promise<

@@ -58,9 +58,10 @@ model Iteration {
   productId      String
   product        Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
   requirements   Requirement[]
-  executionTasks ExecutionTask[]
-  testDesignDirs TestDesignDir[]
-  opLogs         IterationOpLog[]
+  executionTasks    ExecutionTask[]
+  iterationAnalysis IterationAnalysis?
+  testDesignDirs    TestDesignDir[]
+  opLogs            IterationOpLog[]
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
 
@@ -432,6 +433,7 @@ enum IterationStatus {
 enum RequirementStatus {
   UNASSIGNED
   IN_DEVELOPMENT
+  IN_RD
   PENDING_VERIFICATION
   CLOSED
 }
@@ -604,6 +606,21 @@ model ExecutionTaskTestCaseExecRecord {
   testCase      TestCase      @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
 
   @@index([executionTaskId, testCaseId, executedAt])
+}
+
+/// 迭代分析：研发流程优化 / 工具改进 / 质量提升（按迭代一份 JSON）
+model IterationAnalysis {
+  id          String    @id @default(cuid())
+  iterationId String    @unique
+  iteration   Iteration @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  content     String    @db.LongText
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([iterationId])
+  @@index([updatedAt])
 }
 
 /// 简易 UI 配置存储（无登录系统时按 key 全局存一份）

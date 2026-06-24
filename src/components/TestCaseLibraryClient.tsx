@@ -41,6 +41,7 @@ import {
   type TestCaseFolderFlat,
   type TestCaseListItem,
   type TestCaseOpLogRow,
+  type TestCaseExportRow,
 } from "@/app/actions/test-cases";
 import { bulkImportDesignsToTestCases } from "@/app/actions/test-design";
 import {
@@ -80,7 +81,13 @@ import {
 import { buildTree, type TreeNode } from "@/lib/tree";
 import {
   COLUMN_LABELS,
+  DEFAULT_TEST_CASE_EXPORT_FIELDS,
+  parseStoredTestCaseExportFields,
+  saveStoredTestCaseExportFields,
+  TEST_CASE_EXPORT_COLUMN_KEYS,
+  TEST_CASE_EXPORT_COLUMN_LABELS,
   type DataColumnKey,
+  type TestCaseExportColumnKey,
   useTestCaseListColumns,
 } from "@/hooks/useTestCaseListColumns";
 import { CaseLevelSelect } from "@/components/CaseLevelSelect";
@@ -222,6 +229,19 @@ function csvEscapeCell(val: string): string {
   const s = String(val).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
+}
+
+function buildTestCaseExportCsv(
+  rows: TestCaseExportRow[],
+  fields: readonly TestCaseExportColumnKey[],
+): string {
+  const headerLine = fields
+    .map((k) => csvEscapeCell(TEST_CASE_EXPORT_COLUMN_LABELS[k]))
+    .join(",");
+  const bodyLines = rows.map((row) =>
+    fields.map((k) => csvEscapeCell(row[k] ?? "")).join(","),
+  );
+  return `\uFEFF${[headerLine, ...bodyLines].join("\r\n")}`;
 }
 
 async function blobToDataUrl(blob: Blob): Promise<string> {
@@ -629,6 +649,10 @@ export function TestCaseLibraryClient({
   const [batchMaintainerText, setBatchMaintainerText] = useState("");
   const [batchSubmitterApply, setBatchSubmitterApply] = useState(false);
   const [batchSubmitterText, setBatchSubmitterText] = useState("");
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
+  const [exportFieldSel, setExportFieldSel] = useState<
+    Record<TestCaseExportColumnKey, boolean>
+  >(() => ({ ...DEFAULT_TEST_CASE_EXPORT_FIELDS }));
   const selectAllRef = useRef<HTMLInputElement>(null);
   const selectAllFullVisibleRef = useRef<HTMLInputElement>(null);
   const modalLinkedDefectSelectAllRef = useRef<HTMLInputElement>(null);
@@ -2129,6 +2153,11 @@ export function TestCaseLibraryClient({
 
   const runBatchExport = async () => {
     if (selectedCaseIds.length === 0) return;
+    const fields = TEST_CASE_EXPORT_COLUMN_KEYS.filter((k) => exportFieldSel[k]);
+    if (fields.length === 0) {
+      showNotice("导出失败", "请至少勾选一个导出字段。");
+      return;
+    }
     setBatchWorking(true);
     try {
       const r = await getTestCasesExportRows(
@@ -2139,46 +2168,8 @@ export function TestCaseLibraryClient({
         showNotice("导出失败", r.error ?? "没有可导出的数据");
         return;
       }
-      const headers = [
-        "用例编号",
-        "用例名称",
-        "所在目录",
-        "状态",
-        "用例等级",
-        "维护人",
-        "提交人",
-        "创建时间",
-        "更新时间",
-        "测试计划",
-        "前置条件",
-        "操作步骤",
-        "预期结果",
-        "备注",
-      ];
-      const lines = [
-        headers.map(csvEscapeCell).join(","),
-        ...r.rows.map((row) =>
-          [
-            row.caseNo,
-            row.title,
-            row.folderPath,
-            row.statusLabel,
-            row.priority,
-            row.maintainer,
-            row.submitter,
-            row.createdAt,
-            row.updatedAt,
-            row.testPlan,
-            row.precondition,
-            row.operationSteps,
-            row.expectedResult,
-            row.remark,
-          ]
-            .map((cell) => csvEscapeCell(cell))
-            .join(","),
-        ),
-      ];
-      const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {
+      saveStoredTestCaseExportFields(exportFieldSel);
+      const blob = new Blob([buildTestCaseExportCsv(r.rows, fields)], {
         type: "text/csv;charset=utf-8;",
       });
       const url = URL.createObjectURL(blob);
@@ -2189,6 +2180,7 @@ export function TestCaseLibraryClient({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      setBatchExportOpen(false);
     } catch {
       showNotice("导出失败", "生成文件时出错，请稍后重试。");
     } finally {
@@ -3027,7 +3019,7 @@ export function TestCaseLibraryClient({
             </div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-4">
             {!selectedFolderId ? (
               <p className="text-sm text-zinc-500">请在左侧选择目录。</p>
             ) : loadingCases ? (
@@ -3037,7 +3029,8 @@ export function TestCaseLibraryClient({
                 当前范围（含子目录）内暂无用例。
               </p>
             ) : (
-              <>
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
                 {selectedCaseIds.length > 0 ? (
                   <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-blue-200 bg-blue-50/90 px-3 py-2.5 text-sm text-zinc-800">
                     <span>
@@ -3071,7 +3064,13 @@ export function TestCaseLibraryClient({
                       type="button"
                       disabled={batchWorking}
                       className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium hover:bg-zinc-50 disabled:opacity-50"
-                      onClick={runBatchExport}
+                      onClick={() => {
+                        const stored = parseStoredTestCaseExportFields();
+                        setExportFieldSel(
+                          stored ?? { ...DEFAULT_TEST_CASE_EXPORT_FIELDS },
+                        );
+                        setBatchExportOpen(true);
+                      }}
                     >
                       批量导出 CSV
                     </button>
@@ -3288,8 +3287,6 @@ export function TestCaseLibraryClient({
                     没有符合当前搜索与筛选条件的用例。可尝试清空左侧搜索框或重置高级筛选。
                   </p>
                 ) : (
-                  <div className="flex flex-col">
-                    <div className="overflow-x-auto">
                       <table
                         className="w-full table-fixed text-left text-sm"
                         style={{
@@ -3439,25 +3436,26 @@ export function TestCaseLibraryClient({
                         ))}
                       </tbody>
                       </table>
-                    </div>
-                    <div className="shrink-0">
-                      <PaginationBar
-                        page={casePager.page}
-                        pageCount={casePager.pageCount}
-                        pageSize={casePager.pageSize}
-                        pageSizeOptions={casePager.pageSizeOptions}
-                        rangeLabel={casePager.rangeLabel}
-                        onPageChange={casePager.setPage}
-                        onPageSizeChange={casePager.setPageSize}
-                        className="!mt-0 w-full justify-end pt-3"
-                      />
-                    </div>
-                  </div>
                 )}
-              </>
+                </div>
+                {filteredCases.length > 0 ? (
+                  <div className="shrink-0 border-t border-zinc-100 bg-zinc-50/50 px-1 py-2.5">
+                    <PaginationBar
+                      page={casePager.page}
+                      pageCount={casePager.pageCount}
+                      pageSize={casePager.pageSize}
+                      pageSizeOptions={casePager.pageSizeOptions}
+                      rangeLabel={casePager.rangeLabel}
+                      onPageChange={casePager.setPage}
+                      onPageSizeChange={casePager.setPageSize}
+                      className="!mt-0 w-full justify-end pt-0"
+                    />
+                  </div>
+                ) : null}
+              </div>
             )}
 
-            <p className="mt-6 text-center text-xs text-zinc-400">
+            <p className="mt-6 shrink-0 text-center text-xs text-zinc-400">
               <Link href="/test-design" className="hover:underline">
                 前往测试设计
               </Link>
@@ -4747,6 +4745,125 @@ export function TestCaseLibraryClient({
                     ? `恢复已选（${execRestorePick.length}）`
                     : "恢复已选"}
               </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {batchExportOpen ? (
+        <div className="fixed inset-0 z-[92] flex items-center justify-center overflow-y-auto bg-black/45 p-4">
+          <div
+            className="mb-8 w-full max-w-lg rounded-2xl border border-zinc-200 bg-white shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="case-lib-batch-export-title"
+          >
+            <div className="flex items-center justify-between border-b border-zinc-100 px-5 py-4">
+              <div>
+                <div
+                  id="case-lib-batch-export-title"
+                  className="text-sm font-semibold text-zinc-900"
+                >
+                  批量导出 CSV
+                </div>
+                <div className="mt-0.5 text-xs text-zinc-500">
+                  已选{" "}
+                  <strong className="tabular-nums text-zinc-700">
+                    {selectedCaseIds.length}
+                  </strong>{" "}
+                  条用例；勾选需要写入 CSV 的字段。
+                </div>
+              </div>
+              <button
+                type="button"
+                className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                onClick={() => setBatchExportOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="px-5 py-4">
+              <div className="mb-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="rounded-md border border-zinc-200 px-2.5 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                  onClick={() =>
+                    setExportFieldSel({ ...DEFAULT_TEST_CASE_EXPORT_FIELDS })
+                  }
+                >
+                  全选
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md border border-zinc-200 px-2.5 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                  onClick={() =>
+                    setExportFieldSel(
+                      Object.fromEntries(
+                        TEST_CASE_EXPORT_COLUMN_KEYS.map((k) => [k, false]),
+                      ) as Record<TestCaseExportColumnKey, boolean>,
+                    )
+                  }
+                >
+                  全不选
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md border border-zinc-200 px-2.5 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                  onClick={() =>
+                    setExportFieldSel({ ...DEFAULT_TEST_CASE_EXPORT_FIELDS })
+                  }
+                >
+                  恢复默认
+                </button>
+              </div>
+              <ul className="max-h-[min(52vh,22rem)] space-y-1 overflow-y-auto rounded-lg border border-zinc-100 bg-zinc-50/50 p-2">
+                {TEST_CASE_EXPORT_COLUMN_KEYS.map((key) => (
+                  <li
+                    key={key}
+                    className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white"
+                  >
+                    <input
+                      id={`export-field-${key}`}
+                      type="checkbox"
+                      className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                      checked={exportFieldSel[key]}
+                      onChange={(e) =>
+                        setExportFieldSel((prev) => ({
+                          ...prev,
+                          [key]: e.target.checked,
+                        }))
+                      }
+                    />
+                    <label
+                      htmlFor={`export-field-${key}`}
+                      className="min-w-0 flex-1 cursor-pointer text-sm text-zinc-800"
+                    >
+                      {TEST_CASE_EXPORT_COLUMN_LABELS[key]}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-4 flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-200 px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  disabled={batchWorking}
+                  onClick={() => setBatchExportOpen(false)}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg bg-zinc-900 px-3 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
+                  disabled={
+                    batchWorking ||
+                    !TEST_CASE_EXPORT_COLUMN_KEYS.some((k) => exportFieldSel[k])
+                  }
+                  onClick={() => void runBatchExport()}
+                >
+                  {batchWorking ? "导出中…" : "确认导出"}
+                </button>
+              </div>
             </div>
           </div>
         </div>
