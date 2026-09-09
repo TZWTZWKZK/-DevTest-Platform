@@ -9,10 +9,22 @@ import {
   requirementPriorityLabel,
 } from "@/lib/requirement-priority";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
+import {
+  parseRequirementStatusImport,
+  requirementStatusLabel,
+} from "@/lib/requirement-status";
 import { formatIsoBeijing } from "@/lib/timezone-cn";
 import {
+  buildImportBatchParentPointerMap,
+  buildImportWbsWriteOwnerKey,
+  importDbParentRef,
+  importDepthByParentPointer,
+  importWbsIdAsParentPointer,
+  importWbsIdForWrite,
   nextWbsForNewSiblingUnderParent,
-  parentWbsFromChildWbs,
+  importNodeCompositeKey,
+  parseImportCompositeWbsKey,
+  resolveImportParentIdFromIdMap,
 } from "@/lib/wbs-id";
 import { archiveTestDesignsBeforeRequirementDelete } from "@/app/actions/test-design";
 
@@ -87,12 +99,8 @@ function shouldDegradePlanDateFields(e: unknown): boolean {
   return messageLooksLikeDbMissingColumn(msg);
 }
 
-const REQUIREMENT_STATUS_LOG: Record<RequirementStatus, string> = {
-  UNASSIGNED: "未分配",
-  IN_DEVELOPMENT: "开发中",
-  PENDING_VERIFICATION: "待验证",
-  CLOSED: "已上线",
-};
+const REQUIREMENT_STATUS_LOG: Record<RequirementStatus, string> =
+  requirementStatusLabel;
 
 function normStrLog(s: string | null | undefined): string {
   return (s ?? "").trim();
@@ -1034,6 +1042,77 @@ export async function patchRequirementRowFields(input: {
 /** 与前端单文件 10MB 上限对应；Data URL 约为原文件的 ~4/3 */
 const MAX_ATTACHMENT_DATA_URL_CHARS = 15 * 1024 * 1024;
 
+type RequirementAttachmentImport = { name: string; url: string };
+
+function serializeRequirementAttachmentsForExport(
+  attachments: { name: string; url: string }[],
+): string {
+  if (attachments.length === 0) return "";
+  return JSON.stringify(
+    attachments.map((a) => ({ name: a.name, url: a.url })),
+  );
+}
+
+function parseRequirementAttachmentsImport(
+  raw: string,
+  rowIndex: number,
+):
+  | { ok: true; attachments: RequirementAttachmentImport[] }
+  | { ok: false; error: string } {
+  const s = raw.trim();
+  if (!s) return { ok: true, attachments: [] };
+  try {
+    const j = JSON.parse(s) as unknown;
+    if (!Array.isArray(j)) {
+      return { ok: false, error: `第 ${rowIndex} 行：相关附件须为 JSON 数组` };
+    }
+    const attachments: RequirementAttachmentImport[] = [];
+    for (const el of j) {
+      if (!el || typeof el !== "object") {
+        return {
+          ok: false,
+          error: `第 ${rowIndex} 行：相关附件 JSON 格式无效`,
+        };
+      }
+      const o = el as Record<string, unknown>;
+      const name = String(o.name ?? "").trim();
+      const url = String(o.url ?? "").trim();
+      if (!name || !url) {
+        return {
+          ok: false,
+          error: `第 ${rowIndex} 行：附件项须包含 name 与 url`,
+        };
+      }
+      if (url.length > MAX_ATTACHMENT_DATA_URL_CHARS) {
+        return {
+          ok: false,
+          error: `第 ${rowIndex} 行：附件「${name}」过大（请控制在 10MB 内）`,
+        };
+      }
+      attachments.push({ name, url });
+    }
+    return { ok: true, attachments };
+  } catch {
+    return { ok: false, error: `第 ${rowIndex} 行：相关附件 JSON 解析失败` };
+  }
+}
+
+async function syncImportRequirementAttachments(
+  tx: Prisma.TransactionClient,
+  requirementId: string,
+  attachments: RequirementAttachmentImport[],
+): Promise<void> {
+  await tx.requirementAttachment.deleteMany({ where: { requirementId } });
+  if (attachments.length === 0) return;
+  await tx.requirementAttachment.createMany({
+    data: attachments.map((a) => ({
+      requirementId,
+      name: a.name,
+      url: a.url,
+    })),
+  });
+}
+
 export async function addRequirementAttachment(input: {
   requirementId: string;
   name: string;
@@ -1093,6 +1172,8 @@ export type RequirementExportRow = {
   data_id: string;
   wbs_id: string;
   任务名称: string;
+  描述: string;
+  相关附件: string;
   优先级: string;
   状态: string;
   任务进度: string;
@@ -1112,6 +1193,7 @@ function mapRequirementToExportRow(r: {
   dataId: string | null;
   wbsId: string | null;
   title: string;
+  description: string | null;
   taskProgress: string | null;
   latestProgress: string | null;
   priority: number | null;
@@ -1123,6 +1205,7 @@ function mapRequirementToExportRow(r: {
   planEndAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  attachments: { name: string; url: string }[];
 }): RequirementExportRow {
   return {
     节点ID: r.id,
@@ -1130,6 +1213,8 @@ function mapRequirementToExportRow(r: {
     data_id: r.dataId ?? "",
     wbs_id: r.wbsId ?? "",
     任务名称: r.title,
+    描述: r.description ?? "",
+    相关附件: serializeRequirementAttachmentsForExport(r.attachments),
     优先级: formatRequirementPriorityExport(r.priority),
     状态: String(r.status),
     任务进度: r.taskProgress ?? "",
@@ -1159,6 +1244,7 @@ export async function getRequirementsExportRows(
         dataId: true,
         wbsId: true,
         title: true,
+        description: true,
         taskProgress: true,
         latestProgress: true,
         priority: true,
@@ -1170,6 +1256,10 @@ export async function getRequirementsExportRows(
         planEndAt: true,
         createdAt: true,
         updatedAt: true,
+        attachments: {
+          orderBy: { createdAt: "asc" },
+          select: { name: true, url: true },
+        },
       },
     });
     return {
@@ -1196,6 +1286,7 @@ export async function getRequirementsExportAllForIteration(
         dataId: true,
         wbsId: true,
         title: true,
+        description: true,
         taskProgress: true,
         latestProgress: true,
         priority: true,
@@ -1207,6 +1298,10 @@ export async function getRequirementsExportAllForIteration(
         planEndAt: true,
         createdAt: true,
         updatedAt: true,
+        attachments: {
+          orderBy: { createdAt: "asc" },
+          select: { name: true, url: true },
+        },
       },
     });
     return { rows: rows.map(mapRequirementToExportRow) };
@@ -1223,6 +1318,10 @@ export type ImportRequirementRow = {
   /** WBS 层级编号（如 1、1.1）；同一迭代内唯一；可仅填此项由程序推断父节点 */
   wbs_id: string;
   任务名称: string;
+  /** 可选；旧版 Excel 无此列时视为空 */
+  描述?: string;
+  /** 可选；JSON 数组，旧版 Excel 无此列时视为空 */
+  相关附件?: string;
   优先级: string;
   状态: string;
   任务进度: string;
@@ -1234,35 +1333,18 @@ export type ImportRequirementRow = {
   计划结束时间: string;
 };
 
-const STATUS_ZH_TO_ENUM: Record<string, RequirementStatus> = {
-  未分配: "UNASSIGNED",
-  开发中: "IN_DEVELOPMENT",
-  待验证: "PENDING_VERIFICATION",
-  已上线: "CLOSED",
-};
-
-function parseRequirementStatusImport(raw: string): RequirementStatus | null {
-  const s = raw.trim();
-  if (!s) return "UNASSIGNED";
-  if (
-    s === "UNASSIGNED" ||
-    s === "IN_DEVELOPMENT" ||
-    s === "PENDING_VERIFICATION" ||
-    s === "CLOSED"
-  ) {
-    return s;
-  }
-  return STATUS_ZH_TO_ENUM[s] ?? null;
+function parseRequirementStatusImportRow(raw: string): RequirementStatus {
+  return parseRequirementStatusImport(raw);
 }
 
 type NormalizedImport = {
   oldId: string;
-  parentOldId: string | null;
   /** 非空时按全局唯一匹配已有需求并更新 */
   dataId: string | null;
-  /** 同一迭代内唯一；用于导入时推断父子（1.1 的父为 1） */
+  /** 非空时表示父节点 data_id（与本行 wbs_id 相同） */
   wbsId: string | null;
   title: string;
+  description: string | null;
   taskProgress: string | null;
   latestProgress: string | null;
   priority: number | null;
@@ -1274,24 +1356,9 @@ type NormalizedImport = {
   planEndAt: Date | null;
   /** 导入文件中的原始行号（从 1 计），用于报错定位 */
   sourceRowIndex: number;
+  attachments: RequirementAttachmentImport[];
 };
 
-function importRowDepth(oldId: string, byId: Map<string, NormalizedImport>): number {
-  let d = 0;
-  let cur: string | null = oldId;
-  const seen = new Set<string>();
-  while (cur && byId.has(cur) && seen.size < byId.size + 2) {
-    if (seen.has(cur)) break;
-    seen.add(cur);
-    const node = byId.get(cur);
-    if (!node) break;
-    const parentRef = node.parentOldId;
-    if (!parentRef || !byId.has(parentRef)) break;
-    d++;
-    cur = parentRef;
-  }
-  return d;
-}
 
 function importRowFailureMessage(item: NormalizedImport, e: unknown): string {
   const rowHint = `第 ${item.sourceRowIndex} 行（「${truncateForLog(item.title, 40)}」）`;
@@ -1300,9 +1367,10 @@ function importRowFailureMessage(item: NormalizedImport, e: unknown): string {
 
 /**
  * 将导出格式 CSV/Excel 解析后的行导入到指定迭代。
- * - 若某行提供非空 `data_id` 且库中已存在相同值，则更新该需求（含归属迭代与父节点）；
- * - 否则新建节点；文件内 `节点ID` 仍用于同一文件内的父子关系映射；
- * - 若填写 `wbs_id`（如 1.1），且未指定「父节点ID」，则按 WBS 规则推断父行（1.1 的父为 1）。
+ * - 表格 `wbs_id` 为空 → 根节点；不为空 → 值为「父节点 data_id + 空格 + 父任务名称」；
+ * - 写入库内 `wbs_id` 为本行 `data_id + 空格 + 任务名称`（重复则置空）；
+ * - `data_id` 匹配已有记录则更新，否则新建；
+ * - `描述`、`相关附件` 随导入导出往返。
  */
 export async function importRequirementsCsv(
   iterationId: string,
@@ -1318,15 +1386,17 @@ export async function importRequirementsCsv(
   });
   if (!it) return { error: "迭代不存在" };
 
+  const existingInIter = await prisma.requirement.findMany({
+    where: { iterationId: iter },
+    select: { id: true, dataId: true, wbsId: true, title: true },
+  });
+
   const normalized: NormalizedImport[] = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const title = r.任务名称.trim();
     if (!title) continue;
-    const status = parseRequirementStatusImport(r.状态);
-    if (!status) {
-      return { error: `第 ${i + 1} 行：无法识别状态「${r.状态}」` };
-    }
+    const status = parseRequirementStatusImportRow(r.状态);
     const priority = parseRequirementPriorityImport(r.优先级);
     const oldIdRaw = r.节点ID.trim();
     const oldId = oldIdRaw || `__import_${i}_${Math.random().toString(16).slice(2)}`;
@@ -1334,7 +1404,6 @@ export async function importRequirementsCsv(
     const dataId = dataIdTrim || null;
     const wbsIdTrim = r.wbs_id.trim();
     const wbsId = wbsIdTrim || null;
-    const parentRaw = r.父节点ID.trim();
     const taskP = r.任务进度.trim();
     const latestP = r.最新进展情况.trim();
     const ps = parseImportPlanDateCell(r.计划开始时间, "计划开始时间");
@@ -1349,12 +1418,18 @@ export async function importRequirementsCsv(
       taskP || null,
     );
     const statusFinal = statusFromProgress ?? status;
+    const descRaw = (r.描述 ?? "").trim();
+    const attParsed = parseRequirementAttachmentsImport(
+      r.相关附件 ?? "",
+      i + 1,
+    );
+    if (!attParsed.ok) return { error: attParsed.error };
     normalized.push({
       oldId,
-      parentOldId: parentRaw || null,
       dataId,
       wbsId,
       title,
+      description: descRaw || null,
       taskProgress: taskP || null,
       latestProgress: latestP || null,
       priority,
@@ -1365,56 +1440,63 @@ export async function importRequirementsCsv(
       planStartAt: ps.date,
       planEndAt: pe.date,
       sourceRowIndex: i + 1,
+      attachments: attParsed.attachments,
     });
   }
 
   if (normalized.length === 0) return { error: "没有有效的数据行（任务名称不能为空）" };
 
-  const byId = new Map(normalized.map((x) => [x.oldId, x]));
-  const idSet = new Set(byId.keys());
-
-  const wbsToOldId = new Map<string, string>();
+  const dataIdToOldId = new Map<string, string>();
   for (const x of normalized) {
-    if (!x.wbsId) continue;
-    if (wbsToOldId.has(x.wbsId)) {
-      return { error: `导入文件中 wbs_id「${x.wbsId}」出现多次` };
+    if (!x.dataId) continue;
+    if (dataIdToOldId.has(x.dataId)) {
+      return { error: `导入文件中 data_id「${x.dataId}」出现多次` };
     }
-    wbsToOldId.set(x.wbsId, x.oldId);
-  }
-  for (const x of normalized) {
-    if (x.parentOldId) continue;
-    const w = x.wbsId?.trim();
-    if (!w) continue;
-    const pw = parentWbsFromChildWbs(w);
-    if (!pw) continue;
-    const pOld = wbsToOldId.get(pw);
-    if (pOld) x.parentOldId = pOld;
+    dataIdToOldId.set(x.dataId, x.oldId);
   }
 
-  for (const x of normalized) {
-    if (x.parentOldId && !idSet.has(x.parentOldId)) {
-      x.parentOldId = null;
-    }
-  }
+  const updatingDataIds = new Set(
+    normalized.flatMap((x) => (x.dataId ? [x.dataId] : [])),
+  );
+  const wbsWriteOwner = buildImportWbsWriteOwnerKey(
+    existingInIter.map((r) => ({
+      wbsId: importNodeCompositeKey(r.dataId, r.title) ?? r.wbsId,
+      dataId: r.dataId,
+      dbId: r.id,
+    })),
+    normalized.map((x) => ({
+      wbsId: importNodeCompositeKey(x.dataId, x.title),
+      dataId: x.dataId,
+      nodeRef: x.oldId,
+      sourceRowIndex: x.sourceRowIndex,
+    })),
+    updatingDataIds,
+  );
+
+  const batchParentPointer = buildImportBatchParentPointerMap(
+    normalized.map((x) => ({
+      dataId: x.dataId,
+      title: x.title,
+      wbsId: x.wbsId,
+    })),
+  );
 
   const sorted = [...normalized].sort(
     (a, b) =>
-      importRowDepth(a.oldId, byId) - importRowDepth(b.oldId, byId) ||
-      a.title.localeCompare(b.title, "zh-CN"),
+      importDepthByParentPointer(
+        importWbsIdAsParentPointer(a.wbsId),
+        batchParentPointer,
+      ) -
+        importDepthByParentPointer(
+          importWbsIdAsParentPointer(b.wbsId),
+          batchParentPointer,
+        ) || a.sourceRowIndex - b.sourceRowIndex,
   );
 
-  const seenFileDataIds = new Set<string>();
-  for (const x of normalized) {
-    if (!x.dataId) continue;
-    if (seenFileDataIds.has(x.dataId)) {
-      return { error: `导入文件中 data_id「${x.dataId}」出现多次` };
-    }
-    seenFileDataIds.add(x.dataId);
-  }
   const existingByDataId = new Map<string, string>();
-  if (seenFileDataIds.size > 0) {
+  if (dataIdToOldId.size > 0) {
     const foundRows = await prisma.requirement.findMany({
-      where: { dataId: { in: Array.from(seenFileDataIds) } },
+      where: { dataId: { in: Array.from(dataIdToOldId.keys()) } },
       select: { id: true, dataId: true },
     });
     for (const fr of foundRows) {
@@ -1422,25 +1504,92 @@ export async function importRequirementsCsv(
     }
   }
 
+  const parentLookupKeys = [
+    ...new Set(
+      normalized.flatMap((x) => {
+        const w = (x.wbsId ?? "").trim();
+        return w ? [w] : [];
+      }),
+    ),
+  ];
+  const parsedParentKeys = parentLookupKeys
+    .map((k) => parseImportCompositeWbsKey(k))
+    .filter((x): x is { dataId: string; title: string } => x !== null);
+  const parentRowsInDb =
+    parsedParentKeys.length > 0
+      ? await prisma.requirement.findMany({
+          where: {
+            OR: parsedParentKeys.map((p) => ({
+              dataId: p.dataId,
+              title: p.title,
+            })),
+          },
+          select: { id: true, dataId: true, wbsId: true, title: true },
+        })
+      : [];
+
+  const registerImportNodeInIdMap = (
+    idMap: Map<string, string>,
+    item: NormalizedImport,
+    savedId: string,
+    wbsWritten: string | null,
+  ) => {
+    idMap.set(item.oldId, savedId);
+    const composite = importNodeCompositeKey(item.dataId, item.title);
+    if (composite) idMap.set(composite, savedId);
+    const dataKey = (item.dataId ?? "").trim();
+    if (dataKey) idMap.set(dataKey, savedId);
+    const wbsWrittenKey = (wbsWritten ?? "").trim();
+    if (wbsWrittenKey) idMap.set(wbsWrittenKey, savedId);
+  };
+
   try {
     let imported = 0;
     await prisma.$transaction(async (tx) => {
       const idMap = new Map<string, string>();
+      for (const r of existingInIter) {
+        idMap.set(r.id, r.id);
+        idMap.set(importDbParentRef(r.id), r.id);
+        const composite = importNodeCompositeKey(r.dataId, r.title);
+        if (composite) idMap.set(composite, r.id);
+        const d = (r.dataId ?? "").trim();
+        if (d) idMap.set(d, r.id);
+        const w = (r.wbsId ?? "").trim();
+        if (w) idMap.set(w, r.id);
+      }
+      for (const pr of parentRowsInDb) {
+        const composite = importNodeCompositeKey(pr.dataId, pr.title);
+        if (composite) idMap.set(composite, pr.id);
+        const d = (pr.dataId ?? "").trim();
+        if (d) idMap.set(d, pr.id);
+        const w = (pr.wbsId ?? "").trim();
+        if (w) idMap.set(w, pr.id);
+      }
       for (const item of sorted) {
-        const newParentId =
-          item.parentOldId && idMap.has(item.parentOldId)
-            ? idMap.get(item.parentOldId)!
+        const newParentId = resolveImportParentIdFromIdMap(
+          importWbsIdAsParentPointer(item.wbsId),
+          idMap,
+        );
+        const existingId =
+          item.dataId && existingByDataId.get(item.dataId)
+            ? existingByDataId.get(item.dataId)!
             : null;
-        const existingFromDataId =
-          item.dataId && existingByDataId.get(item.dataId);
-        if (existingFromDataId) {
+        const ownWbsKey = importNodeCompositeKey(item.dataId, item.title);
+        const wbsForWrite = importWbsIdForWrite(
+          ownWbsKey,
+          item.dataId,
+          item.oldId,
+          wbsWriteOwner,
+        );
+        if (existingId) {
           try {
             await tx.requirement.update({
-              where: { id: existingFromDataId },
+              where: { id: existingId },
               data: {
                 iterationId: iter,
                 parentId: newParentId,
                 title: item.title,
+                description: item.description,
                 taskProgress: item.taskProgress,
                 latestProgress: item.latestProgress,
                 priority: item.priority,
@@ -1451,20 +1600,21 @@ export async function importRequirementsCsv(
                 planStartAt: item.planStartAt,
                 planEndAt: item.planEndAt,
                 dataId: item.dataId,
-                wbsId: item.wbsId,
+                wbsId: wbsForWrite,
               },
             });
-            idMap.set(item.oldId, existingFromDataId);
+            registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
             imported++;
           } catch (e) {
             if (isUnknownField(e, "dataId")) {
               try {
                 await tx.requirement.update({
-                  where: { id: existingFromDataId },
+                  where: { id: existingId },
                   data: {
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     taskProgress: item.taskProgress,
                     latestProgress: item.latestProgress,
                     priority: item.priority,
@@ -1474,20 +1624,21 @@ export async function importRequirementsCsv(
                     testOwner: item.testOwner,
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                 });
-                idMap.set(item.oldId, existingFromDataId);
+                registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                 imported++;
               } catch (e2) {
                 if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
                   try {
                     await tx.requirement.update({
-                      where: { id: existingFromDataId },
+                      where: { id: existingId },
                       data: {
                         iterationId: iter,
                         parentId: newParentId,
                         title: item.title,
+                description: item.description,
                         taskProgress: item.taskProgress,
                         latestProgress: item.latestProgress,
                         priority: item.priority,
@@ -1495,10 +1646,10 @@ export async function importRequirementsCsv(
                         submitter: item.submitter,
                         planStartAt: item.planStartAt,
                         planEndAt: item.planEndAt,
-                        wbsId: item.wbsId,
+                        wbsId: wbsForWrite,
                       },
                     });
-                    idMap.set(item.oldId, existingFromDataId);
+                    registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                     imported++;
                   } catch (e3) {
                     if (
@@ -1506,20 +1657,21 @@ export async function importRequirementsCsv(
                       isUnknownField(e3, "latestProgress")
                     ) {
                       await tx.requirement.update({
-                        where: { id: existingFromDataId },
+                        where: { id: existingId },
                         data: {
                           iterationId: iter,
                           parentId: newParentId,
                           title: item.title,
+                description: item.description,
                           priority: item.priority,
                           status: item.status,
                           submitter: item.submitter,
                           planStartAt: item.planStartAt,
                           planEndAt: item.planEndAt,
-                          wbsId: item.wbsId,
+                          wbsId: wbsForWrite,
                         },
                       });
-                      idMap.set(item.oldId, existingFromDataId);
+                      registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                       imported++;
                     } else {
                       throw new Error(importRowFailureMessage(item, e3));
@@ -1531,11 +1683,12 @@ export async function importRequirementsCsv(
                 ) {
                   try {
                     await tx.requirement.update({
-                      where: { id: existingFromDataId },
+                      where: { id: existingId },
                       data: {
                         iterationId: iter,
                         parentId: newParentId,
                         title: item.title,
+                description: item.description,
                         priority: item.priority,
                         status: item.status,
                         submitter: item.submitter,
@@ -1543,28 +1696,29 @@ export async function importRequirementsCsv(
                         testOwner: item.testOwner,
                         planStartAt: item.planStartAt,
                         planEndAt: item.planEndAt,
-                        wbsId: item.wbsId,
+                        wbsId: wbsForWrite,
                       },
                     });
-                    idMap.set(item.oldId, existingFromDataId);
+                    registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                     imported++;
                   } catch (e3) {
                     if (isUnknownField(e3, "devOwner") || isUnknownField(e3, "testOwner")) {
                       await tx.requirement.update({
-                        where: { id: existingFromDataId },
+                        where: { id: existingId },
                         data: {
                           iterationId: iter,
                           parentId: newParentId,
                           title: item.title,
+                description: item.description,
                           priority: item.priority,
                           status: item.status,
                           submitter: item.submitter,
                           planStartAt: item.planStartAt,
                           planEndAt: item.planEndAt,
-                          wbsId: item.wbsId,
+                          wbsId: wbsForWrite,
                         },
                       });
-                      idMap.set(item.oldId, existingFromDataId);
+                      registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                       imported++;
                     } else {
                       throw new Error(importRowFailureMessage(item, e3));
@@ -1577,11 +1731,12 @@ export async function importRequirementsCsv(
             } else if (isUnknownField(e, "devOwner") || isUnknownField(e, "testOwner")) {
               try {
                 await tx.requirement.update({
-                  where: { id: existingFromDataId },
+                  where: { id: existingId },
                   data: {
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     taskProgress: item.taskProgress,
                     latestProgress: item.latestProgress,
                     priority: item.priority,
@@ -1590,20 +1745,21 @@ export async function importRequirementsCsv(
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
                     dataId: item.dataId,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                 });
-                idMap.set(item.oldId, existingFromDataId);
+                registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                 imported++;
               } catch (e2) {
                 if (isUnknownField(e2, "dataId")) {
                   try {
                     await tx.requirement.update({
-                      where: { id: existingFromDataId },
+                      where: { id: existingId },
                       data: {
                         iterationId: iter,
                         parentId: newParentId,
                         title: item.title,
+                description: item.description,
                         taskProgress: item.taskProgress,
                         latestProgress: item.latestProgress,
                         priority: item.priority,
@@ -1611,10 +1767,10 @@ export async function importRequirementsCsv(
                         submitter: item.submitter,
                         planStartAt: item.planStartAt,
                         planEndAt: item.planEndAt,
-                        wbsId: item.wbsId,
+                        wbsId: wbsForWrite,
                       },
                     });
-                    idMap.set(item.oldId, existingFromDataId);
+                    registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                     imported++;
                   } catch (e3) {
                     if (
@@ -1622,20 +1778,21 @@ export async function importRequirementsCsv(
                       isUnknownField(e3, "latestProgress")
                     ) {
                       await tx.requirement.update({
-                        where: { id: existingFromDataId },
+                        where: { id: existingId },
                         data: {
                           iterationId: iter,
                           parentId: newParentId,
                           title: item.title,
+                description: item.description,
                           priority: item.priority,
                           status: item.status,
                           submitter: item.submitter,
                           planStartAt: item.planStartAt,
                           planEndAt: item.planEndAt,
-                          wbsId: item.wbsId,
+                          wbsId: wbsForWrite,
                         },
                       });
-                      idMap.set(item.oldId, existingFromDataId);
+                      registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                       imported++;
                     } else {
                       throw new Error(importRowFailureMessage(item, e3));
@@ -1646,20 +1803,21 @@ export async function importRequirementsCsv(
                   isUnknownField(e2, "latestProgress")
                 ) {
                   await tx.requirement.update({
-                    where: { id: existingFromDataId },
+                    where: { id: existingId },
                     data: {
                       iterationId: iter,
                       parentId: newParentId,
                       title: item.title,
+                description: item.description,
                       priority: item.priority,
                       status: item.status,
                       submitter: item.submitter,
                       planStartAt: item.planStartAt,
                       planEndAt: item.planEndAt,
-                      wbsId: item.wbsId,
+                      wbsId: wbsForWrite,
                     },
                   });
-                  idMap.set(item.oldId, existingFromDataId);
+                  registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                   imported++;
                 } else {
                   throw new Error(importRowFailureMessage(item, e2));
@@ -1671,11 +1829,12 @@ export async function importRequirementsCsv(
             ) {
               try {
                 await tx.requirement.update({
-                  where: { id: existingFromDataId },
+                  where: { id: existingId },
                   data: {
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     priority: item.priority,
                     status: item.status,
                     submitter: item.submitter,
@@ -1684,20 +1843,21 @@ export async function importRequirementsCsv(
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
                     dataId: item.dataId,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                 });
-                idMap.set(item.oldId, existingFromDataId);
+                registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                 imported++;
               } catch (e2) {
                 if (isUnknownField(e2, "dataId")) {
                   try {
                     await tx.requirement.update({
-                      where: { id: existingFromDataId },
+                      where: { id: existingId },
                       data: {
                         iterationId: iter,
                         parentId: newParentId,
                         title: item.title,
+                description: item.description,
                         priority: item.priority,
                         status: item.status,
                         submitter: item.submitter,
@@ -1705,28 +1865,29 @@ export async function importRequirementsCsv(
                         testOwner: item.testOwner,
                         planStartAt: item.planStartAt,
                         planEndAt: item.planEndAt,
-                        wbsId: item.wbsId,
+                        wbsId: wbsForWrite,
                       },
                     });
-                    idMap.set(item.oldId, existingFromDataId);
+                    registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                     imported++;
                   } catch (e3) {
                     if (isUnknownField(e3, "devOwner") || isUnknownField(e3, "testOwner")) {
                       await tx.requirement.update({
-                        where: { id: existingFromDataId },
+                        where: { id: existingId },
                         data: {
                           iterationId: iter,
                           parentId: newParentId,
                           title: item.title,
+                description: item.description,
                           priority: item.priority,
                           status: item.status,
                           submitter: item.submitter,
                           planStartAt: item.planStartAt,
                           planEndAt: item.planEndAt,
-                          wbsId: item.wbsId,
+                          wbsId: wbsForWrite,
                         },
                       });
-                      idMap.set(item.oldId, existingFromDataId);
+                      registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                       imported++;
                     } else {
                       throw new Error(importRowFailureMessage(item, e3));
@@ -1734,20 +1895,21 @@ export async function importRequirementsCsv(
                   }
                 } else if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
                   await tx.requirement.update({
-                    where: { id: existingFromDataId },
+                    where: { id: existingId },
                     data: {
                       iterationId: iter,
                       parentId: newParentId,
                       title: item.title,
+                description: item.description,
                       priority: item.priority,
                       status: item.status,
                       submitter: item.submitter,
                       planStartAt: item.planStartAt,
                       planEndAt: item.planEndAt,
-                      wbsId: item.wbsId,
+                      wbsId: wbsForWrite,
                     },
                   });
-                  idMap.set(item.oldId, existingFromDataId);
+                  registerImportNodeInIdMap(idMap, item, existingId, wbsForWrite);
                   imported++;
                 } else {
                   throw new Error(importRowFailureMessage(item, e2));
@@ -1756,6 +1918,14 @@ export async function importRequirementsCsv(
             } else {
               throw new Error(importRowFailureMessage(item, e));
             }
+          }
+          const savedIdOnUpdate = idMap.get(item.oldId);
+          if (savedIdOnUpdate) {
+            await syncImportRequirementAttachments(
+              tx,
+              savedIdOnUpdate,
+              item.attachments,
+            );
           }
           continue;
         }
@@ -1771,6 +1941,7 @@ export async function importRequirementsCsv(
               iterationId: iter,
               parentId: newParentId,
               title: item.title,
+              description: item.description,
               taskProgress: item.taskProgress,
               latestProgress: item.latestProgress,
               priority: item.priority,
@@ -1782,11 +1953,11 @@ export async function importRequirementsCsv(
               planEndAt: item.planEndAt,
               sortOrder,
               dataId: item.dataId,
-              wbsId: item.wbsId,
+              wbsId: wbsForWrite,
             },
             select: { id: true },
           });
-          idMap.set(item.oldId, row.id);
+          registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
           imported++;
         } catch (e) {
           if (isUnknownField(e, "devOwner") || isUnknownField(e, "testOwner")) {
@@ -1796,6 +1967,7 @@ export async function importRequirementsCsv(
                   iterationId: iter,
                   parentId: newParentId,
                   title: item.title,
+                description: item.description,
                   taskProgress: item.taskProgress,
                   latestProgress: item.latestProgress,
                   priority: item.priority,
@@ -1805,11 +1977,11 @@ export async function importRequirementsCsv(
                   planEndAt: item.planEndAt,
                   sortOrder,
                   dataId: item.dataId,
-                  wbsId: item.wbsId,
+                  wbsId: wbsForWrite,
                 },
                 select: { id: true },
               });
-              idMap.set(item.oldId, row.id);
+              registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
               imported++;
             } catch (e2) {
               if (
@@ -1821,6 +1993,7 @@ export async function importRequirementsCsv(
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     priority: item.priority,
                     status: item.status,
                     submitter: item.submitter,
@@ -1828,11 +2001,11 @@ export async function importRequirementsCsv(
                     planEndAt: item.planEndAt,
                     sortOrder,
                     dataId: item.dataId,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                   select: { id: true },
                 });
-                idMap.set(item.oldId, row.id);
+                registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
                 imported++;
               } else {
                 throw new Error(importRowFailureMessage(item, e2));
@@ -1848,6 +2021,7 @@ export async function importRequirementsCsv(
                   iterationId: iter,
                   parentId: newParentId,
                   title: item.title,
+                description: item.description,
                   priority: item.priority,
                   status: item.status,
                   submitter: item.submitter,
@@ -1857,11 +2031,11 @@ export async function importRequirementsCsv(
                   planEndAt: item.planEndAt,
                   sortOrder,
                   dataId: item.dataId,
-                  wbsId: item.wbsId,
+                  wbsId: wbsForWrite,
                 },
                 select: { id: true },
               });
-              idMap.set(item.oldId, row.id);
+              registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
               imported++;
             } catch (e2) {
               if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
@@ -1870,6 +2044,7 @@ export async function importRequirementsCsv(
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     priority: item.priority,
                     status: item.status,
                     submitter: item.submitter,
@@ -1877,11 +2052,11 @@ export async function importRequirementsCsv(
                     planEndAt: item.planEndAt,
                     sortOrder,
                     dataId: item.dataId,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                   select: { id: true },
                 });
-                idMap.set(item.oldId, row.id);
+                registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
                 imported++;
               } else {
                 throw new Error(importRowFailureMessage(item, e2));
@@ -1894,6 +2069,7 @@ export async function importRequirementsCsv(
                   iterationId: iter,
                   parentId: newParentId,
                   title: item.title,
+                description: item.description,
                   taskProgress: item.taskProgress,
                   latestProgress: item.latestProgress,
                   priority: item.priority,
@@ -1904,11 +2080,11 @@ export async function importRequirementsCsv(
                   planStartAt: item.planStartAt,
                   planEndAt: item.planEndAt,
                   sortOrder,
-                  wbsId: item.wbsId,
+                  wbsId: wbsForWrite,
                 },
                 select: { id: true },
               });
-              idMap.set(item.oldId, row.id);
+              registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
               imported++;
             } catch (e2) {
               if (isUnknownField(e2, "devOwner") || isUnknownField(e2, "testOwner")) {
@@ -1918,6 +2094,7 @@ export async function importRequirementsCsv(
                       iterationId: iter,
                       parentId: newParentId,
                       title: item.title,
+                description: item.description,
                       taskProgress: item.taskProgress,
                       latestProgress: item.latestProgress,
                       priority: item.priority,
@@ -1926,11 +2103,11 @@ export async function importRequirementsCsv(
                       planStartAt: item.planStartAt,
                       planEndAt: item.planEndAt,
                       sortOrder,
-                      wbsId: item.wbsId,
+                      wbsId: wbsForWrite,
                     },
                     select: { id: true },
                   });
-                  idMap.set(item.oldId, row.id);
+                  registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
                   imported++;
                 } catch (e3) {
                   if (
@@ -1942,17 +2119,18 @@ export async function importRequirementsCsv(
                         iterationId: iter,
                         parentId: newParentId,
                         title: item.title,
+                description: item.description,
                         priority: item.priority,
                         status: item.status,
                         submitter: item.submitter,
                         planStartAt: item.planStartAt,
                         planEndAt: item.planEndAt,
                         sortOrder,
-                        wbsId: item.wbsId,
+                        wbsId: wbsForWrite,
                       },
                       select: { id: true },
                     });
-                    idMap.set(item.oldId, row.id);
+                    registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
                     imported++;
                   } else {
                     throw new Error(importRowFailureMessage(item, e3));
@@ -1967,6 +2145,7 @@ export async function importRequirementsCsv(
                     iterationId: iter,
                     parentId: newParentId,
                     title: item.title,
+                description: item.description,
                     priority: item.priority,
                     status: item.status,
                     submitter: item.submitter,
@@ -1975,11 +2154,11 @@ export async function importRequirementsCsv(
                     planStartAt: item.planStartAt,
                     planEndAt: item.planEndAt,
                     sortOrder,
-                    wbsId: item.wbsId,
+                    wbsId: wbsForWrite,
                   },
                   select: { id: true },
                 });
-                idMap.set(item.oldId, row.id);
+                registerImportNodeInIdMap(idMap, item, row.id, wbsForWrite);
                 imported++;
               } else {
                 throw new Error(importRowFailureMessage(item, e2));
@@ -1988,6 +2167,14 @@ export async function importRequirementsCsv(
           } else {
             throw new Error(importRowFailureMessage(item, e));
           }
+        }
+        const savedIdOnCreate = idMap.get(item.oldId);
+        if (savedIdOnCreate) {
+          await syncImportRequirementAttachments(
+            tx,
+            savedIdOnCreate,
+            item.attachments,
+          );
         }
       }
     });

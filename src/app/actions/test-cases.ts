@@ -20,6 +20,57 @@ import {
 import { testCaseStatusLabel } from "@/lib/test-labels";
 import { prisma } from "@/lib/prisma";
 
+/** 历史目录无 productId 时归并到 Baseline 产品（若有），否则最早创建的产品 */
+export async function migrateLegacyTestCaseFolderProductIds(): Promise<void> {
+  try {
+    const orphanCount = await prisma.testCaseFolder.count({
+      where: { productId: null },
+    });
+    if (orphanCount === 0) return;
+    const baseline = await prisma.product.findFirst({
+      where: { isBaseline: true },
+      orderBy: { createdAt: "asc" },
+      select: { id: true },
+    });
+    const first =
+      baseline ??
+      (await prisma.product.findFirst({
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      }));
+    if (!first) return;
+    await prisma.testCaseFolder.updateMany({
+      where: { productId: null },
+      data: { productId: first.id },
+    });
+  } catch {
+    /* Client 未 regenerate 等 */
+  }
+}
+
+/**
+ * 解析「用例库」实际归属的产品 id：
+ * 若存在标记为 Baseline 的产品，则所有产品在用例库侧统一使用该产品的目录与用例；
+ * 否则沿用界面所选 productId（按产品隔离）。
+ */
+export async function resolveTestCaseLibraryProductId(
+  selectedProductId: string,
+): Promise<string> {
+  const trimmed = selectedProductId.trim();
+  try {
+    await migrateLegacyTestCaseFolderProductIds();
+    const baseline = await prisma.product.findFirst({
+      where: { isBaseline: true },
+      orderBy: { createdAt: "asc" },
+      select: { id: true },
+    });
+    if (baseline) return baseline.id;
+  } catch {
+    /* ignore */
+  }
+  return trimmed;
+}
+
 export type ActionResult = { ok?: true; error?: string };
 
 type TestCaseWithLinks = Prisma.TestCaseGetPayload<{
@@ -64,6 +115,352 @@ async function insertTestCaseDeletedMany(
       linkedExecTaskIds: r.executionTaskLinks.map((x) => x.executionTaskId),
     })),
   });
+}
+
+/** 删除整条用例前：将该用例下执行记录写入误删归档（与单条删除逻辑一致） */
+async function archiveExecRecordsBeforeCaseDelete(
+  tx: Prisma.TransactionClient,
+  testCaseIds: string[],
+): Promise<void> {
+  const ids = [...new Set(testCaseIds.filter(Boolean))];
+  if (ids.length === 0) return;
+  const records = await tx.executionTaskTestCaseExecRecord.findMany({
+    where: { testCaseId: { in: ids } },
+    select: {
+      id: true,
+      executionTaskId: true,
+      testCaseId: true,
+      executedAt: true,
+      status: true,
+      executor: true,
+      result: true,
+      images: true,
+      note: true,
+    },
+  });
+  if (records.length === 0) return;
+  await tx.executionTaskTestCaseExecRecordDeleted.createMany({
+    data: records.map((r) => ({
+      originalId: r.id,
+      executionTaskId: r.executionTaskId,
+      testCaseId: r.testCaseId,
+      executedAt: r.executedAt,
+      status: r.status,
+      executor: r.executor,
+      result: r.result,
+      images:
+        r.images === null || r.images === undefined
+          ? Prisma.JsonNull
+          : (r.images as Prisma.InputJsonValue),
+      note: r.note,
+    })),
+  });
+}
+
+/** 删除整条用例前：将该用例下操作记录写入误删归档 */
+async function archiveOpLogsBeforeCaseDelete(
+  tx: Prisma.TransactionClient,
+  testCaseIds: string[],
+): Promise<void> {
+  const ids = [...new Set(testCaseIds.filter(Boolean))];
+  if (ids.length === 0) return;
+  const logs = await tx.testCaseOpLog.findMany({
+    where: { testCaseId: { in: ids } },
+    select: {
+      id: true,
+      testCaseId: true,
+      action: true,
+      detail: true,
+      createdAt: true,
+    },
+  });
+  if (logs.length === 0) return;
+  await tx.testCaseOpLogDeleted.createMany({
+    data: logs.map((row) => ({
+      originalId: row.id,
+      testCaseId: row.testCaseId,
+      action: row.action,
+      detail: row.detail,
+      createdAt: row.createdAt,
+    })),
+  });
+}
+
+function jsonFieldToStringIds(v: unknown): string[] {
+  if (v == null) return [];
+  if (!Array.isArray(v)) return [];
+  return v.filter((x): x is string => typeof x === "string");
+}
+
+export type DeletedTestCaseArchiveRow = {
+  id: string;
+  originalId: string;
+  caseNo: string;
+  title: string;
+  folderId: string;
+  deletedAt: string;
+};
+
+/** 从误删归档恢复「删除整条用例」时写入的执行记录（需在 TestCase 已按 originalId 重建之后调用） */
+async function restoreArchivedExecRecordsForTestCase(
+  tx: Prisma.TransactionClient,
+  testCaseId: string,
+): Promise<void> {
+  const archived = await tx.executionTaskTestCaseExecRecordDeleted.findMany({
+    where: { testCaseId },
+  });
+  for (const arc of archived) {
+    const exists = await tx.executionTaskTestCaseExecRecord.findUnique({
+      where: { id: arc.originalId },
+      select: { id: true },
+    });
+    if (exists) {
+      await tx.executionTaskTestCaseExecRecordDeleted.delete({
+        where: { id: arc.id },
+      });
+      continue;
+    }
+    try {
+      await tx.executionTaskTestCaseExecRecord.create({
+        data: {
+          id: arc.originalId,
+          executionTaskId: arc.executionTaskId,
+          testCaseId: arc.testCaseId,
+          executedAt: arc.executedAt,
+          status: arc.status,
+          executor: arc.executor,
+          result: arc.result,
+          images:
+            arc.images === null || arc.images === undefined
+              ? Prisma.JsonNull
+              : (arc.images as Prisma.InputJsonValue),
+          note: arc.note,
+        },
+      });
+      await tx.executionTaskTestCaseExecRecordDeleted.delete({
+        where: { id: arc.id },
+      });
+    } catch {
+      /* 执行任务已删除等导致无法还原本条 */
+    }
+  }
+}
+
+/** 从误删归档恢复「删除整条用例」时写入的操作记录 */
+async function restoreArchivedOpLogsForTestCase(
+  tx: Prisma.TransactionClient,
+  testCaseId: string,
+): Promise<void> {
+  const archived = await tx.testCaseOpLogDeleted.findMany({
+    where: { testCaseId },
+    orderBy: { createdAt: "asc" },
+  });
+  for (const arc of archived) {
+    const exists = await tx.testCaseOpLog.findUnique({
+      where: { id: arc.originalId },
+      select: { id: true },
+    });
+    if (exists) {
+      await tx.testCaseOpLogDeleted.delete({ where: { id: arc.id } });
+      continue;
+    }
+    try {
+      await tx.testCaseOpLog.create({
+        data: {
+          id: arc.originalId,
+          testCaseId: arc.testCaseId,
+          action: arc.action,
+          detail: arc.detail,
+          createdAt: arc.createdAt,
+        },
+      });
+      await tx.testCaseOpLogDeleted.delete({ where: { id: arc.id } });
+    } catch {
+      /* 极少冲突 */
+    }
+  }
+}
+
+/** 列出删除归档（默认最多 500 条，按删除时间倒序） */
+export async function listDeletedTestCasesArchive(input?: {
+  /** 含当日 0 点起（由前端传入本地日起始的 ISO 字符串即可） */
+  deletedAfter?: string | null;
+}): Promise<{ rows: DeletedTestCaseArchiveRow[]; error?: string }> {
+  try {
+    const rawAfter = input?.deletedAfter?.trim();
+    const after = rawAfter ? new Date(rawAfter) : null;
+    const afterOk = after !== null && !Number.isNaN(after.getTime());
+    const rows = await prisma.testCaseDeleted.findMany({
+      where: afterOk ? { deletedAt: { gte: after! } } : undefined,
+      orderBy: { deletedAt: "desc" },
+      take: 500,
+      select: {
+        id: true,
+        originalId: true,
+        caseNo: true,
+        title: true,
+        folderId: true,
+        deletedAt: true,
+      },
+    });
+    return {
+      rows: rows.map((r) => ({
+        ...r,
+        deletedAt: r.deletedAt.toISOString(),
+      })),
+    };
+  } catch (e) {
+    return { rows: [], error: toUserActionError(e) };
+  }
+}
+
+/** 从 TestCaseDeleted 恢复用例并删除归档行；关联按归档 JSON 尽力重建（目标不存在则跳过） */
+export async function restoreTestCasesFromArchive(
+  archiveIds: string[],
+  options?: {
+    /** 归档中的 folderId 已不存在时，改用此目录（须存在） */
+    folderIdIfMissing?: string | null;
+  },
+): Promise<ActionResult & { restored?: number; notes?: string[] }> {
+  const uniq = [...new Set(archiveIds.map((x) => x.trim()).filter(Boolean))];
+  if (uniq.length === 0) return { error: "请选择要恢复的归档条目。" };
+
+  const fallbackFolderInput = options?.folderIdIfMissing?.trim() ?? "";
+
+  const notes: string[] = [];
+  let restored = 0;
+
+  for (const archiveId of uniq) {
+    try {
+      await prisma.$transaction(async (tx) => {
+        const row = await tx.testCaseDeleted.findUnique({
+          where: { id: archiveId },
+        });
+        if (!row) {
+          notes.push(`归档 id ${archiveId.slice(0, 8)}… 不存在或已恢复`);
+          throw new Error("__abort_tx");
+        }
+
+        const existsId = await tx.testCase.findUnique({
+          where: { id: row.originalId },
+          select: { id: true },
+        });
+        if (existsId) {
+          notes.push(`「${row.caseNo}」已在用例库中，跳过`);
+          throw new Error("__abort_tx");
+        }
+
+        const dupNo = await tx.testCase.findFirst({
+          where: { caseNo: row.caseNo },
+          select: { id: true },
+        });
+        if (dupNo) {
+          notes.push(`编号「${row.caseNo}」已被占用，无法恢复「${row.title}」`);
+          throw new Error("__abort_tx");
+        }
+
+        let resolvedFolderId = row.folderId;
+        const folderOk = await tx.testCaseFolder.findUnique({
+          where: { id: row.folderId },
+          select: { id: true },
+        });
+        if (!folderOk) {
+          if (!fallbackFolderInput) {
+            notes.push(`「${row.caseNo}」原目录已不存在，请在界面指定替代目录后重试`);
+            throw new Error("__abort_tx");
+          }
+          const fbOk = await tx.testCaseFolder.findUnique({
+            where: { id: fallbackFolderInput },
+            select: { id: true },
+          });
+          if (!fbOk) {
+            notes.push(`指定的替代目录不存在，无法恢复「${row.caseNo}」`);
+            throw new Error("__abort_tx");
+          }
+          resolvedFolderId = fallbackFolderInput;
+        }
+
+        await tx.testCase.create({
+          data: {
+            id: row.originalId,
+            caseNo: row.caseNo,
+            title: row.title,
+            testPlan: row.testPlan,
+            iterationCode: row.iterationCode,
+            folderId: resolvedFolderId,
+            priority: row.priority,
+            maintainer: row.maintainer,
+            status: row.status,
+            precondition: row.precondition,
+            operationSteps: row.operationSteps,
+            caseActualResult: row.caseActualResult,
+            caseRemark: row.caseRemark,
+            submitter: row.submitter,
+            submittedAt: row.submittedAt,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+          },
+        });
+
+        for (const testDesignId of jsonFieldToStringIds(row.linkedTestDesignIds)) {
+          try {
+            await tx.testDesignTestCase.create({
+              data: { testDesignId, testCaseId: row.originalId },
+            });
+          } catch {
+            /* 测试设计已删除等 */
+          }
+        }
+        for (const defectId of jsonFieldToStringIds(row.linkedDefectIds)) {
+          try {
+            await tx.defectTestCase.create({
+              data: { defectId, testCaseId: row.originalId },
+            });
+          } catch {
+            /* 缺陷已删除等 */
+          }
+        }
+        for (const executionTaskId of jsonFieldToStringIds(
+          row.linkedExecTaskIds,
+        )) {
+          try {
+            await tx.executionTaskTestCase.create({
+              data: { executionTaskId, testCaseId: row.originalId },
+            });
+          } catch {
+            /* 执行任务已删除等 */
+          }
+        }
+
+        await restoreArchivedExecRecordsForTestCase(tx, row.originalId);
+        await restoreArchivedOpLogsForTestCase(tx, row.originalId);
+
+        await tx.testCaseDeleted.delete({ where: { id: row.id } });
+      });
+      restored += 1;
+    } catch (e) {
+      if (e instanceof Error && e.message === "__abort_tx") continue;
+      notes.push(
+        `${archiveId.slice(0, 8)}…：${toUserActionError(e)}`,
+      );
+    }
+  }
+
+  if (restored === 0) {
+    const hint =
+      notes.length > 0
+        ? notes.slice(0, 6).join("；") + (notes.length > 6 ? "…" : "")
+        : "未恢复任何条目。";
+    return { error: hint };
+  }
+
+  revalidatePath("/test-cases");
+  revalidatePath("/executions");
+  return {
+    ok: true,
+    restored,
+    notes: notes.length > 0 ? notes : undefined,
+  };
 }
 
 const DEFECT_STATUS_ZH: Record<string, string> = {
@@ -392,14 +789,17 @@ export type TestCaseFolderFlat = {
   sortOrder: number;
 };
 
-export async function listFoldersFlat(): Promise<TestCaseFolderFlat[]> {
+export async function listFoldersFlat(productId: string): Promise<TestCaseFolderFlat[]> {
+  const pid = await resolveTestCaseLibraryProductId(productId);
+  if (!pid) return [];
   let folders = await prisma.testCaseFolder.findMany({
+    where: { productId: pid },
     orderBy: [{ parentId: "asc" }, { sortOrder: "asc" }],
     select: { id: true, name: true, parentId: true, sortOrder: true },
   });
   if (folders.length === 0) {
     const root = await prisma.testCaseFolder.create({
-      data: { name: "根目录", parentId: null, sortOrder: 0 },
+      data: { name: "根目录", parentId: null, sortOrder: 0, productId: pid },
     });
     folders = [
       {
@@ -416,11 +816,15 @@ export async function listFoldersFlat(): Promise<TestCaseFolderFlat[]> {
 /** 各目录下用例数（含所有子孙目录），与 listTestCasesInFolder 的迭代筛选规则一致 */
 export async function countTestCasesByFolderSubtree(
   iterationCode?: string | null,
+  productId?: string | null,
 ): Promise<Record<string, number>> {
-  const flat = await listFoldersFlat();
-  const where: Prisma.TestCaseWhereInput = iterationCode
-    ? { iterationCode }
-    : {};
+  const pid = await resolveTestCaseLibraryProductId((productId ?? "").trim());
+  if (!pid) return {};
+  const flat = await listFoldersFlat(productId ?? "");
+  const where: Prisma.TestCaseWhereInput = {
+    ...(iterationCode ? { iterationCode } : {}),
+    folder: { productId: pid },
+  };
 
   const groups = await prisma.testCase.groupBy({
     by: ["folderId"],
@@ -435,9 +839,9 @@ export async function countTestCasesByFolderSubtree(
 
   const childrenByParent = new Map<string | null, string[]>();
   for (const f of flat) {
-    const pid = f.parentId;
-    if (!childrenByParent.has(pid)) childrenByParent.set(pid, []);
-    childrenByParent.get(pid)!.push(f.id);
+    const parentKey = f.parentId;
+    if (!childrenByParent.has(parentKey)) childrenByParent.set(parentKey, []);
+    childrenByParent.get(parentKey)!.push(f.id);
   }
 
   const memo = new Map<string, number>();
@@ -462,17 +866,36 @@ export async function countTestCasesByFolderSubtree(
 export async function createFolder(input: {
   name: string;
   parentId: string | null;
+  productId: string;
 }): Promise<ActionResult & { id?: string }> {
   const name = input.name.trim();
+  const pidIn = await resolveTestCaseLibraryProductId(input.productId);
   if (!name) return { error: "文件夹名称不能为空" };
+  if (!pidIn) return { error: "缺少产品信息，无法创建目录。" };
+
+  const parentId = input.parentId;
+  if (parentId) {
+    const par = await prisma.testCaseFolder.findUnique({
+      where: { id: parentId },
+      select: { productId: true },
+    });
+    if (!par?.productId) return { error: "父目录不存在。" };
+    if (par.productId !== pidIn) return { error: "父目录与当前所选产品不一致。" };
+  }
+
   const maxSort = await prisma.testCaseFolder.aggregate({
-    where: { parentId: input.parentId },
+    where: { parentId, productId: pidIn },
     _max: { sortOrder: true },
   });
   const sortOrder = (maxSort._max.sortOrder ?? 0) + 1;
   try {
     const row = await prisma.testCaseFolder.create({
-      data: { name, parentId: input.parentId, sortOrder },
+      data: {
+        name,
+        parentId,
+        sortOrder,
+        productId: pidIn,
+      },
     });
     revalidatePath("/test-cases");
     return { ok: true, id: row.id };
@@ -481,10 +904,21 @@ export async function createFolder(input: {
   }
 }
 
-export async function deleteFolder(folderId: string): Promise<ActionResult> {
+export async function deleteFolder(
+  folderId: string,
+  productId: string,
+): Promise<ActionResult> {
   const id = folderId.trim();
-  if (!id) return { error: "缺少文件夹 id。" };
+  const pid = await resolveTestCaseLibraryProductId(productId);
+  if (!id || !pid) return { error: "缺少文件夹或产品信息。" };
   try {
+    const row = await prisma.testCaseFolder.findUnique({
+      where: { id },
+      select: { productId: true },
+    });
+    if (!row || row.productId !== pid) {
+      return { error: "目录不存在或不属于当前产品。" };
+    }
     const subCount = await prisma.testCaseFolder.count({
       where: { parentId: id },
     });
@@ -506,13 +940,142 @@ export async function deleteFolder(folderId: string): Promise<ActionResult> {
 export async function renameFolder(
   folderId: string,
   name: string,
+  productId: string,
 ): Promise<ActionResult> {
   const n = name.trim();
+  const pid = await resolveTestCaseLibraryProductId(productId);
   if (!n) return { error: "文件夹名称不能为空" };
+  if (!pid) return { error: "缺少产品信息。" };
   try {
+    const row = await prisma.testCaseFolder.findUnique({
+      where: { id: folderId },
+      select: { productId: true },
+    });
+    if (!row || row.productId !== pid) {
+      return { error: "目录不存在或不属于当前产品。" };
+    }
     await prisma.testCaseFolder.update({
       where: { id: folderId },
       data: { name: n },
+    });
+    revalidatePath("/test-cases");
+    return { ok: true };
+  } catch (e) {
+    return { error: toUserActionError(e) };
+  }
+}
+
+/** 在同一父目录下调整文件夹顺序（仅平级，不改变父子关系） */
+export async function reorderTestCaseFolderSiblings(input: {
+  productId: string;
+  parentId: string | null;
+  orderedIds: string[];
+}): Promise<ActionResult> {
+  const libraryPid = await resolveTestCaseLibraryProductId(input.productId);
+  if (!libraryPid) return { error: "缺少产品信息。" };
+
+  const ordered = [
+    ...new Set(input.orderedIds.map((x) => x.trim()).filter(Boolean)),
+  ];
+  if (ordered.length === 0) return { error: "顺序无效。" };
+
+  const parentWhere =
+    input.parentId === null || input.parentId === ""
+      ? { parentId: null }
+      : { parentId: input.parentId };
+
+  const existing = await prisma.testCaseFolder.findMany({
+    where: {
+      productId: libraryPid,
+      ...parentWhere,
+    },
+    select: { id: true },
+  });
+  if (existing.length !== ordered.length) {
+    return { error: "目录列表已变化，请刷新页面后重试。" };
+  }
+  const setOk = new Set(existing.map((e) => e.id));
+  for (const id of ordered) {
+    if (!setOk.has(id)) {
+      return { error: "目录列表已变化，请刷新页面后重试。" };
+    }
+  }
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (let i = 0; i < ordered.length; i++) {
+        await tx.testCaseFolder.update({
+          where: { id: ordered[i]! },
+          data: { sortOrder: i + 1 },
+        });
+      }
+    });
+    revalidatePath("/test-cases");
+    return { ok: true };
+  } catch (e) {
+    return { error: toUserActionError(e) };
+  }
+}
+
+/** 跨层级移动目录（变更 parentId，插入为新父级下最后一个子目录） */
+export async function moveTestCaseFolder(input: {
+  folderId: string;
+  newParentId: string | null;
+  productId: string;
+}): Promise<ActionResult> {
+  const libraryPid = await resolveTestCaseLibraryProductId(input.productId);
+  if (!libraryPid) return { error: "缺少产品信息。" };
+
+  const fid = input.folderId.trim();
+  const rawParent = input.newParentId?.trim();
+  const newParentId = rawParent ? rawParent : null;
+  if (!fid) return { error: "缺少目录标识。" };
+
+  const folder = await prisma.testCaseFolder.findUnique({
+    where: { id: fid },
+    select: { id: true, productId: true, parentId: true },
+  });
+  if (!folder || folder.productId !== libraryPid) {
+    return { error: "目录不存在或无权操作。" };
+  }
+
+  if (newParentId) {
+    const par = await prisma.testCaseFolder.findUnique({
+      where: { id: newParentId },
+      select: { id: true, productId: true },
+    });
+    if (!par || par.productId !== libraryPid) {
+      return { error: "目标父目录不存在。" };
+    }
+    if (newParentId === fid) {
+      return { error: "不能将目录移动到自身之下。" };
+    }
+  }
+
+  const flat = await listFoldersFlat(input.productId);
+  const subtree = collectDescendantFolderIds(flat, fid);
+  if (newParentId && subtree.includes(newParentId)) {
+    return { error: "不能将目录移动到其子目录下。" };
+  }
+
+  const norm = (p: string | null | undefined) => p ?? null;
+  if (norm(folder.parentId) === norm(newParentId)) {
+    return { ok: true };
+  }
+
+  const maxSort = await prisma.testCaseFolder.aggregate({
+    where: {
+      productId: libraryPid,
+      ...(newParentId === null ? { parentId: null } : { parentId: newParentId }),
+    },
+    _max: { sortOrder: true },
+  });
+  const sortOrder = (maxSort._max.sortOrder ?? 0) + 1;
+
+  try {
+    await prisma.testCaseFolder.update({
+      where: { id: fid },
+      data: { parentId: newParentId, sortOrder },
     });
     revalidatePath("/test-cases");
     return { ok: true };
@@ -546,31 +1109,46 @@ export type TestCaseIdOption = {
   folderName?: string | null;
 };
 
-export async function listTestCaseIdOptions(): Promise<TestCaseIdOption[]> {
-  const db = prisma as unknown as {
-    testCase: { findMany: (args: unknown) => Promise<unknown[]> };
-  };
-  const rows = (await db.testCase.findMany({
-    orderBy: [{ updatedAt: "desc" }],
-    select: { id: true, caseNo: true, title: true },
-    take: 800,
-  })) as unknown as Array<{ id: string; caseNo: string; title: string }>;
-  return rows;
+export async function listTestCaseIdOptions(input?: {
+  productId?: string | null;
+}): Promise<TestCaseIdOption[]> {
+  const raw = input?.productId?.trim();
+  const pid = raw ? await resolveTestCaseLibraryProductId(raw) : "";
+  try {
+    await migrateLegacyTestCaseFolderProductIds();
+    const rows = await prisma.testCase.findMany({
+      where: pid ? { folder: { productId: pid } } : undefined,
+      orderBy: [{ updatedAt: "desc" }],
+      select: { id: true, caseNo: true, title: true },
+      take: 800,
+    });
+    return rows;
+  } catch {
+    return [];
+  }
 }
 
 export async function searchTestCaseIdOptions(input: {
   q?: string | null;
   iterationCode?: string | null;
   take?: number | null;
+  /** 按用例库归属产品过滤（与目录树隔离一致） */
+  productId?: string | null;
 }): Promise<TestCaseIdOption[]> {
   const q = (input.q ?? "").trim();
   const iterationCode = (input.iterationCode ?? "").trim();
+  const rawProductId = (input.productId ?? "").trim();
+  const productId = rawProductId
+    ? await resolveTestCaseLibraryProductId(rawProductId)
+    : "";
   const take = Math.max(1, Math.min(200, Number(input.take ?? 20) || 20));
 
   try {
+    await migrateLegacyTestCaseFolderProductIds();
     const rows = await prisma.testCase.findMany({
       where: {
         ...(iterationCode ? { iterationCode } : {}),
+        ...(productId ? { folder: { productId } } : {}),
         ...(q
           ? {
               OR: [
@@ -604,18 +1182,29 @@ export async function searchTestCaseIdOptions(input: {
 export async function listTestCasesInFolder(
   viewFolderId: string,
   iterationCode?: string | null,
+  productId?: string | null,
 ): Promise<TestCaseListItem[]> {
-  const flat = await listFoldersFlat();
+  const pid = await resolveTestCaseLibraryProductId((productId ?? "").trim());
+  if (!pid) return [];
+  await migrateLegacyTestCaseFolderProductIds();
+  const folderRow = await prisma.testCaseFolder.findUnique({
+    where: { id: viewFolderId.trim() },
+    select: { id: true, productId: true },
+  });
+  if (!folderRow || folderRow.productId !== pid) return [];
+
+  const flat = await listFoldersFlat((productId ?? "").trim());
   const scopeIds = collectDescendantFolderIds(flat, viewFolderId);
   const whereBase = {
     folderId: { in: scopeIds },
+    folder: { productId: pid },
     ...(iterationCode ? { iterationCode } : {}),
   } as const;
 
   // 兼容：如果历史数据里还存在旧状态值，先归一化到当前枚举
   try {
     await prisma.$executeRawUnsafe(
-      "UPDATE TestCase SET status = 'BLOCKED' WHERE status NOT IN ('PASSED','FAILED','BLOCKED','DEPRECATED')",
+      "UPDATE TestCase SET status = 'BLOCKED' WHERE status NOT IN ('PASSED','FAILED','BLOCKED','DEPRECATED','REQ_TRANSFER')",
     );
   } catch {
     // ignore
@@ -675,7 +1264,7 @@ export async function listTestCasesInFolder(
     } else if (isInvalidEnumValue(e)) {
       // 再次兜底归一化并重试一次
       await prisma.$executeRawUnsafe(
-        "UPDATE TestCase SET status = 'BLOCKED' WHERE status NOT IN ('PASSED','FAILED','BLOCKED','DEPRECATED')",
+        "UPDATE TestCase SET status = 'BLOCKED' WHERE status NOT IN ('PASSED','FAILED','BLOCKED','DEPRECATED','REQ_TRANSFER')",
       );
       const whereCompat = whereBase as unknown as Prisma.TestCaseWhereInput;
       rows = await prisma.testCase.findMany({
@@ -789,6 +1378,41 @@ export async function getTestCaseOpLogs(
     }));
   } catch {
     return [];
+  }
+}
+
+/** 删除单条操作记录：先写入误删归档表 */
+export async function deleteTestCaseOpLog(opLogId: string): Promise<ActionResult> {
+  const id = opLogId.trim();
+  if (!id) return { error: "无效记录" };
+  try {
+    await prisma.$transaction(async (tx) => {
+      const row = await tx.testCaseOpLog.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          testCaseId: true,
+          action: true,
+          detail: true,
+          createdAt: true,
+        },
+      });
+      if (!row) return;
+      await tx.testCaseOpLogDeleted.create({
+        data: {
+          originalId: row.id,
+          testCaseId: row.testCaseId,
+          action: row.action,
+          detail: row.detail,
+          createdAt: row.createdAt,
+        },
+      });
+      await tx.testCaseOpLog.delete({ where: { id } });
+    });
+    revalidatePath("/test-cases");
+    return { ok: true };
+  } catch (e) {
+    return { error: toUserActionError(e) };
   }
 }
 
@@ -1097,6 +1721,13 @@ export async function saveTestCase(input: TestCaseSaveInput): Promise<ActionResu
   if (!title) return { error: "用例名称不能为空" };
   if (!input.folderId) return { error: "请选择用例库文件夹" };
 
+  const folderProduct = await prisma.testCaseFolder.findUnique({
+    where: { id: input.folderId },
+    select: { productId: true },
+  });
+  const folderPid = folderProduct?.productId?.trim();
+  if (!folderPid) return { error: "所选目录无效或未归属产品。" };
+
   const priorityNorm =
     input.priority === null || input.priority === undefined
       ? null
@@ -1197,7 +1828,7 @@ export async function saveTestCase(input: TestCaseSaveInput): Promise<ActionResu
 
     if (savedId) {
       try {
-        const flat = await listFoldersFlat();
+        const flat = await listFoldersFlat(folderPid);
         const snapOpts = {
           title,
           priorityNorm,
@@ -1303,6 +1934,8 @@ export async function deleteTestCase(id: string): Promise<ActionResult> {
       });
       if (!row) return;
       await insertTestCaseDeletedMany(tx, [row]);
+      await archiveExecRecordsBeforeCaseDelete(tx, [id]);
+      await archiveOpLogsBeforeCaseDelete(tx, [id]);
       await tx.testCase.delete({ where: { id } });
     });
     revalidatePath("/test-cases");
@@ -1326,6 +1959,8 @@ export async function bulkDeleteTestCases(ids: string[]): Promise<ActionResult> 
         },
       });
       await insertTestCaseDeletedMany(tx, rows);
+      await archiveExecRecordsBeforeCaseDelete(tx, uniq);
+      await archiveOpLogsBeforeCaseDelete(tx, uniq);
       await tx.testCase.deleteMany({ where: { id: { in: uniq } } });
     });
     revalidatePath("/test-cases");
@@ -1338,19 +1973,77 @@ export async function bulkDeleteTestCases(ids: string[]): Promise<ActionResult> 
 export async function bulkMoveTestCases(
   ids: string[],
   targetFolderId: string,
+  productId: string,
 ): Promise<ActionResult> {
   const uniq = [...new Set(ids.filter(Boolean))];
   if (uniq.length === 0) return { error: "请先在列表中勾选用例" };
   if (!targetFolderId) return { error: "请选择目标文件夹" };
+  const pid = await resolveTestCaseLibraryProductId(productId);
+  if (!pid) return { error: "缺少产品信息" };
   try {
     const folder = await prisma.testCaseFolder.findUnique({
       where: { id: targetFolderId },
-      select: { id: true },
+      select: { id: true, productId: true },
     });
-    if (!folder) return { error: "目标文件夹不存在" };
+    if (!folder || folder.productId !== pid) {
+      return { error: "目标文件夹不存在或不属于当前产品" };
+    }
+    const caseRows = await prisma.testCase.findMany({
+      where: { id: { in: uniq } },
+      select: { id: true, folder: { select: { productId: true } } },
+    });
+    if (caseRows.length !== uniq.length) {
+      return { error: "部分用例不存在或已被删除" };
+    }
+    for (const c of caseRows) {
+      if (c.folder.productId !== pid) {
+        return { error: "只能移动当前产品用例库内的用例" };
+      }
+    }
     await prisma.testCase.updateMany({
       where: { id: { in: uniq } },
       data: { folderId: targetFolderId },
+    });
+    revalidatePath("/test-cases");
+    return { ok: true };
+  } catch (e) {
+    return { error: toUserActionError(e) };
+  }
+}
+
+/** 批量更新用例元数据；`updates` 仅包含需要写入的字段，`null` 表示清空该字段 */
+export async function bulkUpdateTestCasesMeta(input: {
+  ids: string[];
+  updates: {
+    status?: TestCaseStatus | null;
+    priority?: number | null;
+    maintainer?: string | null;
+    submitter?: string | null;
+  };
+}): Promise<ActionResult> {
+  const uniq = [...new Set(input.ids.filter(Boolean))];
+  if (uniq.length === 0) return { error: "请先在列表中勾选用例" };
+
+  const data: Prisma.TestCaseUpdateManyMutationInput = {};
+  const { updates } = input;
+  if ("status" in updates) data.status = updates.status;
+  if ("priority" in updates) {
+    data.priority =
+      updates.priority === null || updates.priority === undefined
+        ? null
+        : parseCaseLevelOrNull(updates.priority);
+  }
+  if ("maintainer" in updates) data.maintainer = updates.maintainer;
+  if ("submitter" in updates) data.submitter = updates.submitter;
+
+  if (Object.keys(data).length === 0) {
+    return { error: "请至少选择一项要修改的内容" };
+  }
+
+  try {
+    await prisma.testCase.updateMany({
+      where: { id: { in: uniq } },
+      data,
     });
     revalidatePath("/test-cases");
     return { ok: true };
@@ -1378,13 +2071,16 @@ export type TestCaseExportRow = {
 
 export async function getTestCasesExportRows(
   ids: string[],
+  productId: string,
 ): Promise<ActionResult & { rows?: TestCaseExportRow[] }> {
   const uniq = [...new Set(ids.filter(Boolean))];
   if (uniq.length === 0) return { error: "请先在列表中勾选要导出的用例" };
+  const pid = await resolveTestCaseLibraryProductId(productId);
+  if (!pid) return { error: "缺少产品信息" };
   try {
-    const flat = await listFoldersFlat();
+    const flat = await listFoldersFlat(productId);
     const list = await prisma.testCase.findMany({
-      where: { id: { in: uniq } },
+      where: { id: { in: uniq }, folder: { productId: pid } },
       select: {
         caseNo: true,
         title: true,
@@ -1402,6 +2098,9 @@ export async function getTestCasesExportRows(
         updatedAt: true,
       },
     });
+    if (list.length !== uniq.length) {
+      return { error: "存在无权导出的用例或数据已变化，请刷新后重试" };
+    }
     const rows: TestCaseExportRow[] = list.map((r) => ({
       caseNo: r.caseNo,
       title: r.title,

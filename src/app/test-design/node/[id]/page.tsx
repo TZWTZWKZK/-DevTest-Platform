@@ -19,7 +19,7 @@ export default async function TestDesignNodePage({
   if (!node) notFound();
 
   const [pickerCases, linkedIds, opLogs] = await Promise.all([
-    listTestCasesForPicker(600),
+    listTestCasesForPicker(node.requirement.iteration.productId, 600),
     getLinkedTestCaseIds(id),
     getTestDesignOpLogs(id, 12),
   ]);
@@ -35,9 +35,12 @@ export default async function TestDesignNodePage({
       />
       <TestDesignNodeDetailClient
         nodeId={node.id}
+        pickerProductId={node.requirement.iteration.productId}
         backToTreeContext={{
+          productId: requirement.iteration.productId,
           iterationCode: requirement.iteration.code,
           requirementId: requirement.id,
+          dirId: node.dirId,
         }}
         breadcrumb={breadcrumb}
         initialTitle={node.title}

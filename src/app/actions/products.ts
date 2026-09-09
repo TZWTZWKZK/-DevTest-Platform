@@ -68,6 +68,8 @@ export async function createProduct(
   const startDate = optDate(formData, "startDate");
   const endDate = optDate(formData, "endDate");
   const description = optString(formData, "description");
+  const isBaseline =
+    formData.get("isBaseline") === "true" || formData.get("isBaseline") === "on";
 
   if (!name) {
     return { error: "项目名称不能为空" };
@@ -82,20 +84,44 @@ export async function createProduct(
   }
 
   try {
-    await prisma.product.create({
-      data: {
-        name,
-        code,
-        level,
-        parentId: level === 1 ? null : parentIdRaw,
-        owner,
-        department,
-        teamMembers,
-        startDate,
-        endDate,
-        description,
-      },
-    });
+    if (isBaseline) {
+      await prisma.$transaction([
+        prisma.product.updateMany({
+          where: { isBaseline: true },
+          data: { isBaseline: false },
+        }),
+        prisma.product.create({
+          data: {
+            name,
+            code,
+            level,
+            parentId: level === 1 ? null : parentIdRaw,
+            owner,
+            department,
+            teamMembers,
+            startDate,
+            endDate,
+            description,
+            isBaseline: true,
+          },
+        }),
+      ]);
+    } else {
+      await prisma.product.create({
+        data: {
+          name,
+          code,
+          level,
+          parentId: level === 1 ? null : parentIdRaw,
+          owner,
+          department,
+          teamMembers,
+          startDate,
+          endDate,
+          description,
+        },
+      });
+    }
   } catch (e) {
     if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
       return { error: "项目编码已存在，请更换" };
@@ -122,6 +148,8 @@ export async function updateProduct(
   const startDate = optDate(formData, "startDate");
   const endDate = optDate(formData, "endDate");
   const description = optString(formData, "description");
+  const isBaseline =
+    formData.get("isBaseline") === "true" || formData.get("isBaseline") === "on";
 
   if (!id) {
     return { error: "缺少项目标识" };
@@ -143,21 +171,47 @@ export async function updateProduct(
   }
 
   try {
-    await prisma.product.update({
-      where: { id },
-      data: {
-        name,
-        code,
-        level,
-        parentId: level === 1 ? null : parentIdRaw,
-        owner,
-        department,
-        teamMembers,
-        startDate,
-        endDate,
-        description,
-      },
-    });
+    if (isBaseline) {
+      await prisma.$transaction([
+        prisma.product.updateMany({
+          where: { isBaseline: true },
+          data: { isBaseline: false },
+        }),
+        prisma.product.update({
+          where: { id },
+          data: {
+            name,
+            code,
+            level,
+            parentId: level === 1 ? null : parentIdRaw,
+            owner,
+            department,
+            teamMembers,
+            startDate,
+            endDate,
+            description,
+            isBaseline: true,
+          },
+        }),
+      ]);
+    } else {
+      await prisma.product.update({
+        where: { id },
+        data: {
+          name,
+          code,
+          level,
+          parentId: level === 1 ? null : parentIdRaw,
+          owner,
+          department,
+          teamMembers,
+          startDate,
+          endDate,
+          description,
+          isBaseline: false,
+        },
+      });
+    }
   } catch (e) {
     if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
       return { error: "项目编码已存在，请更换" };
@@ -180,16 +234,18 @@ export async function deleteProduct(productId: string): Promise<ProductActionSta
   return { ok: true };
 }
 
-export type ProductOption = { id: string; name: string; code: string | null };
+export type ProductOption = {
+  id: string;
+  name: string;
+  code: string | null;
+  isBaseline?: boolean;
+};
 
 export async function listProductOptions(): Promise<ProductOption[]> {
-  const db = prisma as unknown as {
-    product: { findMany: (args: unknown) => Promise<unknown[]> };
-  };
-  const rows = (await db.product.findMany({
+  const rows = await prisma.product.findMany({
     orderBy: [{ updatedAt: "desc" }],
-    select: { id: true, name: true, code: true },
+    select: { id: true, name: true, code: true, isBaseline: true },
     take: 500,
-  })) as unknown as Array<{ id: string; name: string; code: string | null }>;
+  });
   return rows;
 }

@@ -15,6 +15,7 @@ export const testCaseStatusLabel: Record<TestCaseStatus, string> = {
   FAILED: "失败",
   BLOCKED: "阻塞",
   DEPRECATED: "废弃",
+  REQ_TRANSFER: "转需求",
 };
 
 /** 列表中等徽章：描边 + 文字色（Tailwind） */
@@ -27,6 +28,15 @@ export const testCaseStatusBadgeClass: Record<TestCaseStatus, string> = {
     "border-amber-500/80 bg-amber-50 text-amber-900",
   DEPRECATED:
     "border-zinc-400 bg-zinc-100 text-zinc-600",
+  REQ_TRANSFER:
+    "border-violet-500/80 bg-violet-50 text-violet-800",
+};
+
+/** 下拉选项文字色（原生 option 对部分浏览器生效） */
+export const testCaseStatusSelectOptionStyle: Partial<
+  Record<TestCaseStatus, { color: string }>
+> = {
+  REQ_TRANSFER: { color: "#7c3aed" },
 };
 
 export const testCaseStatusOptions = Object.entries(testCaseStatusLabel).map(

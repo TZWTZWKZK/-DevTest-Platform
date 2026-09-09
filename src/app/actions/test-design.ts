@@ -3,6 +3,10 @@
 import { randomUUID } from "node:crypto";
 import { type Prisma, type RequirementStatus, type TestDesignType } from "@prisma/client";
 import { revalidatePath } from "next/cache";
+import {
+  migrateLegacyTestCaseFolderProductIds,
+  resolveTestCaseLibraryProductId,
+} from "@/app/actions/test-cases";
 import { prisma } from "@/lib/prisma";
 import {
   formatCaseLevelOpLog,
@@ -1032,18 +1036,41 @@ export async function bulkUpdateTestDesignNodes(input: {
 export async function bulkImportDesignsToTestCases(input: {
   testDesignIds: string[];
   folderId: string;
-}): Promise<ActionResult> {
+  /** 与用例库当前所选产品一致时校验目标目录归属 */
+  productId?: string | null;
+}): Promise<
+  ActionResult & {
+    imported?: number;
+    skippedDuplicates?: number;
+    skippedDuplicateDetails?: string[];
+  }
+> {
   const ids = Array.from(
     new Set(input.testDesignIds.map((x) => x.trim()).filter(Boolean)),
   );
   const folderId = input.folderId.trim();
+  const productIdIn = (input.productId ?? "").trim();
   if (ids.length === 0) return { error: "请选择要导入的设计" };
   if (!folderId) return { error: "请选择用例库目标文件夹" };
+
+  const folderRow = await prisma.testCaseFolder.findUnique({
+    where: { id: folderId },
+    select: { id: true, productId: true },
+  });
+  if (!folderRow?.productId) return { error: "目标文件夹不存在或未归属产品。" };
+  if (productIdIn) {
+    const resolved = await resolveTestCaseLibraryProductId(productIdIn);
+    if (resolved && folderRow.productId !== resolved) {
+      return { error: "目标目录与当前用例库归属不一致。" };
+    }
+  }
 
   const stripTitleTag = (title: string): string => {
     const m = title.match(/^【[^】]+】\s*(.*)$/);
     return m ? m[1] ?? title : title;
   };
+  const normIterCode = (c: string | null | undefined) => (c ?? "").trim();
+  const normCaseTitle = (t: string) => stripTitleTag(t).trim();
 
   const loadDesigns = async (): Promise<
     Array<{
@@ -1129,13 +1156,45 @@ export async function bulkImportDesignsToTestCases(input: {
   };
 
   const designs = await loadDesigns();
-  for (const d of designs) {
+  const designById = new Map(designs.map((d) => [d.id, d]));
+  const orderedDesigns = ids
+    .map((id) => designById.get(id))
+    .filter((d): d is (typeof designs)[number] => d != null);
+
+  /** 同一产品下：迭代编码 + 用例标题（去目录标签、trim）唯一，与库内已有或本批已成功导入的冲突则跳过 */
+  const existingCases = await prisma.testCase.findMany({
+    where: { folder: { productId: folderRow.productId } },
+    select: { title: true, iterationCode: true },
+  });
+  const takenKeys = new Set<string>();
+  for (const row of existingCases) {
+    takenKeys.add(
+      `${normIterCode(row.iterationCode)}|${normCaseTitle(row.title)}`,
+    );
+  }
+
+  let imported = 0;
+  const skippedDuplicateDetails: string[] = [];
+
+  for (const d of orderedDesigns) {
+    const titleNorm = normCaseTitle(d.title);
+    const iterNorm = normIterCode(d.iterationCode);
+    const dupKey = `${iterNorm}|${titleNorm}`;
+    if (takenKeys.has(dupKey)) {
+      const iterLabel =
+        iterNorm === "" ? "baseline / 未填迭代" : iterNorm;
+      skippedDuplicateDetails.push(
+        `「${titleNorm || "（无标题）"}」 — ${iterLabel}（库内已存在同名或本批已导入）`,
+      );
+      continue;
+    }
+
     await prisma.$transaction(async (tx) => {
       const tempCaseNo = `__pending_${randomUUID()}`;
       const row = await tx.testCase.create({
         data: {
           caseNo: tempCaseNo,
-          title: stripTitleTag(d.title),
+          title: titleNorm,
           folderId,
           iterationCode: d.iterationCode ?? null,
           submitter: d.createdBy ?? null,
@@ -1168,10 +1227,28 @@ export async function bulkImportDesignsToTestCases(input: {
         },
       });
     });
+    takenKeys.add(dupKey);
+    imported++;
   }
+
+  const MAX_DETAIL_LINES = 35;
+  const skippedDuplicates = skippedDuplicateDetails.length;
+  const skippedDuplicateDetailsOut =
+    skippedDuplicates > MAX_DETAIL_LINES
+      ? [
+          ...skippedDuplicateDetails.slice(0, MAX_DETAIL_LINES),
+          `… 共 ${skippedDuplicates} 条因重名未导入（仅列出前 ${MAX_DETAIL_LINES} 条）`,
+        ]
+      : skippedDuplicateDetails;
+
   revalidatePath("/test-cases");
   revalidatePath("/test-design");
-  return { ok: true };
+  return {
+    ok: true,
+    imported,
+    skippedDuplicates,
+    skippedDuplicateDetails: skippedDuplicateDetailsOut,
+  };
 }
 
 export async function createTestDesignNode(input: {
@@ -1759,8 +1836,12 @@ export async function getTestDesignOpLogs(
   }
 }
 
-export async function listTestCasesForPicker(limit = 500) {
+export async function listTestCasesForPicker(productId: string, limit = 500) {
+  const pid = await resolveTestCaseLibraryProductId(productId);
+  if (!pid) return [];
+  await migrateLegacyTestCaseFolderProductIds();
   return prisma.testCase.findMany({
+    where: { folder: { productId: pid } },
     take: limit,
     orderBy: { updatedAt: "desc" },
     select: {

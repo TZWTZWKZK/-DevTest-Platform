@@ -16,6 +16,8 @@ export type ProductRow = {
   id: string;
   name: string;
   code: string | null;
+  /** 共享用例库（全库唯一） */
+  isBaseline: boolean;
   level: number;
   parentId: string | null;
   parentLabel: string | null;
@@ -193,6 +195,7 @@ export function ProductManagement({
               <thead className="border-b border-zinc-200 bg-zinc-50 text-xs font-medium text-zinc-500">
                 <tr>
                   <th className="whitespace-nowrap px-3 py-3">项目名称</th>
+                  <th className="whitespace-nowrap px-3 py-3">共享用例库</th>
                   <th className="whitespace-nowrap px-3 py-3">项目编码</th>
                   <th className="whitespace-nowrap px-3 py-3">项目层级</th>
                   <th className="whitespace-nowrap px-3 py-3">关联一级项目</th>
@@ -212,7 +215,7 @@ export function ProductManagement({
                 {products.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={12}
+                      colSpan={13}
                       className="px-4 py-12 text-center text-zinc-500"
                     >
                       暂无产品，请点击「新增产品」创建第一条记录。
@@ -223,6 +226,15 @@ export function ProductManagement({
                     <tr key={p.id} className="hover:bg-zinc-50/80">
                       <td className="whitespace-nowrap px-3 py-3 font-medium text-zinc-900">
                         {p.name}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-3 text-xs">
+                        {p.isBaseline ? (
+                          <span className="rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 font-medium text-amber-900">
+                            Baseline
+                          </span>
+                        ) : (
+                          <span className="text-zinc-400">—</span>
+                        )}
                       </td>
                       <td className="whitespace-nowrap px-3 py-3 font-mono text-xs text-zinc-500 tabular-nums">
                         {p.code ?? (
@@ -502,6 +514,27 @@ export function ProductManagement({
                     className={inputClass}
                     disabled={formBusy}
                   />
+                </div>
+
+                <div className="sm:col-span-2 rounded-lg border border-amber-200 bg-amber-50/90 px-3 py-2.5">
+                  <label className="flex cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      name="isBaseline"
+                      value="true"
+                      defaultChecked={editing?.isBaseline ?? false}
+                      disabled={formBusy}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-zinc-900">
+                        共享测试用例库（Baseline）
+                      </span>
+                      <span className="mt-0.5 block text-xs leading-snug text-zinc-600">
+                        全系统仅可指定一个。勾选后，所有产品在用例库中看到的目录与用例均归属本产品；切换「切换产品」仍浏览同一套库，仅影响迭代等筛选。
+                      </span>
+                    </span>
+                  </label>
                 </div>
 
                 <div className="sm:col-span-2">

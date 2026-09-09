@@ -13,7 +13,9 @@ const navItems = [
   { href: "/test-design", label: "测试设计" },
   { href: "/test-cases", label: "测试用例库" },
   { href: "/defects", label: "缺陷管理" },
+  { href: "/defect-analysis", label: "缺陷分析" },
   { href: "/executions", label: "执行任务" },
+  { href: "/executions/iteration-analysis", label: "迭代分析" },
 ] as const;
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -41,7 +43,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }, [collapsed]);
 
   const activeHref = useMemo(() => {
-    for (const item of navItems) {
+    const sorted = [...navItems].sort((a, b) => b.href.length - a.href.length);
+    for (const item of sorted) {
       const active =
         item.href === "/"
           ? pathname === "/"
@@ -79,10 +82,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
         <nav className="flex flex-1 flex-col gap-0.5 p-2" aria-label="导航菜单">
           {navItems.map((item) => {
-            const active =
-              item.href === "/"
-                ? pathname === "/"
-                : pathname === item.href || pathname.startsWith(`${item.href}/`);
+            const active = activeHref === item.href;
             return (
               <Link
                 key={item.href}

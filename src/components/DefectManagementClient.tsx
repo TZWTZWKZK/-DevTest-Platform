@@ -44,6 +44,7 @@ import {
   useDefectListColumns,
 } from "@/hooks/useDefectListColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 
 const statusLabel: Record<DefectStatus, string> = {
   UNASSIGNED: "未分配",
@@ -114,6 +115,15 @@ function newDescImageId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+/** 与「产品」分列展示时，迭代选项去掉「产品名 / 」前缀避免重复 */
+function iterationSelectShortLabel(o: { code: string; label: string }): string {
+  if (!o.code) return o.label;
+  const sep = " / ";
+  const i = o.label.indexOf(sep);
+  if (i >= 0) return o.label.slice(i + sep.length);
+  return o.label;
+}
+
 type Adv = {
   q: string;
   status: DefectStatus | "";
@@ -161,6 +171,7 @@ export function DefectManagementClient() {
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const selectAllFullVisibleRef = useRef<HTMLInputElement | null>(null);
   const addLinkSelectAllRef = useRef<HTMLInputElement | null>(null);
   const [batchWorking, setBatchWorking] = useState(false);
 
@@ -189,6 +200,7 @@ export function DefectManagementClient() {
         : iterationOptions,
     [iterationOptions, productId],
   );
+
   const iterationLabelByCode = useMemo(() => {
     const m = new Map<string, string>();
     for (const it of iterationOptions) m.set(it.code, it.label);
@@ -212,9 +224,23 @@ export function DefectManagementClient() {
   const [addLinkSelectedIds, setAddLinkSelectedIds] = useState<string[]>([]);
   const [addLinkPanelOpen, setAddLinkPanelOpen] = useState(false);
   const [addLinkQuery, setAddLinkQuery] = useState("");
+  /** 添加关联用例弹层内：与列表「产品」可独立选择 */
+  const [addLinkProductId, setAddLinkProductId] = useState("");
   const [addLinkIterCode, setAddLinkIterCode] = useState("");
   const [addLinkResults, setAddLinkResults] = useState<TestCaseIdOption[]>([]);
   const [addLinkLoading, setAddLinkLoading] = useState(false);
+
+  /** 添加关联用例：选中具体产品时只显示该产品下的迭代；选「全部产品」时列出全部（含产品前缀） */
+  const addLinkIterationOptions = useMemo(() => {
+    const pid = addLinkProductId.trim();
+    if (!pid) {
+      return iterationOptions;
+    }
+    return iterationOptions.filter(
+      (o) => o.code === "" || (o.productId ?? "") === pid,
+    );
+  }, [addLinkProductId, iterationOptions]);
+
   const [createdAtIso, setCreatedAtIso] = useState<string | null>(null);
   const [lastUpdatedAtIso, setLastUpdatedAtIso] = useState<string | null>(null);
   const descRef = useRef<HTMLTextAreaElement | null>(null);
@@ -285,19 +311,33 @@ export function DefectManagementClient() {
   useEffect(() => {
     (async () => {
       try {
-        const [ps, cs, its] = await Promise.all([
+        const [ps, its] = await Promise.all([
           listProductOptions(),
-          listTestCaseIdOptions(),
           listIterationCodeOptions(),
         ]);
         setProducts(ps);
-        setCaseOptions(cs);
         setIterationOptions(its);
       } catch {
         // ignore
       }
     })();
   }, []);
+
+  useEffect(() => {
+    const pid = productId.trim();
+    if (!pid) {
+      setCaseOptions([]);
+      return;
+    }
+    void (async () => {
+      try {
+        const cs = await listTestCaseIdOptions({ productId: pid });
+        setCaseOptions(cs);
+      } catch {
+        setCaseOptions([]);
+      }
+    })();
+  }, [productId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -333,21 +373,6 @@ export function DefectManagementClient() {
       setAdv((p) => ({ ...p, iterationCode: "" }));
     }
   }, [visibleIterationOptions, adv.iterationCode]);
-
-  useEffect(() => {
-    const el = selectAllRef.current;
-    if (!el) return;
-    if (selectedIds.length === 0) {
-      el.indeterminate = false;
-      el.checked = false;
-      return;
-    }
-    const all = rows.map((r) => r.id);
-    const set = new Set(selectedIds);
-    const allSelected = all.length > 0 && all.every((id) => set.has(id));
-    el.indeterminate = !allSelected;
-    el.checked = allSelected;
-  }, [rows, selectedIds]);
 
   const addLinkPickSet = useMemo(
     () => new Set(addLinkSelectedIds),
@@ -642,10 +667,12 @@ export function DefectManagementClient() {
     const t = window.setTimeout(async () => {
       setAddLinkLoading(true);
       try {
+        const rawPid = addLinkProductId.trim();
         const rows = await searchTestCaseIdOptions({
           q: addLinkQuery,
           iterationCode: addLinkIterCode || null,
           take: 20,
+          productId: rawPid !== "" ? rawPid : null,
         });
         setAddLinkResults(rows);
       } finally {
@@ -653,7 +680,7 @@ export function DefectManagementClient() {
       }
     }, 220);
     return () => window.clearTimeout(t);
-  }, [addLinkIterCode, addLinkPanelOpen, addLinkQuery]);
+  }, [addLinkIterCode, addLinkPanelOpen, addLinkProductId, addLinkQuery]);
 
   useEffect(() => {
     if (!addLinkPanelOpen) return;
@@ -747,6 +774,80 @@ export function DefectManagementClient() {
     defaultPageSize: 20,
     storageKey: "pm.pageSize.defects",
   });
+  const defectListPagedRowIdsRef = useRef<string[]>([]);
+  defectListPagedRowIdsRef.current = defectPager.pagedItems.map((r) => r.id);
+  const selectedIdsRef = useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
+  const { onRowCheckboxPointerDown, tableBodyRef: defectListTableBodyRef } =
+    useRowCheckboxBrushByIds({
+      pagedRowIdsRef: defectListPagedRowIdsRef,
+      selectedIdsRef,
+      setSelectedIds: setSelectedIds,
+    });
+
+  const allDefectListRowIds = useMemo(
+    () => visible.map((r) => r.id),
+    [visible],
+  );
+
+  useEffect(() => {
+    const el = selectAllRef.current;
+    if (!el) return;
+    if (selectedIds.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const pageIds = defectPager.pagedItems.map((r) => r.id);
+    const selectedSet = new Set(selectedIds);
+    const allPageSelected =
+      pageIds.length > 0 && pageIds.every((id) => selectedSet.has(id));
+    el.indeterminate = !allPageSelected;
+    el.checked = allPageSelected;
+  }, [defectPager.pagedItems, selectedIds]);
+
+  useEffect(() => {
+    const el = selectAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allDefectListRowIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAll =
+      selectedIds.length === ids.length &&
+      selectedIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => selectedIds.includes(id));
+    el.checked = exactAll;
+    el.indeterminate = someInList && !exactAll;
+  }, [allDefectListRowIds, selectedIds]);
+
+  const toggleDefectSelectPage = useCallback(() => {
+    const ids = defectPager.pagedItems.map((r) => r.id);
+    if (ids.length === 0) return;
+    setSelectedIds((prev) => {
+      const pageSet = new Set(ids);
+      const allOn = ids.every((id) => prev.includes(id));
+      return allOn
+        ? prev.filter((id) => !pageSet.has(id))
+        : [...new Set([...prev, ...ids])];
+    });
+  }, [defectPager.pagedItems]);
+
+  const toggleDefectSelectAllVisible = useCallback(() => {
+    const ids = allDefectListRowIds;
+    if (ids.length === 0) return;
+    setSelectedIds((prev) => {
+      const fullSet = new Set(ids);
+      const exact =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exact) return [];
+      return [...ids];
+    });
+  }, [allDefectListRowIds]);
 
   const startResizeCol = useCallback(
     (e: React.MouseEvent, key: DefectColumnKey) => {
@@ -770,7 +871,7 @@ export function DefectManagementClient() {
 
   /** 列宽总和 + 勾选列；避免 table-fixed 下“总宽大于列宽之和”时浏览器把多余宽度均摊，看起来拖不动 */
   const defectListTablePx = useMemo(() => {
-    const chk = 40;
+    const chk = 56;
     const sum =
       chk + cols.visibleOrdered.reduce((s, k) => s + cols.widthFor(k), 0);
     return Math.max(1100, sum);
@@ -1284,26 +1385,32 @@ export function DefectManagementClient() {
                     }}
                   >
                   <colgroup>
-                    <col style={{ width: 40 }} />
+                    <col style={{ width: 56 }} />
                     {cols.visibleOrdered.map((k) => (
                       <col key={k} style={{ width: cols.widthFor(k) }} />
                     ))}
                   </colgroup>
                   <thead className="border-b border-zinc-200 bg-zinc-50/80 text-xs text-zinc-500">
                     <tr>
-                      <th className="w-10 py-2.5 pr-2 text-left align-bottom font-medium">
-                        <input
-                          ref={selectAllRef}
-                          type="checkbox"
-                          className="h-4 w-4 rounded border-zinc-300"
-                          onChange={() => {
-                            const all = defectPager.pagedItems.map((r) => r.id);
-                            const set = new Set(selectedIds);
-                            const allSelected =
-                              all.length > 0 && all.every((id) => set.has(id));
-                            setSelectedIds(allSelected ? [] : all);
-                          }}
-                        />
+                      <th className="w-16 min-w-[4rem] py-2.5 pr-2 text-left align-bottom font-medium">
+                        <div className="flex items-end gap-1">
+                          <input
+                            ref={selectAllRef}
+                            type="checkbox"
+                            className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                            onChange={toggleDefectSelectPage}
+                            title="全选当前页（可与其它页已选合并）"
+                            aria-label="全选当前页"
+                          />
+                          <input
+                            ref={selectAllFullVisibleRef}
+                            type="checkbox"
+                            className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                            onChange={toggleDefectSelectAllVisible}
+                            title="全选列表：选中当前筛选下全部缺陷（与分页「/ 总数」一致）"
+                            aria-label="全选全部可见缺陷"
+                          />
+                        </div>
                       </th>
                       {cols.visibleOrdered.map((k, idx) => {
                         const w = cols.widthFor(k);
@@ -1328,28 +1435,38 @@ export function DefectManagementClient() {
                       })}
                     </tr>
                   </thead>
-                  <tbody>
+                  <tbody ref={defectListTableBodyRef}>
                     {defectPager.pagedItems.map((r) => (
                       <tr
                         key={r.id}
+                        data-pm-row-select={r.id}
                         className="group border-b border-zinc-100 hover:bg-zinc-50/70"
                         onClick={() => openEdit(r)}
                       >
                         <td
-                          className="w-10 py-2.5 pr-2 align-top"
+                          className="w-16 min-w-[4rem] py-2.5 pr-2 align-top"
                           onClick={(e) => e.stopPropagation()}
                         >
                           <input
                             type="checkbox"
                             className="mt-1 h-4 w-4 rounded border-zinc-300"
                             checked={selectedIds.includes(r.id)}
-                            onChange={() =>
+                            onChange={() => {}}
+                            onClick={(e) => e.preventDefault()}
+                            onPointerDown={(e) =>
+                              onRowCheckboxPointerDown(e, r.id)
+                            }
+                            onKeyDown={(e) => {
+                              if (e.key !== " " && e.key !== "Enter") return;
+                              e.preventDefault();
+                              e.stopPropagation();
                               setSelectedIds((prev) =>
                                 prev.includes(r.id)
                                   ? prev.filter((x) => x !== r.id)
                                   : [...prev, r.id],
-                              )
-                            }
+                              );
+                            }}
+                            title="按住并拖动经过多行可连续勾选"
                           />
                         </td>
                         {cols.visibleOrdered.map((k, idx) => {
@@ -1600,15 +1717,42 @@ export function DefectManagementClient() {
                                 className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
                                 value={addLinkQuery}
                                 onChange={(e) => setAddLinkQuery(e.target.value)}
-                                onFocus={() => setAddLinkPanelOpen(true)}
+                                onFocus={() => {
+                                  setAddLinkPanelOpen(true);
+                                  setAddLinkProductId((prev) => prev || productId);
+                                }}
                                 placeholder="搜索用例（编号/名称）"
                               />
                               {addLinkPanelOpen ? (
-                                <div className="absolute left-0 top-[calc(100%+6px)] z-30 w-[520px] max-w-[90vw] rounded-xl border border-zinc-200 bg-white p-2 shadow-xl">
+                                <div className="absolute left-0 top-[calc(100%+6px)] z-30 w-[min(560px,92vw)] max-w-[90vw] rounded-xl border border-zinc-200 bg-white p-2 shadow-xl">
                                   <div className="flex flex-wrap items-end gap-2">
-                                    <div className="min-w-[220px] flex-1">
+                                    <div className="min-w-[200px] flex-1">
                                       <label className="text-[11px] font-medium text-zinc-500">
-                                        迭代筛选
+                                        产品
+                                      </label>
+                                      <select
+                                        className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
+                                        value={addLinkProductId}
+                                        onChange={(e) => {
+                                          setAddLinkProductId(e.target.value);
+                                          setAddLinkIterCode("");
+                                        }}
+                                      >
+                                        <option value="">
+                                          全部产品（不按产品过滤）
+                                        </option>
+                                        {products.map((p) => (
+                                          <option key={p.id} value={p.id}>
+                                            {p.code
+                                              ? `${p.name}（${p.code}）`
+                                              : p.name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                    <div className="min-w-[200px] flex-1">
+                                      <label className="text-[11px] font-medium text-zinc-500">
+                                        迭代
                                       </label>
                                       <select
                                         className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
@@ -1617,12 +1761,14 @@ export function DefectManagementClient() {
                                           setAddLinkIterCode(e.target.value)
                                         }
                                       >
-                                        {visibleIterationOptions.map((o) => (
+                                        {addLinkIterationOptions.map((o) => (
                                           <option
                                             key={o.code || "__baseline__"}
                                             value={o.code}
                                           >
-                                            {o.label}
+                                            {addLinkProductId.trim() && o.code
+                                              ? iterationSelectShortLabel(o)
+                                              : o.label}
                                           </option>
                                         ))}
                                       </select>
@@ -1644,6 +1790,7 @@ export function DefectManagementClient() {
                                       type="button"
                                       className="rounded-lg border border-zinc-200 px-2.5 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
                                       onClick={() => {
+                                        setAddLinkProductId(productId);
                                         setAddLinkIterCode("");
                                         setAddLinkQuery("");
                                         setAddLinkSelectedIds([]);

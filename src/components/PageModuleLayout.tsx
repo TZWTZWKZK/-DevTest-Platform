@@ -17,9 +17,22 @@ export function ModulePageHeader({
 }
 
 /** 主工作区白底圆角卡片（与用例库外层一致） */
-export function ModuleWorkspaceCard({ children }: { children: ReactNode }) {
+export function ModuleWorkspaceCard({
+  children,
+  className = "",
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <div className="overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
+    <div
+      className={[
+        "overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm",
+        className,
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       {children}
     </div>
   );

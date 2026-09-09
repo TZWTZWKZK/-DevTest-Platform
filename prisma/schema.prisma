@@ -32,11 +32,15 @@ model Product {
   /// 结束时间
   endDate     DateTime?
   description String?     @db.Text
+  /// 共享测试用例库：标记为 true 时，所有产品在用例库中看到的目录与用例均归属本产品（全库仅此一个）
+  isBaseline  Boolean     @default(false)
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
-  iterations  Iteration[]
+  iterations      Iteration[]
+  testCaseFolders TestCaseFolder[]
 
   @@index([parentId])
+  @@index([isBaseline])
 }
 
 model Iteration {
@@ -54,9 +58,10 @@ model Iteration {
   productId      String
   product        Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
   requirements   Requirement[]
-  executionTasks ExecutionTask[]
-  testDesignDirs TestDesignDir[]
-  opLogs         IterationOpLog[]
+  executionTasks    ExecutionTask[]
+  iterationAnalysis IterationAnalysis?
+  testDesignDirs    TestDesignDir[]
+  opLogs            IterationOpLog[]
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
 
@@ -231,7 +236,7 @@ model TestDesignDir {
   @@unique([iterationId, type, parentId, name])
 }
 
-/// 用例库文件夹（目录树）
+/// 用例库文件夹（目录树；按产品隔离）
 model TestCaseFolder {
   id        String           @id @default(cuid())
   name      String
@@ -239,11 +244,15 @@ model TestCaseFolder {
   parent    TestCaseFolder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Cascade)
   children  TestCaseFolder[] @relation("FolderTree")
   sortOrder Int              @default(0)
+  /// 归属产品；与迭代等产品侧数据隔离
+  productId String?
+  product   Product?         @relation(fields: [productId], references: [id], onDelete: Restrict)
   testCases TestCase[]
   createdAt DateTime         @default(now())
   updatedAt DateTime         @updatedAt
 
   @@index([parentId])
+  @@index([productId])
 }
 
 model TestCase {
@@ -349,12 +358,59 @@ model TestCaseOpLog {
   @@index([createdAt])
 }
 
-/// 通过(绿) / 失败(红) / 阻塞(黄) / 废弃(灰)
+/// 误删归档：用例-缺陷关联（解除关联前写入）
+model DefectTestCaseDeleted {
+  id         String   @id @default(cuid())
+  defectId   String
+  testCaseId String
+  createdAt  DateTime
+  deletedAt  DateTime @default(now())
+
+  @@index([defectId])
+  @@index([testCaseId])
+  @@index([deletedAt])
+}
+
+/// 误删归档：执行任务内对用例的每次执行记录（移除导入等批量删除前写入）
+model ExecutionTaskTestCaseExecRecordDeleted {
+  id              String         @id @default(cuid())
+  originalId      String
+  executionTaskId String
+  testCaseId      String
+  executedAt      DateTime
+  status          TestCaseStatus
+  executor        String?
+  result          String?        @db.LongText
+  images          Json?
+  note            String?
+  deletedAt       DateTime       @default(now())
+
+  @@index([executionTaskId, testCaseId])
+  @@index([testCaseId])
+  @@index([deletedAt])
+}
+
+/// 误删归档：用例操作记录（单条删除前写入）
+model TestCaseOpLogDeleted {
+  id         String   @id @default(cuid())
+  originalId String
+  testCaseId String
+  action     String
+  detail     String?  @db.Text
+  createdAt  DateTime
+  deletedAt  DateTime @default(now())
+
+  @@index([testCaseId])
+  @@index([deletedAt])
+}
+
+/// 通过(绿) / 失败(红) / 阻塞(黄) / 废弃(灰) / 转需求(紫)
 enum TestCaseStatus {
   PASSED
   FAILED
   BLOCKED
   DEPRECATED
+  REQ_TRANSFER
 }
 
 /// 测试设计类型：功能、性能等
@@ -377,6 +433,7 @@ enum IterationStatus {
 enum RequirementStatus {
   UNASSIGNED
   IN_DEVELOPMENT
+  IN_RD
   PENDING_VERIFICATION
   CLOSED
 }
@@ -549,6 +606,21 @@ model ExecutionTaskTestCaseExecRecord {
   testCase      TestCase      @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
 
   @@index([executionTaskId, testCaseId, executedAt])
+}
+
+/// 迭代分析：研发流程优化 / 工具改进 / 质量提升（按迭代一份 JSON）
+model IterationAnalysis {
+  id          String    @id @default(cuid())
+  iterationId String    @unique
+  iteration   Iteration @relation(fields: [iterationId], references: [id], onDelete: Cascade)
+  content     String    @db.LongText
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([iterationId])
+  @@index([updatedAt])
 }
 
 /// 简易 UI 配置存储（无登录系统时按 key 全局存一份）

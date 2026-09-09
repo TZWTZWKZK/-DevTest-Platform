@@ -38,6 +38,7 @@ import {
   useRequirementTreeColumns,
 } from "@/hooks/useRequirementTreeColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 import {
   formatTaskProgressAsPercentIfNumeric,
   parseTaskProgressPercent,
@@ -51,6 +52,10 @@ import {
 } from "@/app/actions/executions";
 import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
+import {
+  requirementStatusBadgeClass,
+  requirementStatusLabel,
+} from "@/lib/requirement-status";
 import { beijingDatetimeLocalToIsoOrNull, formatIsoBeijing } from "@/lib/timezone-cn";
 import {
   isSortableRequirementColumn,
@@ -63,20 +68,6 @@ import { buildTree, type TreeNode } from "@/lib/tree";
 import * as XLSX from "xlsx";
 
 type Node = TreeNode<RequirementFlat>;
-
-const requirementStatusLabel = {
-  UNASSIGNED: "未分配",
-  IN_DEVELOPMENT: "开发中",
-  PENDING_VERIFICATION: "待验证",
-  CLOSED: "已上线",
-} as const;
-
-const requirementStatusBadgeClass = {
-  UNASSIGNED: "border-violet-500/80 bg-violet-50 text-violet-800",
-  IN_DEVELOPMENT: "border-red-500/80 bg-red-50 text-red-800",
-  PENDING_VERIFICATION: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
-  CLOSED: "border-blue-500/80 bg-blue-50 text-blue-800",
-} as const;
 
 type RequirementStatus = RequirementFlat["status"];
 
@@ -96,7 +87,7 @@ const DEFAULT_REQUIREMENT_DESCRIPTION_TEMPLATE = [
 /** 「1 天」按 24 小时窗口比较计划结束时间（与当前时间差） */
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-/** 整行浅色底：未分配 / 开发中且将逾期或≤1天 → 红；待验证 → 绿；已上线 → 蓝；开发中且距结束>1天 → 黄 */
+/** 整行浅色底：未分配 → 红；开发中/研发中 → 橙（临期≤1天 → 红）；待验证 → 绿；已上线 → 蓝 */
 function requirementRowSurfaceClass(
   status: RequirementStatus,
   planEndAt: string | null | undefined,
@@ -111,14 +102,14 @@ function requirementRowSurfaceClass(
   if (status === "UNASSIGNED") {
     return "bg-red-50/70 hover:bg-red-100/80";
   }
-  if (status === "IN_DEVELOPMENT") {
-    if (!planEndAt) return "";
-    const endMs = new Date(planEndAt).getTime();
-    if (Number.isNaN(endMs)) return "";
-    if (endMs - nowMs <= MS_PER_DAY) {
-      return "bg-red-50/70 hover:bg-red-100/80";
+  if (status === "IN_DEVELOPMENT" || status === "IN_RD") {
+    if (planEndAt) {
+      const endMs = new Date(planEndAt).getTime();
+      if (!Number.isNaN(endMs) && endMs - nowMs <= MS_PER_DAY) {
+        return "bg-red-50/70 hover:bg-red-100/80";
+      }
     }
-    return "bg-amber-50/70 hover:bg-amber-100/80";
+    return "bg-orange-50/70 hover:bg-orange-100/80";
   }
   return "";
 }
@@ -319,6 +310,10 @@ function parseRequirementImportTable(
         cellForImport(cells, headerIndex, "wbs_id") ||
         cellForImport(cells, headerIndex, "WBS编号"),
       任务名称: titleCellForImport(cells, headerIndex),
+      描述:
+        cellForImport(cells, headerIndex, "描述") ||
+        cellForImport(cells, headerIndex, "需求描述"),
+      相关附件: cellForImport(cells, headerIndex, "相关附件"),
       优先级: cellForImport(cells, headerIndex, "优先级"),
       状态: cellForImport(cells, headerIndex, "状态"),
       任务进度: prog.任务进度,
@@ -598,6 +593,7 @@ export function RequirementTreeClient({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [batchWorking, setBatchWorking] = useState(false);
   const selectAllRef = useRef<HTMLInputElement | null>(null);
+  const selectAllFullVisibleRef = useRef<HTMLInputElement | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
   const [moveModalOpen, setMoveModalOpen] = useState(false);
   const [moveTargetId, setMoveTargetId] = useState<string>("__root__");
@@ -811,6 +807,21 @@ export function RequirementTreeClient({
   });
   const pagedRows = reqPager.pagedItems;
   const pagedVisibleIds = useMemo(() => pagedRows.map((x) => x.n.id), [pagedRows]);
+  /** 与分页「显示 1–20 / 67」中分母一致：当前筛选+展开下全部可见行 */
+  const allVisibleRowIds = useMemo(
+    () => visibleRows.map(({ n }) => n.id),
+    [visibleRows],
+  );
+  const pagedReqPickRowIdsRef = useRef<string[]>([]);
+  pagedReqPickRowIdsRef.current = pagedVisibleIds;
+  const selectedIdsRef = useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
+  const { onRowCheckboxPointerDown, tableBodyRef: reqTreeTableBodyRef } =
+    useRowCheckboxBrushByIds({
+      pagedRowIdsRef: pagedReqPickRowIdsRef,
+      selectedIdsRef,
+      setSelectedIds: setSelectedIds,
+    });
 
   const focusScrollDoneRef = useRef<string | null>(null);
   useEffect(() => {
@@ -963,19 +974,32 @@ export function RequirementTreeClient({
     }
     const allIds = pagedVisibleIds;
     const selectedSet = new Set(selectedIds);
-    const allSelected = allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
+    const allSelected =
+      allIds.length > 0 && allIds.every((id) => selectedSet.has(id));
     el.indeterminate = !allSelected;
     el.checked = allSelected;
   }, [pagedVisibleIds, selectedIds]);
 
+  useEffect(() => {
+    const el = selectAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allVisibleRowIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAllVisible =
+      selectedIds.length === ids.length &&
+      selectedIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => selectedIds.includes(id));
+    el.checked = exactAllVisible;
+    el.indeterminate = someInList && !exactAllVisible;
+  }, [allVisibleRowIds, selectedIds]);
+
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((p) => ({ ...p, [id]: !(p[id] ?? true) }));
-  }, []);
-
-  const toggleSelectOne = useCallback((id: string) => {
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
   }, []);
 
   const toggleSelectAll = useCallback(() => {
@@ -989,6 +1013,20 @@ export function RequirementTreeClient({
         : Array.from(new Set([...prev, ...allIds]));
     });
   }, [pagedVisibleIds]);
+
+  /** 全部可见行（与分页栏「/ 总数」一致）；已全选则清空 */
+  const toggleSelectAllFullVisible = useCallback(() => {
+    const ids = allVisibleRowIds;
+    if (ids.length === 0) return;
+    setSelectedIds((prev) => {
+      const fullSet = new Set(ids);
+      const exactAllVisible =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exactAllVisible) return [];
+      return [...ids];
+    });
+  }, [allVisibleRowIds]);
 
   const runDuplicateAsChild = useCallback(
     async (id: string) => {
@@ -1122,7 +1160,7 @@ export function RequirementTreeClient({
       }
       if (
         !window.confirm(
-          `确定将 ${parsed.length} 行导入到当前迭代「${iterationLabel}」？若某行填写了 data_id 且与已有需求一致，将更新该条；其余行将新建。`,
+          `确定将 ${parsed.length} 行导入到当前迭代「${iterationLabel}」？表格 wbs_id 为空为根节点，不为空则挂到「父 data_id + 任务名称」对应节点下；库内 wbs_id 写入本行 data_id + 任务名称。`,
         )
       ) {
         return;
@@ -1167,23 +1205,39 @@ export function RequirementTreeClient({
       <tr
         key={n.id}
         data-requirement-row-id={n.id}
+        data-pm-row-select={n.id}
         className={[
           "group cursor-pointer border-b border-zinc-100",
           rowSurface || "hover:bg-zinc-50/70",
         ].join(" ")}
         onClick={() => router.push(`/requirements/node/${n.id}`)}
       >
-        <td className="w-12 py-2.5 pl-3 pr-2 align-top">
+        <td
+          className="w-16 min-w-[4rem] py-2.5 pl-3 pr-2 align-top"
+          onClick={(e) => e.stopPropagation()}
+        >
           <input
             type="checkbox"
             className="mt-1 h-4 w-4 rounded border-zinc-300"
             checked={selectedIds.includes(n.id)}
-            onChange={(e) => {
+            onChange={() => {}}
+            onClick={(e) => {
+              e.preventDefault();
               e.stopPropagation();
-              toggleSelectOne(n.id);
             }}
+            onPointerDown={(e) => onRowCheckboxPointerDown(e, n.id)}
+            onKeyDown={(e) => {
+              if (e.key !== " " && e.key !== "Enter") return;
+              e.preventDefault();
+              e.stopPropagation();
+              setSelectedIds((prev) =>
+                prev.includes(n.id)
+                  ? prev.filter((x) => x !== n.id)
+                  : [...prev, n.id],
+              );
+            }}
+            title="按住并拖动经过多行可连续勾选"
             aria-label={`选择需求：${n.title}`}
-            onClick={(e) => e.stopPropagation()}
           />
         </td>
         {visibleOrdered.map((k) => {
@@ -1837,14 +1891,25 @@ export function RequirementTreeClient({
                       <table className="min-w-[960px] table-fixed">
                         <thead className="sticky top-0 z-20 border-b border-zinc-200 bg-zinc-50 text-xs text-zinc-500 shadow-[0_1px_0_0_rgb(228_228_231)]">
                           <tr>
-                            <th className="w-12 py-2.5 pl-3 pr-2 text-left align-bottom font-medium">
-                              <input
-                                ref={selectAllRef}
-                                type="checkbox"
-                                className="h-4 w-4 rounded border-zinc-300"
-                                onChange={toggleSelectAll}
-                                aria-label="全选"
-                              />
+                            <th className="w-16 min-w-[4rem] py-2.5 pl-3 pr-2 text-left align-bottom font-medium">
+                              <div className="flex items-end gap-1">
+                                <input
+                                  ref={selectAllRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={toggleSelectAll}
+                                  title="全选当前页（可与其它页已选合并）"
+                                  aria-label="全选当前页"
+                                />
+                                <input
+                                  ref={selectAllFullVisibleRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={toggleSelectAllFullVisible}
+                                  title="全选列表：选中当前筛选下全部可见需求（与分页「/ 总数」一致），不含折叠子树"
+                                  aria-label="全选全部可见需求"
+                                />
+                              </div>
                             </th>
                           {visibleOrdered.map((k) => {
                             const w = colConfig.widths[k];
@@ -2490,7 +2555,7 @@ export function RequirementTreeClient({
                           })}
                         </tr>
                         </thead>
-                        <tbody>
+                        <tbody ref={reqTreeTableBodyRef}>
                           {pagedRows.map(({ n, depth }) => renderRow(n, depth))}
                         </tbody>
                       </table>

@@ -1,7 +1,17 @@
-import { Suspense } from "react";
+import type { TestDesignType } from "@prisma/client";
 import { listIterationCodeOptions } from "@/app/actions/iterations";
-import { ModulePageHeader } from "@/components/PageModuleLayout";
-import { TestDesignTreeClient } from "@/components/TestDesignTreeClient";
+import { listProductOptions } from "@/app/actions/products";
+import { TestDesignPageClient } from "@/components/TestDesignPageClient";
+import { testDesignTypeOptions } from "@/lib/test-labels";
+
+const TEST_DESIGN_TYPES = new Set(
+  testDesignTypeOptions.map((o) => o.value as TestDesignType),
+);
+
+function parseDesignType(v: string): TestDesignType | "" {
+  const t = v.trim() as TestDesignType;
+  return TEST_DESIGN_TYPES.has(t) ? t : "";
+}
 
 function firstQuery(v: string | string[] | undefined): string {
   if (typeof v === "string") return v;
@@ -14,30 +24,32 @@ export default async function TestDesignPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const iterations = await listIterationCodeOptions();
+  const [iterations, products] = await Promise.all([
+    listIterationCodeOptions(),
+    listProductOptions(),
+  ]);
   const sp = await searchParams;
   const icRaw = firstQuery(sp.iterationCode).trim();
   const rqRaw = firstQuery(sp.requirementId).trim();
+  const pidRaw = firstQuery(sp.productId).trim();
   const validCodes = new Set(iterations.map((it) => it.code));
+  const validProductIds = new Set(products.map((p) => p.id));
   const initialIterationCode =
     icRaw && validCodes.has(icRaw) ? icRaw : "";
   const initialRequirementId = rqRaw;
+  const initialProductId =
+    pidRaw && validProductIds.has(pidRaw) ? pidRaw : "";
+  const initialCategory = parseDesignType(firstQuery(sp.type));
+  const initialDirId = firstQuery(sp.dirId).trim();
 
   return (
-    <div className="p-8">
-      <ModulePageHeader
-        title="测试设计"
-        description="按需求维护树形测试设计；节点可进入详情并关联测试用例库中的用例。"
-      />
-      <Suspense
-        fallback={<p className="text-sm text-zinc-500">加载测试设计…</p>}
-      >
-        <TestDesignTreeClient
-          iterations={iterations}
-          initialIterationCode={initialIterationCode}
-          initialRequirementId={initialRequirementId}
-        />
-      </Suspense>
-    </div>
+    <TestDesignPageClient
+      iterations={iterations}
+      initialProductId={initialProductId}
+      initialIterationCode={initialIterationCode}
+      initialRequirementId={initialRequirementId}
+      initialCategory={initialCategory}
+      initialDirId={initialDirId}
+    />
   );
 }

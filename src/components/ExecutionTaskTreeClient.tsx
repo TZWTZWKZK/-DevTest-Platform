@@ -40,6 +40,7 @@ import {
   useExecutionTaskColumns,
 } from "@/hooks/useExecutionTaskColumns";
 import { usePagination } from "@/hooks/usePagination";
+import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 import { normalizeColumnOrder } from "@/lib/normalize-column-order";
 import { buildTree, type TreeNode } from "@/lib/tree";
 
@@ -257,6 +258,7 @@ export function ExecutionTaskTreeClient({
   const colPanelRef = useRef<HTMLDivElement | null>(null);
   const [pickedIds, setPickedIds] = useState<string[]>([]);
   const pickAllRef = useRef<HTMLInputElement | null>(null);
+  const pickAllFullVisibleRef = useRef<HTMLInputElement | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
   const [moveTargetIterId, setMoveTargetIterId] = useState("");
   const [taskRowMenu, setTaskRowMenu] = useState<TaskRowMenuState | null>(null);
@@ -446,7 +448,7 @@ export function ExecutionTaskTreeClient({
       }
       if (
         !window.confirm(
-          `确定删除任务「${title}」？仅允许删除无子任务、无已导入用例且无执行记录的任务。`,
+          `确定删除任务「${title}」？需无子任务且无已导入用例；删除后该任务下历史执行记录将一并删除。`,
         )
       ) {
         return;
@@ -492,11 +494,30 @@ export function ExecutionTaskTreeClient({
   });
   const pagedRows = rowPager.pagedItems;
   const pagedVisibleIds = useMemo(() => pagedRows.map((x) => x.n.id), [pagedRows]);
+  const allTaskVisibleRowIds = useMemo(
+    () => visibleRows.map(({ n }) => n.id),
+    [visibleRows],
+  );
+  const pagedTaskPickRowIdsRef = useRef<string[]>([]);
+  pagedTaskPickRowIdsRef.current = pagedVisibleIds;
+  const pickedIdsRef = useRef(pickedIds);
+  pickedIdsRef.current = pickedIds;
+  const { onRowCheckboxPointerDown, tableBodyRef: taskPickTableBodyRef } =
+    useRowCheckboxBrushByIds({
+      pagedRowIdsRef: pagedTaskPickRowIdsRef,
+      selectedIdsRef: pickedIdsRef,
+      setSelectedIds: setPickedIds,
+    });
   const pickedSet = useMemo(() => new Set(pickedIds), [pickedIds]);
 
   useEffect(() => {
     const el = pickAllRef.current;
     if (!el) return;
+    if (pickedIds.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
     if (pagedVisibleIds.length === 0) {
       el.indeterminate = false;
       el.checked = false;
@@ -507,11 +528,23 @@ export function ExecutionTaskTreeClient({
     el.checked = allSelected;
   }, [pagedVisibleIds, pickedIds.length, pickedSet]);
 
-  const togglePickOne = useCallback((id: string) => {
-    setPickedIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
-  }, []);
+  useEffect(() => {
+    const el = pickAllFullVisibleRef.current;
+    if (!el) return;
+    const ids = allTaskVisibleRowIds;
+    if (ids.length === 0) {
+      el.indeterminate = false;
+      el.checked = false;
+      return;
+    }
+    const fullSet = new Set(ids);
+    const exactAll =
+      pickedIds.length === ids.length &&
+      pickedIds.every((id) => fullSet.has(id));
+    const someInList = ids.some((id) => pickedIds.includes(id));
+    el.checked = exactAll;
+    el.indeterminate = someInList && !exactAll;
+  }, [allTaskVisibleRowIds, pickedIds]);
 
   const togglePickAll = useCallback(() => {
     if (pagedVisibleIds.length === 0) return;
@@ -522,6 +555,19 @@ export function ExecutionTaskTreeClient({
       return Array.from(new Set([...prev, ...pagedVisibleIds]));
     });
   }, [pagedVisibleIds]);
+
+  const togglePickAllFullVisible = useCallback(() => {
+    const ids = allTaskVisibleRowIds;
+    if (ids.length === 0) return;
+    setPickedIds((prev) => {
+      const fullSet = new Set(ids);
+      const exact =
+        prev.length === ids.length &&
+        prev.every((id) => fullSet.has(id));
+      if (exact) return [];
+      return [...ids];
+    });
+  }, [allTaskVisibleRowIds]);
 
   const toggleExpand = (id: string) => {
     setExpanded((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
@@ -571,7 +617,7 @@ export function ExecutionTaskTreeClient({
     }
     if (
       !window.confirm(
-        `确定删除已选 ${pickedIds.length} 项任务？仅允许删除「无子任务、无已导入用例、无执行记录」的任务；若仍有关联数据将被拒绝。`,
+        `确定删除已选 ${pickedIds.length} 项任务？需「无子任务、无已导入用例」；删除后各任务下历史执行记录将一并删除。`,
       )
     )
       return;
@@ -679,6 +725,7 @@ export function ExecutionTaskTreeClient({
     return (
       <tr
         key={n.id}
+        data-pm-row-select={n.id}
         className="cursor-pointer hover:bg-zinc-50/70"
         onClick={() => router.push(`/executions/task/${n.id}`)}
       >
@@ -687,11 +734,20 @@ export function ExecutionTaskTreeClient({
             type="checkbox"
             className="mt-0.5 h-4 w-4 rounded border-zinc-300"
             checked={pickedSet.has(n.id)}
-            onChange={(e) => {
+            onChange={() => {}}
+            onClick={(e) => e.preventDefault()}
+            onPointerDown={(e) => onRowCheckboxPointerDown(e, n.id)}
+            onKeyDown={(e) => {
+              if (e.key !== " " && e.key !== "Enter") return;
+              e.preventDefault();
               e.stopPropagation();
-              togglePickOne(n.id);
+              setPickedIds((prev) =>
+                prev.includes(n.id)
+                  ? prev.filter((x) => x !== n.id)
+                  : [...prev, n.id],
+              );
             }}
-            onClick={(e) => e.stopPropagation()}
+            title="按住并拖动经过多行可连续勾选"
             aria-label="选择该行"
           />
         </td>
@@ -766,7 +822,7 @@ export function ExecutionTaskTreeClient({
                 <td
                   key={k}
                   className="px-3 py-2 align-top text-xs text-zinc-600 tabular-nums"
-                  title="通过率：成功/用例总数。成功=该任务下该用例的最近一次执行状态为「成功」；括号为成功占比（四舍五入取整）。"
+                  title="通过率：成功/用例总数。成功=该任务下该用例最近一次执行状态为「通过」「废弃」或「转需求」；括号为成功占比（四舍五入取整）。"
                 >
                   {formatPassRate(n.passedCaseCount, n.linkedCaseCount)}
                 </td>
@@ -1127,24 +1183,38 @@ export function ExecutionTaskTreeClient({
                     ) : (
                       <table className="w-max min-w-[760px] table-fixed text-sm">
                         <colgroup>
-                          <col style={{ width: 44 }} />
+                          <col style={{ width: 60 }} />
                           {visibleOrdered.map((k) => (
                             <col key={k} style={{ width: widthFor(k) }} />
                           ))}
                         </colgroup>
                         <thead className="sticky top-0 z-[1] border-b border-zinc-100 bg-zinc-50 text-xs text-zinc-500">
                           <tr>
-                            <th className="px-3 py-2 text-left font-medium">
-                              <input
-                                ref={pickAllRef}
-                                type="checkbox"
-                                className="h-4 w-4 rounded border-zinc-300"
-                                onChange={(e) => {
-                                  e.stopPropagation();
-                                  togglePickAll();
-                                }}
-                                aria-label="全选（当前页）"
-                              />
+                            <th className="min-w-[3.75rem] px-2 py-2 text-left font-medium">
+                              <div className="flex items-end justify-start gap-1">
+                                <input
+                                  ref={pickAllRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={(e) => {
+                                    e.stopPropagation();
+                                    togglePickAll();
+                                  }}
+                                  title="全选当前页（可与其它页已选合并）"
+                                  aria-label="全选当前页"
+                                />
+                                <input
+                                  ref={pickAllFullVisibleRef}
+                                  type="checkbox"
+                                  className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                  onChange={(e) => {
+                                    e.stopPropagation();
+                                    togglePickAllFullVisible();
+                                  }}
+                                  title="全选列表：选中当前筛选下全部任务（与分页「/ 总数」一致）"
+                                  aria-label="全选全部可见任务"
+                                />
+                              </div>
                             </th>
                             {visibleOrdered.map((k) => {
                               const label = EXEC_TASK_COLUMN_LABELS[k];
@@ -1168,7 +1238,10 @@ export function ExecutionTaskTreeClient({
                             })}
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-zinc-100">
+                        <tbody
+                          ref={taskPickTableBodyRef}
+                          className="divide-y divide-zinc-100"
+                        >
                           {pagedRows.map(({ n, depth }) => renderRow(n, depth))}
                         </tbody>
                       </table>

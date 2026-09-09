@@ -14,6 +14,10 @@ import { RequirementPrioritySelect } from "@/components/RequirementPrioritySelec
 import { ModuleWorkspaceCard } from "@/components/PageModuleLayout";
 import { deriveRequirementStatusFromTaskProgress } from "@/lib/requirement-progress-status";
 import {
+  requirementStatusBadgeClass,
+  requirementStatusLabel,
+} from "@/lib/requirement-status";
+import {
   beijingDatetimeLocalToIsoOrNull,
   formatIsoBeijing,
   isoToBeijingDatetimeLocal,
@@ -30,20 +34,6 @@ function isoToDatetimeLocal(iso: string | null | undefined): string {
 function datetimeLocalToIsoOrNull(v: string): string | null {
   return beijingDatetimeLocalToIsoOrNull(v);
 }
-
-const requirementStatusLabel = {
-  UNASSIGNED: "未分配",
-  IN_DEVELOPMENT: "开发中",
-  PENDING_VERIFICATION: "待验证",
-  CLOSED: "已上线",
-} as const;
-
-const requirementStatusBadgeClass = {
-  UNASSIGNED: "border-violet-500/80 bg-violet-50 text-violet-800",
-  IN_DEVELOPMENT: "border-red-500/80 bg-red-50 text-red-800",
-  PENDING_VERIFICATION: "border-emerald-500/80 bg-emerald-50 text-emerald-800",
-  CLOSED: "border-blue-500/80 bg-blue-50 text-blue-800",
-} as const;
 
 export function RequirementNodeDetailClient({
   nodeId,
