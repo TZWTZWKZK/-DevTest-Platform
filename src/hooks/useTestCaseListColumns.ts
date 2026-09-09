@@ -144,7 +144,7 @@ export const TEST_CASE_EXPORT_COLUMN_LABELS: Record<
 > = {
   caseNo: "用例编号",
   title: "用例名称",
-  folderPath: "所在目录",
+  folderPath: "所在目录（导出时拆为一级/二级/…目录）",
   statusLabel: "状态",
   priority: "用例等级",
   maintainer: "维护人",

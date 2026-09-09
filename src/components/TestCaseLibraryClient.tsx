@@ -11,14 +11,15 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   bulkDeleteTestCases,
   bulkMoveTestCases,
   bulkUpdateTestCasesMeta,
-  countTestCasesByFolderSubtree,
   createFolder,
   deleteFolder,
   deleteTestCase,
@@ -29,6 +30,7 @@ import {
   listDefectsLinkedToTestCase,
   listDeletedTestCasesArchive,
   listFoldersFlat,
+  listTestCaseCountRows,
   listTestCasesInFolder,
   moveTestCaseFolder,
   renameFolder,
@@ -38,6 +40,7 @@ import {
   unlinkDefectFromTestCase,
   unlinkDefectsFromTestCaseBatch,
   type DefectLinkedToCaseRow,
+  type TestCaseCountRow,
   type TestCaseFolderFlat,
   type TestCaseListItem,
   type TestCaseOpLogRow,
@@ -48,6 +51,7 @@ import {
   addExecutionTaskCaseExecRecord,
   getGlobalIterationProductPreference,
   getGlobalTestCaseExecResultHeightPreference,
+  getGlobalTestCaseLibraryLayoutPreference,
   getGlobalTestCaseSidebarPreference,
   getExecutionTaskCaseResult,
   listDeletedTestCaseExecRecords,
@@ -56,6 +60,7 @@ import {
   restoreTestCaseExecRecordsFromArchive,
   saveGlobalTestCaseExecResultHeightPreference,
   saveGlobalIterationProductPreference,
+  saveGlobalTestCaseLibraryLayoutPreference,
   saveGlobalTestCaseSidebarPreference,
   saveExecutionTaskCaseResult,
   type DeletedTestCaseExecRecordRow,
@@ -80,6 +85,10 @@ import {
 } from "@/lib/test-labels";
 import { buildTree, type TreeNode } from "@/lib/tree";
 import {
+  buildTestCaseExportCsv,
+  downloadTestCaseExportCsv,
+} from "@/lib/test-case-export-csv";
+import {
   COLUMN_LABELS,
   DEFAULT_TEST_CASE_EXPORT_FIELDS,
   parseStoredTestCaseExportFields,
@@ -101,8 +110,10 @@ import { TableColumnResizeHandle } from "@/components/TableColumnResizeHandle";
 import { usePagination } from "@/hooks/usePagination";
 import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 
-/** 与测试设计「批量导入到用例库」共用 */
-const PENDING_TEST_DESIGN_IMPORT_STORAGE = "pm-pending-test-design-import";
+import {
+  clearPendingTestDesignImport,
+  readPendingTestDesignImport,
+} from "@/lib/pendingTestDesignImport";
 
 /** 拖到目录树顶部「移到顶层」占位 id（非真实文件夹） */
 const FOLDER_TREE_ROOT_DROP = "__folder_tree_root_drop__";
@@ -170,6 +181,9 @@ function formatTs(iso: string | null | undefined): string {
   }
 }
 
+const COLUMN_PANEL_WIDTH = 320;
+const COLUMN_PANEL_MAX_HEIGHT = 448;
+
 function clampMenuPosition(x: number, y: number, menuW: number, menuH: number) {
   const pad = 8;
   const maxX = typeof window !== "undefined" ? window.innerWidth - menuW - pad : x;
@@ -180,8 +194,197 @@ function clampMenuPosition(x: number, y: number, menuW: number, menuH: number) {
   };
 }
 
+const CASE_STATUS_FILTER_UNSET = "__UNSET__";
+
+const CASE_STATUS_HEADER_CHEVRON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E";
+
+const ALL_CASE_STATUS_FILTER_OPTIONS = [
+  { value: CASE_STATUS_FILTER_UNSET, label: "未填" },
+  ...(Object.keys(testCaseStatusLabel) as TestCaseStatus[]).map((s) => ({
+    value: s,
+    label: testCaseStatusLabel[s],
+  })),
+] as const;
+
+type CaseStatusFilterValue =
+  (typeof ALL_CASE_STATUS_FILTER_OPTIONS)[number]["value"];
+
+function caseStatusFilterSummary(
+  statusIn: CaseStatusFilterValue[],
+): string {
+  if (statusIn.length === 0) return "全部";
+  if (statusIn.length === 1) {
+    const only = statusIn[0]!;
+    if (only === CASE_STATUS_FILTER_UNSET) return "未填";
+    return testCaseStatusLabel[only] ?? only;
+  }
+  return `已选 ${statusIn.length} 项`;
+}
+
+type CaseListFilterRow = {
+  folderId: string;
+  status: TestCaseStatus | null;
+  priority: number | null;
+  maintainer: string | null;
+  submitter: string | null;
+  caseNo: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  folderPath?: string;
+};
+
+function applyCaseListFilters<T extends CaseListFilterRow>(
+  list: T[],
+  caseSearchQuery: string,
+  advFilter: {
+    statusIn: CaseStatusFilterValue[];
+    priorityText: string;
+    maintainer: string;
+    submitter: string;
+    folderPathContains: string;
+    createdFrom: string;
+    createdTo: string;
+    updatedFrom: string;
+    updatedTo: string;
+  },
+  folderPathOf: (c: T) => string,
+): T[] {
+  let out = list;
+  const q = caseSearchQuery.trim().toLowerCase();
+  if (q) {
+    out = out.filter(
+      (c) =>
+        c.caseNo.toLowerCase().includes(q) ||
+        c.title.toLowerCase().includes(q),
+    );
+  }
+  const f = advFilter;
+  if (f.statusIn.length > 0) {
+    const wantsUnset = f.statusIn.includes(CASE_STATUS_FILTER_UNSET);
+    const statusValues = f.statusIn.filter(
+      (s): s is TestCaseStatus => s !== CASE_STATUS_FILTER_UNSET,
+    );
+    out = out.filter((c) => {
+      const matchUnset = wantsUnset && c.status == null;
+      const matchStatus =
+        c.status != null && statusValues.includes(c.status);
+      return matchUnset || matchStatus;
+    });
+  }
+  if (f.priorityText.trim()) {
+    const raw = f.priorityText.trim();
+    const rawLow = raw.toLowerCase();
+    const m = rawLow.match(/^l?([0-4])$/);
+    const tier = m ? Number(m[1]) : null;
+    const n = Number.parseInt(raw, 10);
+    out = out.filter((c) => {
+      const disp = formatCaseLevelDisplay(c.priority).toLowerCase();
+      if (tier !== null) return c.priority === tier;
+      if (!Number.isNaN(n)) return c.priority === n;
+      return (
+        disp.includes(rawLow) || String(c.priority ?? "").includes(raw)
+      );
+    });
+  }
+  if (f.maintainer.trim()) {
+    const m = f.maintainer.trim().toLowerCase();
+    out = out.filter((c) =>
+      (c.maintainer ?? "").toLowerCase().includes(m),
+    );
+  }
+  if (f.submitter.trim()) {
+    const s = f.submitter.trim().toLowerCase();
+    out = out.filter((c) =>
+      (c.submitter ?? "").toLowerCase().includes(s),
+    );
+  }
+  if (f.folderPathContains.trim()) {
+    const p = f.folderPathContains.trim().toLowerCase();
+    out = out.filter((c) => folderPathOf(c).toLowerCase().includes(p));
+  }
+  const createFrom = dayBoundaryMs(f.createdFrom, false);
+  const createTo = dayBoundaryMs(f.createdTo, true);
+  if (createFrom !== null || createTo !== null) {
+    out = out.filter((c) =>
+      inSelectableDateRange(c.createdAt, createFrom, createTo),
+    );
+  }
+  const upFrom = dayBoundaryMs(f.updatedFrom, false);
+  const upTo = dayBoundaryMs(f.updatedTo, true);
+  if (upFrom !== null || upTo !== null) {
+    out = out.filter((c) =>
+      inSelectableDateRange(c.updatedAt, upFrom, upTo),
+    );
+  }
+  return out;
+}
+
+function hasActiveCaseListFilters(
+  caseSearchQuery: string,
+  advFilter: {
+    statusIn: CaseStatusFilterValue[];
+    priorityText: string;
+    maintainer: string;
+    submitter: string;
+    folderPathContains: string;
+    createdFrom: string;
+    createdTo: string;
+    updatedFrom: string;
+    updatedTo: string;
+  },
+): boolean {
+  if (caseSearchQuery.trim()) return true;
+  const f = advFilter;
+  return (
+    f.statusIn.length > 0 ||
+    f.priorityText.trim() !== "" ||
+    f.maintainer.trim() !== "" ||
+    f.submitter.trim() !== "" ||
+    f.folderPathContains.trim() !== "" ||
+    f.createdFrom !== "" ||
+    f.createdTo !== "" ||
+    f.updatedFrom !== "" ||
+    f.updatedTo !== ""
+  );
+}
+
+function computeFolderSubtreeCounts(
+  rows: Array<{ folderId: string }>,
+  flat: TestCaseFolderFlat[],
+): Record<string, number> {
+  const direct = new Map<string, number>();
+  for (const r of rows) {
+    direct.set(r.folderId, (direct.get(r.folderId) ?? 0) + 1);
+  }
+  const childrenByParent = new Map<string | null, string[]>();
+  for (const f of flat) {
+    const parentKey = f.parentId;
+    if (!childrenByParent.has(parentKey)) childrenByParent.set(parentKey, []);
+    childrenByParent.get(parentKey)!.push(f.id);
+  }
+  const memo = new Map<string, number>();
+  function subtree(id: string): number {
+    const hit = memo.get(id);
+    if (hit !== undefined) return hit;
+    let t = direct.get(id) ?? 0;
+    for (const c of childrenByParent.get(id) ?? []) {
+      t += subtree(c);
+    }
+    memo.set(id, t);
+    return t;
+  }
+  const out: Record<string, number> = {};
+  for (const f of flat) {
+    out[f.id] = subtree(f.id);
+  }
+  return out;
+}
+
 const DEFAULT_ADV_FILTER = {
-  status: "" as TestCaseStatus | "",
+  /** 空数组表示不过滤；`__UNSET__` 表示 status 为空 */
+  statusIn: [] as CaseStatusFilterValue[],
   priorityText: "",
   maintainer: "",
   submitter: "",
@@ -191,6 +394,7 @@ const DEFAULT_ADV_FILTER = {
   updatedFrom: "",
   updatedTo: "",
 };
+
 const MAX_PASTED_IMAGE_BYTES = 1_000_000;
 const PASTE_IMAGE_SCALE_STEPS = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4] as const;
 const EXEC_RESULT_TEXTAREA_MIN_HEIGHT = 120;
@@ -223,25 +427,6 @@ function inSelectableDateRange(
   if (fromMs !== null && t < fromMs) return false;
   if (toMs !== null && t > toMs) return false;
   return true;
-}
-
-function csvEscapeCell(val: string): string {
-  const s = String(val).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function buildTestCaseExportCsv(
-  rows: TestCaseExportRow[],
-  fields: readonly TestCaseExportColumnKey[],
-): string {
-  const headerLine = fields
-    .map((k) => csvEscapeCell(TEST_CASE_EXPORT_COLUMN_LABELS[k]))
-    .join(",");
-  const bodyLines = rows.map((row) =>
-    fields.map((k) => csvEscapeCell(row[k] ?? "")).join(","),
-  );
-  return `\uFEFF${[headerLine, ...bodyLines].join("\r\n")}`;
 }
 
 async function blobToDataUrl(blob: Blob): Promise<string> {
@@ -411,29 +596,92 @@ const FOLDER_SEARCH_FOOTER_DEFAULT_H = 148;
 /** 顶部「目录说明 + 筛选 + 导入提示」区默认高度（px）；下沿拖动可调，超出部分在区内滚动 */
 const FOLDER_UPPER_PANE_DEFAULT_H = 300;
 const FOLDER_UPPER_PANE_MIN_H = 100;
+const FOLDER_PANE_DEFAULT_W = 288;
+const FOLDER_PANE_MIN_W = 200;
+const FOLDER_PANE_MAX_W = 440;
+const FOLDER_PANE_RIGHT_MIN_W = 240;
+const FOLDER_PANE_LAYOUT_STORAGE_KEY = "pm-test-case-folder-pane-w-v1";
+
+function resolveFolderPaneMaxW(importPickerMode: boolean): number {
+  if (!importPickerMode) return FOLDER_PANE_MAX_W;
+  if (typeof window === "undefined") return Math.max(FOLDER_PANE_MAX_W, 960);
+  return Math.max(
+    FOLDER_PANE_MIN_W,
+    window.innerWidth - FOLDER_PANE_RIGHT_MIN_W,
+  );
+}
+
+function clampFolderPaneW(w: number, maxW = FOLDER_PANE_MAX_W): number {
+  if (!Number.isFinite(w)) return FOLDER_PANE_DEFAULT_W;
+  return Math.max(
+    FOLDER_PANE_MIN_W,
+    Math.min(maxW, Math.round(w)),
+  );
+}
+
+function LibraryShell({
+  picker,
+  children,
+}: {
+  picker: boolean;
+  children: ReactNode;
+}) {
+  if (picker) {
+    return (
+      <div className="flex h-full min-h-0 flex-col overflow-hidden lg:flex-row">
+        {children}
+      </div>
+    );
+  }
+  return (
+    <ModuleWorkspaceCard>
+      <div className="flex max-h-[calc(100dvh-11rem)] min-h-[70vh] flex-col overflow-hidden lg:flex-row">
+        {children}
+      </div>
+    </ModuleWorkspaceCard>
+  );
+}
 
 export function TestCaseLibraryClient({
   initialFolders,
   embedMode = false,
+  importPickerMode = false,
   embedProductId = null,
   openCaseId = null,
   onEmbedClose,
   onEmbedSaved,
   executionTaskId = null,
+  linkedCaseIds = [],
+  onImportCases,
+  onImportPickerClose,
 }: {
   initialFolders: TestCaseFolderFlat[];
   embedMode?: boolean;
+  /** 执行任务导入弹窗：展示完整用例库 UI，勾选用例导入 */
+  importPickerMode?: boolean;
   /** 嵌入执行任务页时锁定为迭代所属产品，目录树与该产品的用例库一致 */
   embedProductId?: string | null;
   openCaseId?: string | null;
   onEmbedClose?: () => void;
   onEmbedSaved?: () => void;
   executionTaskId?: string | null;
+  /** 导入选择器：已关联到当前任务的用例 id（不可重复勾选） */
+  linkedCaseIds?: string[];
+  onImportCases?: (ids: string[]) => void | Promise<void>;
+  onImportPickerClose?: () => void;
 }) {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const deepCaseId = embedMode ? null : searchParams.get("case");
-  const designImportFlag = embedMode ? null : searchParams.get("designImport");
+  const deepCaseId = embedMode || importPickerMode ? null : searchParams.get("case");
+  const designImportFlag =
+    embedMode || importPickerMode ? null : searchParams.get("designImport");
+  const showFullLibrary = !embedMode || importPickerMode;
+
+  const linkedCaseIdSet = useMemo(
+    () => new Set(linkedCaseIds.filter(Boolean)),
+    [linkedCaseIds],
+  );
+  const [importPickerWorking, setImportPickerWorking] = useState(false);
 
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(() => {
     const roots = buildTree(initialFolders);
@@ -443,9 +691,9 @@ export function TestCaseLibraryClient({
   const [products, setProducts] = useState<ProductOption[]>([]);
   const [productId, setProductId] = useState("");
   const effectiveProductId = useMemo(() => {
-    if (embedMode) return (embedProductId ?? "").trim();
+    if (embedMode || importPickerMode) return (embedProductId ?? "").trim();
     return productId.trim();
-  }, [embedMode, embedProductId, productId]);
+  }, [embedMode, importPickerMode, embedProductId, productId]);
   const productPrefHydratedRef = useRef(false);
   const [iterationOptions, setIterationOptions] = useState<
     { code: string; label: string; productId?: string | null }[]
@@ -453,9 +701,12 @@ export function TestCaseLibraryClient({
   const [cases, setCases] = useState<TestCaseListItem[]>([]);
   const [loadingCases, setLoadingCases] = useState(false);
   const [folders, setFolders] = useState(initialFolders);
-  const [folderSubtreeCounts, setFolderSubtreeCounts] = useState<
-    Record<string, number>
-  >({});
+  /** 当前产品下用于目录树计数的轻量用例（已按迭代筛选） */
+  const [countRows, setCountRows] = useState<TestCaseCountRow[]>([]);
+  /** 未按迭代筛选时的全量（仅在选择具体迭代时加载，用于目录旁 filtered/total） */
+  const [countRowsAllIteration, setCountRowsAllIteration] = useState<
+    TestCaseCountRow[] | null
+  >(null);
   const [folderDragId, setFolderDragId] = useState<string | null>(null);
   const [folderDragOverId, setFolderDragOverId] = useState<string | null>(null);
   /** 当前悬停行允许的投放含义（用于描边颜色）；同级时 Ctrl=仅排序，否则=放入其下 */
@@ -500,6 +751,8 @@ export function TestCaseLibraryClient({
   );
   const [execResultTextareaPrefReady, setExecResultTextareaPrefReady] = useState(false);
   const execRunStatusAtOpen = useRef<TestCaseStatus>("BLOCKED");
+  /** 打开弹窗时用例库中的状态（执行任务嵌入模式：表单未选状态时避免误清空库状态） */
+  const libraryStatusAtOpen = useRef<TestCaseStatus | null>(null);
   const [execRunImages, setExecRunImages] = useState<Array<{ id: string; dataUrl: string }>>(
     [],
   );
@@ -570,52 +823,88 @@ export function TestCaseLibraryClient({
   const [designImportBusy, setDesignImportBusy] = useState(false);
 
   const cancelPendingDesignImport = useCallback(() => {
-    try {
-      sessionStorage.removeItem(PENDING_TEST_DESIGN_IMPORT_STORAGE);
-    } catch {
-      /* ignore */
-    }
+    clearPendingTestDesignImport();
     setPendingDesignImportIds([]);
   }, []);
 
+  const hydratePendingDesignImport = useCallback(() => {
+    const pending = readPendingTestDesignImport();
+    if (!pending) return false;
+    setPendingDesignImportIds(pending.ids);
+    if (pending.productId) {
+      setProductId((prev) => (prev.trim() ? prev : pending.productId!));
+    }
+    return true;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (embedMode || importPickerMode) return;
+    hydratePendingDesignImport();
+  }, [embedMode, importPickerMode, hydratePendingDesignImport]);
+
+  const designImportEntryHandledRef = useRef(false);
+
   useEffect(() => {
     if (embedMode || designImportFlag !== "1") return;
-    let ids: string[] = [];
-    try {
-      const raw = sessionStorage.getItem(PENDING_TEST_DESIGN_IMPORT_STORAGE);
-      if (raw) {
-        const j = JSON.parse(raw) as { ids?: unknown; ts?: number };
-        const ts = typeof j.ts === "number" ? j.ts : 0;
-        if (Date.now() - ts > 86400000) {
-          sessionStorage.removeItem(PENDING_TEST_DESIGN_IMPORT_STORAGE);
-        } else if (Array.isArray(j.ids)) {
-          ids = j.ids.filter(
-            (x): x is string => typeof x === "string" && x.trim() !== "",
-          );
-        }
-      }
-    } catch {
-      try {
-        sessionStorage.removeItem(PENDING_TEST_DESIGN_IMPORT_STORAGE);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (ids.length > 0) {
-      setPendingDesignImportIds(ids);
-    } else {
+    if (designImportEntryHandledRef.current) return;
+    designImportEntryHandledRef.current = true;
+    const ok = hydratePendingDesignImport();
+    if (!ok) {
       showNotice(
         "无法导入",
         "未找到待导入的测试设计。请返回测试设计页勾选节点后，再点「批量导入到用例库」。",
       );
     }
     router.replace("/test-cases", { scroll: false });
-  }, [embedMode, designImportFlag, router, showNotice]);
+  }, [
+    embedMode,
+    designImportFlag,
+    hydratePendingDesignImport,
+    router,
+    showNotice,
+  ]);
 
   const [caseSearchQuery, setCaseSearchQuery] = useState("");
   const [advFilter, setAdvFilter] = useState({ ...DEFAULT_ADV_FILTER });
   const [advFilterOpen, setAdvFilterOpen] = useState(false);
+  const [statusHeaderFilterOpen, setStatusHeaderFilterOpen] = useState(false);
+  const statusHeaderFilterRef = useRef<HTMLDivElement | null>(null);
+
+  const toggleStatusInFilter = useCallback((value: CaseStatusFilterValue) => {
+    setAdvFilter((p) => {
+      const set = new Set(p.statusIn);
+      if (set.has(value)) set.delete(value);
+      else set.add(value);
+      return { ...p, statusIn: Array.from(set) };
+    });
+  }, []);
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
+  const importablePickCount = useMemo(
+    () => selectedCaseIds.filter((id) => !linkedCaseIdSet.has(id)).length,
+    [selectedCaseIds, linkedCaseIdSet],
+  );
+  const toggleCasePickForImport = useCallback(
+    (id: string) => {
+      if (importPickerMode && linkedCaseIdSet.has(id)) return;
+      setSelectedCaseIds((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+      );
+    },
+    [importPickerMode, linkedCaseIdSet],
+  );
+  const runImportPicker = useCallback(async () => {
+    const ids = selectedCaseIds.filter((id) => !linkedCaseIdSet.has(id));
+    if (ids.length === 0) {
+      showNotice("导入", "请先勾选要导入的用例（已导入本任务的不可选）。");
+      return;
+    }
+    setImportPickerWorking(true);
+    try {
+      await onImportCases?.(ids);
+    } finally {
+      setImportPickerWorking(false);
+    }
+  }, [linkedCaseIdSet, onImportCases, selectedCaseIds, showNotice]);
   const [moveModalOpen, setMoveModalOpen] = useState(false);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState<string>("");
   const [restoreArchiveOpen, setRestoreArchiveOpen] = useState(false);
@@ -672,6 +961,8 @@ export function TestCaseLibraryClient({
   const [sidebarPrefReady, setSidebarPrefReady] = useState(false);
   const [sidebarPrefResolved, setSidebarPrefResolved] = useState(false);
   const pendingPrefIterationCodeRef = useRef<string | null>(null);
+  const skipIterationPrefPersistRef = useRef(false);
+  const [productPrefHydrated, setProductPrefHydrated] = useState(false);
 
   const toggleFolderExpand = useCallback((folderId: string) => {
     setFolderExpandedById((prev) => {
@@ -691,31 +982,101 @@ export function TestCaseLibraryClient({
   } = useTestCaseListColumns();
   const [columnPanelOpen, setColumnPanelOpen] = useState(false);
   const columnPanelRef = useRef<HTMLDivElement | null>(null);
+  const columnPanelDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [columnPanelFixedPos, setColumnPanelFixedPos] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
   const resizeDrag = useRef<{
     key: DataColumnKey;
     startX: number;
     startW: number;
   } | null>(null);
 
-  const [folderPaneW, setFolderPaneW] = useState(288);
-  const startResizeFolderPane = useCallback(
-    (startX: number) => {
-      const startW = folderPaneW;
-      const onMove = (e: MouseEvent) => {
-        const dx = e.clientX - startX;
-        setFolderPaneW(
-          Math.max(200, Math.min(440, Math.round(startW + dx))),
-        );
-      };
-      const onUp = () => {
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-      };
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-    },
-    [folderPaneW],
-  );
+  const [folderPaneW, setFolderPaneW] = useState(FOLDER_PANE_DEFAULT_W);
+  const folderPaneWRef = useRef(FOLDER_PANE_DEFAULT_W);
+  const folderPaneLayoutHydratedRef = useRef(false);
+  const skipFolderPaneLayoutPersistRef = useRef(true);
+
+  useEffect(() => {
+    folderPaneWRef.current = folderPaneW;
+  }, [folderPaneW]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let localW = FOLDER_PANE_DEFAULT_W;
+      try {
+        const raw = localStorage.getItem(FOLDER_PANE_LAYOUT_STORAGE_KEY);
+        if (raw) {
+          const n = Number(JSON.parse(raw));
+          if (Number.isFinite(n)) localW = clampFolderPaneW(n);
+        }
+      } catch {
+        /* ignore */
+      }
+      const pref = await getGlobalTestCaseLibraryLayoutPreference();
+      if (cancelled) return;
+      const w = clampFolderPaneW(pref.layout?.folderPaneW ?? localW);
+      skipFolderPaneLayoutPersistRef.current = true;
+      setFolderPaneW(w);
+      if (
+        !pref.layout &&
+        typeof window !== "undefined" &&
+        localStorage.getItem(FOLDER_PANE_LAYOUT_STORAGE_KEY) !== null
+      ) {
+        void saveGlobalTestCaseLibraryLayoutPreference({ folderPaneW: localW });
+      }
+      folderPaneLayoutHydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!folderPaneLayoutHydratedRef.current) return;
+    if (skipFolderPaneLayoutPersistRef.current) {
+      skipFolderPaneLayoutPersistRef.current = false;
+      return;
+    }
+    const w = clampFolderPaneW(folderPaneW);
+    const t = window.setTimeout(() => {
+      try {
+        localStorage.setItem(FOLDER_PANE_LAYOUT_STORAGE_KEY, JSON.stringify(w));
+      } catch {
+        /* ignore */
+      }
+      void saveGlobalTestCaseLibraryLayoutPreference({ folderPaneW: w });
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [folderPaneW]);
+
+  const startResizeFolderPane = useCallback((startX: number) => {
+    const startW = folderPaneWRef.current;
+    const onMove = (e: MouseEvent) => {
+      const dx = e.clientX - startX;
+      const maxW = resolveFolderPaneMaxW(importPickerMode);
+      setFolderPaneW(clampFolderPaneW(startW + dx, maxW));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [importPickerMode]);
+
+  useEffect(() => {
+    if (!importPickerMode) return;
+    const syncMax = () => {
+      const maxW = resolveFolderPaneMaxW(true);
+      setFolderPaneW((w) => clampFolderPaneW(w, maxW));
+    };
+    syncMax();
+    window.addEventListener("resize", syncMax);
+    return () => window.removeEventListener("resize", syncMax);
+  }, [importPickerMode]);
 
   const [folderSearchFooterH, setFolderSearchFooterH] = useState(
     FOLDER_SEARCH_FOOTER_DEFAULT_H,
@@ -817,66 +1178,55 @@ export function TestCaseLibraryClient({
     setSelectedCaseIds([]);
   }, [selectedFolderId]);
 
+  const folderPathByFolderId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of folders) {
+      map.set(f.id, folderPathFromFlat(f.id, folders));
+    }
+    return map;
+  }, [folders]);
+
+  const listFiltersActive = useMemo(
+    () => hasActiveCaseListFilters(caseSearchQuery, advFilter),
+    [caseSearchQuery, advFilter],
+  );
+
+  const folderSubtreeBaseCounts = useMemo(
+    () => computeFolderSubtreeCounts(countRows, folders),
+    [countRows, folders],
+  );
+
+  const folderSubtreeCounts = useMemo(() => {
+    if (!listFiltersActive) return folderSubtreeBaseCounts;
+    const filtered = applyCaseListFilters(
+      countRows,
+      caseSearchQuery,
+      advFilter,
+      (c) => folderPathByFolderId.get(c.folderId) ?? c.folderId,
+    );
+    return computeFolderSubtreeCounts(filtered, folders);
+  }, [
+    countRows,
+    folders,
+    listFiltersActive,
+    caseSearchQuery,
+    advFilter,
+    folderPathByFolderId,
+    folderSubtreeBaseCounts,
+  ]);
+
+  const folderSubtreeAllIterationCounts = useMemo(() => {
+    if (!countRowsAllIteration) return {};
+    return computeFolderSubtreeCounts(countRowsAllIteration, folders);
+  }, [countRowsAllIteration, folders]);
+
   const filteredCases = useMemo(() => {
-    let list = cases;
-    const q = caseSearchQuery.trim().toLowerCase();
-    if (q) {
-      list = list.filter(
-        (c) =>
-          c.caseNo.toLowerCase().includes(q) ||
-          c.title.toLowerCase().includes(q),
-      );
-    }
-    const f = advFilter;
-    if (f.status) {
-      list = list.filter((c) => c.status === f.status);
-    }
-    if (f.priorityText.trim()) {
-      const raw = f.priorityText.trim();
-      const rawLow = raw.toLowerCase();
-      const m = rawLow.match(/^l?([0-4])$/);
-      const tier = m ? Number(m[1]) : null;
-      const n = Number.parseInt(raw, 10);
-      list = list.filter((c) => {
-        const disp = formatCaseLevelDisplay(c.priority).toLowerCase();
-        if (tier !== null) return c.priority === tier;
-        if (!Number.isNaN(n)) return c.priority === n;
-        return (
-          disp.includes(rawLow) || String(c.priority ?? "").includes(raw)
-        );
-      });
-    }
-    if (f.maintainer.trim()) {
-      const m = f.maintainer.trim().toLowerCase();
-      list = list.filter((c) =>
-        (c.maintainer ?? "").toLowerCase().includes(m),
-      );
-    }
-    if (f.submitter.trim()) {
-      const s = f.submitter.trim().toLowerCase();
-      list = list.filter((c) =>
-        (c.submitter ?? "").toLowerCase().includes(s),
-      );
-    }
-    if (f.folderPathContains.trim()) {
-      const p = f.folderPathContains.trim().toLowerCase();
-      list = list.filter((c) => c.folderPath.toLowerCase().includes(p));
-    }
-    const createFrom = dayBoundaryMs(f.createdFrom, false);
-    const createTo = dayBoundaryMs(f.createdTo, true);
-    if (createFrom !== null || createTo !== null) {
-      list = list.filter((c) =>
-        inSelectableDateRange(c.createdAt, createFrom, createTo),
-      );
-    }
-    const upFrom = dayBoundaryMs(f.updatedFrom, false);
-    const upTo = dayBoundaryMs(f.updatedTo, true);
-    if (upFrom !== null || upTo !== null) {
-      list = list.filter((c) =>
-        inSelectableDateRange(c.updatedAt, upFrom, upTo),
-      );
-    }
-    return list;
+    return applyCaseListFilters(
+      cases,
+      caseSearchQuery,
+      advFilter,
+      (c) => c.folderPath,
+    );
   }, [cases, caseSearchQuery, advFilter]);
 
   const casePager = usePagination(filteredCases, {
@@ -1027,11 +1377,52 @@ export function TestCaseLibraryClient({
     const onDoc = (e: MouseEvent) => {
       if (!(e.target instanceof Node)) return;
       if (columnPanelRef.current?.contains(e.target)) return;
+      if (columnPanelDropdownRef.current?.contains(e.target)) return;
       setColumnPanelOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
   }, [columnPanelOpen]);
+
+  const updateColumnPanelFixedPos = useCallback(() => {
+    const el = columnPanelRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const { x, y } = clampMenuPosition(
+      rect.right - COLUMN_PANEL_WIDTH,
+      rect.bottom + 6,
+      COLUMN_PANEL_WIDTH,
+      COLUMN_PANEL_MAX_HEIGHT,
+    );
+    setColumnPanelFixedPos({ top: y, left: x });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!columnPanelOpen || !importPickerMode) {
+      setColumnPanelFixedPos(null);
+      return;
+    }
+    updateColumnPanelFixedPos();
+    window.addEventListener("resize", updateColumnPanelFixedPos);
+    window.addEventListener("scroll", updateColumnPanelFixedPos, true);
+    return () => {
+      window.removeEventListener("resize", updateColumnPanelFixedPos);
+      window.removeEventListener("scroll", updateColumnPanelFixedPos, true);
+    };
+  }, [columnPanelOpen, importPickerMode, updateColumnPanelFixedPos]);
+
+  useEffect(() => {
+    if (!statusHeaderFilterOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const el = statusHeaderFilterRef.current;
+      if (!el) return;
+      const t = e.target;
+      if (t instanceof Node && el.contains(t)) return;
+      setStatusHeaderFilterOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [statusHeaderFilterOpen]);
 
   const reloadFolders = useCallback(async () => {
     if (!effectiveProductId) {
@@ -1125,17 +1516,23 @@ export function TestCaseLibraryClient({
 
   const reloadFolderCounts = useCallback(async () => {
     if (!effectiveProductId) {
-      setFolderSubtreeCounts({});
+      setCountRows([]);
+      setCountRowsAllIteration(null);
       return;
     }
     try {
-      const m = await countTestCasesByFolderSubtree(
-        iterationCode ? iterationCode : null,
-        effectiveProductId,
-      );
-      setFolderSubtreeCounts(m);
+      const ic = iterationCode.trim();
+      const [rows, rowsAll] = await Promise.all([
+        listTestCaseCountRows(effectiveProductId, ic || null),
+        ic
+          ? listTestCaseCountRows(effectiveProductId, null)
+          : Promise.resolve(null),
+      ]);
+      setCountRows(rows);
+      setCountRowsAllIteration(rowsAll);
     } catch {
-      setFolderSubtreeCounts({});
+      setCountRows([]);
+      setCountRowsAllIteration(null);
     }
   }, [iterationCode, effectiveProductId]);
 
@@ -1185,11 +1582,7 @@ export function TestCaseLibraryClient({
         showNotice("导入失败", r.error);
         return;
       }
-      try {
-        sessionStorage.removeItem(PENDING_TEST_DESIGN_IMPORT_STORAGE);
-      } catch {
-        /* ignore */
-      }
+      clearPendingTestDesignImport();
       setPendingDesignImportIds([]);
       const imported = r.imported ?? n;
       const skipped = r.skippedDuplicates ?? 0;
@@ -1227,14 +1620,14 @@ export function TestCaseLibraryClient({
   ]);
 
   useEffect(() => {
-    if (embedMode) return;
+    if (embedMode && !importPickerMode) return;
     reloadCases();
-  }, [embedMode, reloadCases]);
+  }, [embedMode, importPickerMode, reloadCases]);
 
   useEffect(() => {
-    if (embedMode) return;
+    if (embedMode && !importPickerMode) return;
     void reloadFolderCounts();
-  }, [embedMode, reloadFolderCounts]);
+  }, [embedMode, importPickerMode, reloadFolderCounts]);
 
   useEffect(() => {
     (async () => {
@@ -1284,16 +1677,12 @@ export function TestCaseLibraryClient({
       const candidate = (pref.productId ?? "").trim();
       if (candidate) setProductId(candidate);
       productPrefHydratedRef.current = true;
+      setProductPrefHydrated(true);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
-
-  useEffect(() => {
-    if (productId) return;
-    if (products.length > 0) setProductId(products[0]!.id);
-  }, [productId, products]);
 
   useEffect(() => {
     if (!productPrefHydratedRef.current || !productId) return;
@@ -1323,7 +1712,8 @@ export function TestCaseLibraryClient({
   }, []);
 
   useEffect(() => {
-    if (!iterationOptionsReady || !sidebarPrefReady || sidebarPrefResolved) return;
+    if (!iterationOptionsReady || !sidebarPrefReady || !productPrefHydrated) return;
+    if (sidebarPrefResolved) return;
     const prefCode = pendingPrefIterationCodeRef.current;
     if (prefCode === null) {
       setSidebarPrefResolved(true);
@@ -1335,17 +1725,58 @@ export function TestCaseLibraryClient({
       setSidebarPrefResolved(true);
       return;
     }
+    const meta = iterationOptions.find((o) => o.code === prefCode);
     if (visibleIterationOptions.some((o) => o.code === prefCode)) {
       setIterationCode((prev) => (prev === prefCode ? prev : prefCode));
+    } else if (meta?.productId) {
+      skipIterationPrefPersistRef.current = true;
+      setProductId(meta.productId);
+      setIterationCode(prefCode);
+    } else if (meta) {
+      setIterationCode(prefCode);
     } else {
       setIterationCode("");
     }
     pendingPrefIterationCodeRef.current = null;
     setSidebarPrefResolved(true);
-  }, [visibleIterationOptions, iterationOptionsReady, sidebarPrefReady, sidebarPrefResolved]);
+  }, [
+    iterationOptions,
+    iterationOptionsReady,
+    productPrefHydrated,
+    sidebarPrefReady,
+    sidebarPrefResolved,
+    visibleIterationOptions,
+  ]);
 
   useEffect(() => {
     if (!sidebarPrefResolved) return;
+    const ic = iterationCode.trim();
+    if (!ic) return;
+    if (visibleIterationOptions.some((o) => o.code === ic)) return;
+    const meta = iterationOptions.find((o) => o.code === ic);
+    if (meta?.productId && meta.productId !== productId) {
+      skipIterationPrefPersistRef.current = true;
+      setProductId(meta.productId);
+      return;
+    }
+    if (!meta) {
+      skipIterationPrefPersistRef.current = true;
+      setIterationCode("");
+    }
+  }, [
+    sidebarPrefResolved,
+    visibleIterationOptions,
+    iterationCode,
+    iterationOptions,
+    productId,
+  ]);
+
+  useEffect(() => {
+    if (!sidebarPrefResolved) return;
+    if (skipIterationPrefPersistRef.current) {
+      skipIterationPrefPersistRef.current = false;
+      return;
+    }
     const t = window.setTimeout(() => {
       void saveGlobalTestCaseSidebarPreference({
         iterationCode,
@@ -1356,10 +1787,10 @@ export function TestCaseLibraryClient({
   }, [iterationCode, folderExpandedById, sidebarPrefResolved]);
 
   useEffect(() => {
-    if (!visibleIterationOptions.some((o) => o.code === iterationCode)) {
-      setIterationCode("");
-    }
-  }, [visibleIterationOptions, iterationCode]);
+    if (!productPrefHydrated) return;
+    if (productId) return;
+    if (products.length > 0) setProductId(products[0]!.id);
+  }, [productId, productPrefHydrated, products]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1390,6 +1821,7 @@ export function TestCaseLibraryClient({
   }, [execResultTextareaHeight, execResultTextareaPrefReady]);
 
   const openCreate = (targetFolderId?: string | null) => {
+    if (importPickerMode) return;
     const fid = targetFolderId ?? selectedFolderId;
     if (!fid) {
       showNotice("无法新建", "请先在左侧选择目录。");
@@ -1858,6 +2290,7 @@ export function TestCaseLibraryClient({
   ]);
 
   const openEdit = useCallback(async (id: string) => {
+    if (importPickerMode) return;
     setErr(null);
     closeMenus();
     let full: Awaited<ReturnType<typeof getTestCaseFull>>;
@@ -1880,8 +2313,20 @@ export function TestCaseLibraryClient({
     setFolderId(full.folderId);
     setPriority(caseLevelToFormValue(full.priority));
     setMaintainer(full.maintainer ?? "");
-    setStatus((full.status ?? "") as TestCaseStatus | "");
-    execRunStatusAtOpen.current = full.status ?? "BLOCKED";
+    libraryStatusAtOpen.current = full.status ?? null;
+    const taskId = executionTaskId?.trim() || "";
+    if (embedMode && taskId) {
+      const rec = await listExecutionTaskCaseExecRecords({
+        executionTaskId: taskId,
+        testCaseId: full.id,
+      });
+      const latest = rec.records?.[0];
+      setStatus((latest?.status ?? "") as TestCaseStatus | "");
+      execRunStatusAtOpen.current = latest?.status ?? "BLOCKED";
+    } else {
+      setStatus((full.status ?? "") as TestCaseStatus | "");
+      execRunStatusAtOpen.current = full.status ?? "BLOCKED";
+    }
     setPrecondition(full.precondition ?? "");
     setOperationSteps(full.operationSteps ?? "");
     setCaseActualResult(full.caseActualResult ?? "");
@@ -1915,10 +2360,10 @@ export function TestCaseLibraryClient({
     }
     if (embedMode && embedOpenCaseIdRef.current !== id) return;
     setModalOpen(true);
-  }, [closeMenus, embedMode, showNotice]);
+  }, [closeMenus, embedMode, executionTaskId, importPickerMode, showNotice]);
 
   useEffect(() => {
-    if (embedMode) return;
+    if (embedMode && !importPickerMode) return;
     if (deepCaseId) {
       void openEdit(deepCaseId);
     }
@@ -1960,6 +2405,13 @@ export function TestCaseLibraryClient({
       priority.trim() === ""
         ? null
         : parseCaseLevelOrNull(Number.parseInt(priority, 10));
+    const taskId = executionTaskId?.trim() || "";
+    const inTaskEmbed = Boolean(embedMode && taskId && editingId);
+    const selectedStatus = status ? (status as TestCaseStatus) : null;
+    // 执行任务内：未选状态视为「未标记」，勿把用例库已有状态清空
+    const statusForLibrary = inTaskEmbed
+      ? selectedStatus ?? libraryStatusAtOpen.current
+      : selectedStatus;
     try {
       const r = await saveTestCase({
         id: editingId,
@@ -1970,7 +2422,7 @@ export function TestCaseLibraryClient({
         folderId,
         priority: pri,
         maintainer: maintainer.trim() || null,
-        status: status ? (status as TestCaseStatus) : null,
+        status: statusForLibrary,
         precondition: precondition.trim() || null,
         operationSteps: operationSteps.trim() || null,
         caseActualResult: caseActualResult.trim() || null,
@@ -1981,9 +2433,9 @@ export function TestCaseLibraryClient({
         showNotice("保存失败", r.error);
         return;
       }
-      if (embedMode && executionTaskId && editingId) {
+      if (inTaskEmbed && editingId) {
         const r2 = await saveExecutionTaskCaseResult({
-          executionTaskId,
+          executionTaskId: taskId,
           testCaseId: editingId,
           executionResult: execResult.trim() || null,
         });
@@ -1992,21 +2444,21 @@ export function TestCaseLibraryClient({
           return;
         }
 
-        // 通过「保存」同步新增一次执行记录（时间/状态/执行人/执行结果/截图）
-        const recordStatus = (status ? (status as TestCaseStatus) : "BLOCKED") as TestCaseStatus;
-        const r3 = await addExecutionTaskCaseExecRecord({
-          executionTaskId,
-          testCaseId: editingId,
-          status: recordStatus,
-          executor: submitter.trim() || null,
-          result: execResult.trim() || null,
-          // 通过字符串传输，规避 server action 对深层数组序列化限制
-          images: JSON.stringify(execRunImages.map((x) => x.dataUrl)),
-          note: null,
-        });
-        if (r3.error) {
-          showNotice("保存执行记录失败", r3.error);
-          return;
+        // 仅在选定状态时写入执行记录并回写用例库状态
+        if (selectedStatus) {
+          const r3 = await addExecutionTaskCaseExecRecord({
+            executionTaskId: taskId,
+            testCaseId: editingId,
+            status: selectedStatus,
+            executor: submitter.trim() || null,
+            result: execResult.trim() || null,
+            images: JSON.stringify(execRunImages.map((x) => x.dataUrl)),
+            note: null,
+          });
+          if (r3.error) {
+            showNotice("保存执行记录失败", r3.error);
+            return;
+          }
         }
       }
       setModalOpen(false);
@@ -2169,17 +2621,10 @@ export function TestCaseLibraryClient({
         return;
       }
       saveStoredTestCaseExportFields(exportFieldSel);
-      const blob = new Blob([buildTestCaseExportCsv(r.rows, fields)], {
-        type: "text/csv;charset=utf-8;",
-      });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `用例导出-${new Date().toISOString().slice(0, 10)}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      downloadTestCaseExportCsv(
+        buildTestCaseExportCsv(r.rows, fields),
+        "用例导出",
+      );
       setBatchExportOpen(false);
     } catch {
       showNotice("导出失败", "生成文件时出错，请稍后重试。");
@@ -2567,12 +3012,44 @@ export function TestCaseLibraryClient({
                   ) : null}
                   {showFolderLevelNumber ? " " : null}
                   <span className="font-medium">{n.name}</span>
-                  <span
-                    className="ml-1 shrink-0 tabular-nums text-zinc-400"
-                    title="该目录及子目录下的用例数（随当前迭代筛选）"
-                  >
-                    ({folderSubtreeCounts[n.id] ?? 0})
-                  </span>
+                  {(() => {
+                    const filtered = folderSubtreeCounts[n.id] ?? 0;
+                    const base = folderSubtreeBaseCounts[n.id] ?? 0;
+                    const totalAllIter = folderSubtreeAllIterationCounts[n.id];
+                    const showSplitList =
+                      listFiltersActive && base !== filtered;
+                    const showSplitIteration =
+                      !listFiltersActive &&
+                      iterationCode.trim() !== "" &&
+                      typeof totalAllIter === "number" &&
+                      base !== totalAllIter;
+                    const label = showSplitList
+                      ? `${filtered}/${base}`
+                      : showSplitIteration
+                        ? `${base}/${totalAllIter}`
+                        : String(filtered);
+                    const iterLabel =
+                      visibleIterationOptions.find((o) => o.code === iterationCode)
+                        ?.label ?? iterationCode;
+                    return (
+                      <span
+                        className="ml-1 shrink-0 tabular-nums text-zinc-400"
+                        title={
+                          showSplitList
+                            ? `符合当前列表筛选 ${filtered} 条；该目录及子目录共 ${base} 条（未应用搜索与高级筛选）。`
+                            : showSplitIteration
+                              ? `当前迭代「${iterLabel}」下 ${base} 条；该目录及子目录共 ${totalAllIter} 条（含其它迭代或未标迭代）。切换为 baseline 可查看全部。`
+                              : iterationCode.trim()
+                                ? `该目录及子目录下、当前迭代「${iterLabel}」的用例数`
+                                : listFiltersActive
+                                  ? `符合当前列表筛选的用例数`
+                                  : "该目录及子目录下的用例数（全部迭代）"
+                        }
+                      >
+                        ({label})
+                      </span>
+                    );
+                  })()}
                 </button>
                 <button
                   type="button"
@@ -2611,12 +3088,19 @@ export function TestCaseLibraryClient({
 
   return (
     <>
-      {!embedMode ? (
-      <ModuleWorkspaceCard>
-        <div className="flex max-h-[calc(100dvh-11rem)] min-h-[70vh] flex-col overflow-hidden lg:flex-row">
+      {showFullLibrary ? (
+        <LibraryShell picker={importPickerMode}>
         <section
-          className="relative flex min-h-[280px] flex-col border-b border-zinc-200 bg-zinc-50/60 lg:min-h-0 lg:border-b-0 lg:border-r lg:border-zinc-200"
-          style={{ width: folderPaneW, maxWidth: "100%" }}
+          className={[
+            "relative flex flex-col border-b border-zinc-200 bg-zinc-50/60 lg:min-h-0 lg:border-b-0 lg:border-r lg:border-zinc-200",
+            importPickerMode
+              ? "h-full min-h-0 shrink-0 overflow-hidden"
+              : "min-h-[280px]",
+          ].join(" ")}
+          style={{
+            width: folderPaneW,
+            maxWidth: importPickerMode ? undefined : "100%",
+          }}
         >
           <div
             className="relative flex shrink-0 flex-col overflow-hidden border-b border-zinc-200/80"
@@ -2639,6 +3123,12 @@ export function TestCaseLibraryClient({
               右键或<strong>⋮</strong>新建、重命名、删除。
             </p>
             <div className="mt-2">
+              {importPickerMode ? (
+                <p className="rounded-md border border-zinc-200 bg-white px-2 py-1.5 text-[11px] leading-snug text-zinc-600">
+                  导入模式：产品已锁定为当前迭代所属用例库。
+                </p>
+              ) : (
+                <>
               <label className="text-xs font-medium text-zinc-600">
                 切换产品
               </label>
@@ -2661,6 +3151,8 @@ export function TestCaseLibraryClient({
                   」。切换上方产品仅影响迭代等筛选，不改变左侧目录树。
                 </p>
               ) : null}
+                </>
+              )}
             </div>
             <div className="mt-2">
               <label className="text-xs font-medium text-zinc-600">
@@ -2678,6 +3170,13 @@ export function TestCaseLibraryClient({
                   </option>
                 ))}
               </select>
+              {iterationCode.trim() ? (
+                <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
+                  目录旁数字为<strong>当前迭代</strong>下的条数；若显示为「1/38」表示该目录共
+                  38 条，仅 1 条归属此迭代（其余可能未标迭代或属其它迭代）。选 baseline
+                  可查看全部。
+                </p>
+              ) : null}
             </div>
             <div className="mt-2 flex items-center gap-2">
               <button
@@ -2731,8 +3230,9 @@ export function TestCaseLibraryClient({
               </button>
             </div>
               </div>
+            </div>
           {!embedMode && pendingDesignImportIds.length > 0 ? (
-            <div className="border-t border-blue-200/80 bg-blue-50/95 px-3 py-2.5">
+            <div className="shrink-0 border-t border-blue-200/80 bg-blue-50/95 px-3 py-2.5">
               <div className="text-xs font-semibold text-zinc-900">
                 从测试设计导入
               </div>
@@ -2771,7 +3271,6 @@ export function TestCaseLibraryClient({
               </div>
             </div>
           ) : null}
-            </div>
             <div
               data-testid="case-lib-folder-upper-resize"
               className="z-30 flex h-3 w-full shrink-0 cursor-row-resize touch-none items-center justify-center border-t border-zinc-200/90 bg-zinc-100/95 hover:bg-zinc-200/70"
@@ -2885,16 +3384,17 @@ export function TestCaseLibraryClient({
               在当前已加载的列表（本目录及子目录用例）内筛选。
             </p>
           </div>
-          <span
-            className="absolute right-0 top-0 z-[8] hidden h-full w-2 cursor-col-resize hover:bg-zinc-300/40 lg:block"
-            role="separator"
-            title="拖动调整左侧宽度"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              startResizeFolderPane(e.clientX);
-            }}
-          />
         </section>
+
+        <div
+          className="relative z-[8] -mx-px hidden w-2 shrink-0 cursor-col-resize self-stretch hover:bg-zinc-300/40 lg:block"
+          role="separator"
+          title="拖动调整左侧宽度"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            startResizeFolderPane(e.clientX);
+          }}
+        />
 
         <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white">
           <div className="shrink-0 border-b border-zinc-100 px-4 py-3">
@@ -2904,9 +3404,18 @@ export function TestCaseLibraryClient({
                   当前：{selectedFolderName || "未选择"}
                 </h2>
                 <p className="mt-0.5 text-xs text-zinc-500">
-                  列表包含当前目录及<strong>所有子目录</strong>下的用例；
-                  <strong>点击用例行</strong>进入编辑；<strong>右键</strong>或{" "}
-                  <strong>⋮</strong> 可快捷操作。
+                  {importPickerMode ? (
+                    <>
+                      列表包含当前目录及<strong>所有子目录</strong>下的用例；勾选后点击「导入已选」。
+                      已导入本任务的用例不可重复勾选。
+                    </>
+                  ) : (
+                    <>
+                      列表包含当前目录及<strong>所有子目录</strong>下的用例；
+                      <strong>点击用例行</strong>进入编辑；<strong>右键</strong>或{" "}
+                      <strong>⋮</strong> 可快捷操作。
+                    </>
+                  )}
                 </p>
               </div>
               <div className="flex flex-shrink-0 flex-wrap items-center gap-1.5">
@@ -2933,71 +3442,117 @@ export function TestCaseLibraryClient({
                   >
                     ⚙
                   </button>
-                  {columnPanelOpen ? (
-                    <div
-                      className="absolute right-0 top-full z-[150] mt-1.5 w-80 max-h-[min(70vh,28rem)] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-left shadow-xl"
-                      role="dialog"
-                      aria-label="列设置"
-                    >
-                      <p className="text-xs leading-relaxed text-zinc-500">
-                        勾选表示在表格中显示。使用上下箭头调整列的先后顺序。在表头列右侧的竖线上按住拖动可调整列宽。
-                      </p>
-                      <ul className="mt-3 space-y-1">
-                        {columnConfig.order.map((key, idx) => (
-                          <li
-                            key={key}
-                            className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-zinc-50"
+                  {columnPanelOpen &&
+                  (!importPickerMode || columnPanelFixedPos)
+                    ? (() => {
+                        const panelEl = (
+                          <div
+                            ref={columnPanelDropdownRef}
+                            className={
+                              importPickerMode
+                                ? "fixed z-[200] w-80 max-h-[min(70vh,28rem)] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-left shadow-xl"
+                                : "absolute right-0 top-full z-[150] mt-1.5 w-80 max-h-[min(70vh,28rem)] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-left shadow-xl"
+                            }
+                            style={
+                              importPickerMode && columnPanelFixedPos
+                                ? {
+                                    top: columnPanelFixedPos.top,
+                                    left: columnPanelFixedPos.left,
+                                  }
+                                : undefined
+                            }
+                            role="dialog"
+                            aria-label="列设置"
                           >
-                            <input
-                              id={`col-vis-${key}`}
-                              type="checkbox"
-                              className="h-4 w-4 shrink-0 rounded border-zinc-300"
-                              checked={columnConfig.visible[key] !== false}
-                              onChange={(e) =>
-                                setVisible(key, e.target.checked)
-                              }
-                            />
-                            <label
-                              htmlFor={`col-vis-${key}`}
-                              className="min-w-0 flex-1 cursor-pointer text-sm text-zinc-800"
+                            <p className="text-xs leading-relaxed text-zinc-500">
+                              勾选表示在表格中显示。使用上下箭头调整列的先后顺序。在表头列右侧的竖线上按住拖动可调整列宽。
+                            </p>
+                            <ul className="mt-3 space-y-1">
+                              {columnConfig.order.map((key, idx) => (
+                                <li
+                                  key={key}
+                                  className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-zinc-50"
+                                >
+                                  <input
+                                    id={`col-vis-${key}`}
+                                    type="checkbox"
+                                    className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                                    checked={columnConfig.visible[key] !== false}
+                                    onChange={(e) =>
+                                      setVisible(key, e.target.checked)
+                                    }
+                                  />
+                                  <label
+                                    htmlFor={`col-vis-${key}`}
+                                    className="min-w-0 flex-1 cursor-pointer text-sm text-zinc-800"
+                                  >
+                                    {COLUMN_LABELS[key]}
+                                  </label>
+                                  <div className="flex shrink-0 gap-0.5">
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
+                                      disabled={idx === 0}
+                                      title="上移"
+                                      aria-label={`将「${COLUMN_LABELS[key]}」列上移`}
+                                      onClick={() => moveKey(key, -1)}
+                                    >
+                                      ↑
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="rounded border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
+                                      disabled={idx === columnConfig.order.length - 1}
+                                      title="下移"
+                                      aria-label={`将「${COLUMN_LABELS[key]}」列下移`}
+                                      onClick={() => moveKey(key, 1)}
+                                    >
+                                      ↓
+                                    </button>
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                            <button
+                              type="button"
+                              className="mt-3 w-full rounded-lg border border-zinc-200 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                              onClick={() => resetDefaults()}
                             >
-                              {COLUMN_LABELS[key]}
-                            </label>
-                            <div className="flex shrink-0 gap-0.5">
-                              <button
-                                type="button"
-                                className="rounded border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
-                                disabled={idx === 0}
-                                title="上移"
-                                aria-label={`将「${COLUMN_LABELS[key]}」列上移`}
-                                onClick={() => moveKey(key, -1)}
-                              >
-                                ↑
-                              </button>
-                              <button
-                                type="button"
-                                className="rounded border border-zinc-200 px-1.5 py-0.5 text-xs text-zinc-600 disabled:opacity-30"
-                                disabled={idx === columnConfig.order.length - 1}
-                                title="下移"
-                                aria-label={`将「${COLUMN_LABELS[key]}」列下移`}
-                                onClick={() => moveKey(key, 1)}
-                              >
-                                ↓
-                              </button>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                      <button
-                        type="button"
-                        className="mt-3 w-full rounded-lg border border-zinc-200 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                        onClick={() => resetDefaults()}
-                      >
-                        恢复默认列
-                      </button>
-                    </div>
-                  ) : null}
+                              恢复默认列
+                            </button>
+                          </div>
+                        );
+                        if (importPickerMode && typeof document !== "undefined") {
+                          return createPortal(panelEl, document.body);
+                        }
+                        return panelEl;
+                      })()
+                    : null}
                 </div>
+                {importPickerMode ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={importPickerWorking || importablePickCount === 0}
+                      className={MODULE_TOOLBAR_BTN_PRIMARY}
+                      onClick={() => void runImportPicker()}
+                    >
+                      {importPickerWorking
+                        ? "导入中…"
+                        : importablePickCount > 0
+                          ? `导入已选（${importablePickCount}）`
+                          : "导入已选"}
+                    </button>
+                    <button
+                      type="button"
+                      className={MODULE_TOOLBAR_BTN_SECONDARY}
+                      onClick={() => onImportPickerClose?.()}
+                    >
+                      取消
+                    </button>
+                  </>
+                ) : (
+                <>
                 <button
                   type="button"
                   onClick={() => void openRestoreArchiveModal()}
@@ -3015,6 +3570,8 @@ export function TestCaseLibraryClient({
                 >
                   在当前目录新建用例
                 </button>
+                </>
+                )}
               </div>
             </div>
           </div>
@@ -3036,11 +3593,37 @@ export function TestCaseLibraryClient({
                     <span>
                       已选{" "}
                       <strong className="tabular-nums">
-                        {selectedCaseIds.length}
+                        {importPickerMode ? importablePickCount : selectedCaseIds.length}
                       </strong>{" "}
                       条
+                      {importPickerMode && selectedCaseIds.length > importablePickCount ? (
+                        <span className="ml-1 text-xs text-zinc-500">
+                          （含 {selectedCaseIds.length - importablePickCount} 条已导入，将跳过）
+                        </span>
+                      ) : null}
                     </span>
-                    <span className="hidden text-zinc-400 sm:inline">|</span>
+                    {importPickerMode ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={importPickerWorking || importablePickCount === 0}
+                          className="rounded-md bg-zinc-900 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
+                          onClick={() => void runImportPicker()}
+                        >
+                          {importPickerWorking
+                            ? "导入中…"
+                            : `导入已选（${importablePickCount}）`}
+                        </button>
+                        <button
+                          type="button"
+                          className="ml-auto text-xs text-zinc-500 underline hover:text-zinc-800"
+                          onClick={clearSelection}
+                        >
+                          取消选择
+                        </button>
+                      </>
+                    ) : (
+                    <>
                     <button
                       type="button"
                       disabled={batchWorking || batchEditWorking}
@@ -3102,6 +3685,8 @@ export function TestCaseLibraryClient({
                     >
                       取消选择
                     </button>
+                    </>
+                    )}
                   </div>
                 ) : null}
 
@@ -3111,29 +3696,49 @@ export function TestCaseLibraryClient({
                       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                         <div>
                           <label className="text-xs font-medium text-zinc-600">
-                            状态
+                            状态（可多选）
                           </label>
-                          <select
-                            className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm"
-                            value={advFilter.status}
-                            onChange={(e) =>
-                              setAdvFilter((p) => ({
-                                ...p,
-                                status: e.target.value as TestCaseStatus | "",
-                              }))
-                            }
-                          >
-                            <option value="">全部</option>
-                            {testCaseStatusOptions.map((o) => (
-                              <option
+                          <div className="mt-1 max-h-36 space-y-1 overflow-y-auto rounded-lg border border-zinc-300 bg-white p-2">
+                            {ALL_CASE_STATUS_FILTER_OPTIONS.map((o) => (
+                              <label
                                 key={o.value}
-                                value={o.value}
-                                style={testCaseStatusSelectOptionStyle[o.value]}
+                                className="flex cursor-pointer items-center gap-2 rounded-md px-1 py-1 text-sm text-zinc-800 hover:bg-zinc-50"
                               >
+                                <input
+                                  type="checkbox"
+                                  className="h-3.5 w-3.5 rounded border-zinc-300"
+                                  checked={advFilter.statusIn.includes(o.value)}
+                                  onChange={() => toggleStatusInFilter(o.value)}
+                                />
                                 {o.label}
-                              </option>
+                              </label>
                             ))}
-                          </select>
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              className="rounded-md border border-zinc-200 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                              onClick={() =>
+                                setAdvFilter((p) => ({
+                                  ...p,
+                                  statusIn: ALL_CASE_STATUS_FILTER_OPTIONS.map(
+                                    (o) => o.value,
+                                  ),
+                                }))
+                              }
+                            >
+                              全选
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-md border border-zinc-200 px-2 py-0.5 text-xs text-zinc-700 hover:bg-zinc-50"
+                              onClick={() =>
+                                setAdvFilter((p) => ({ ...p, statusIn: [] }))
+                              }
+                            >
+                              清除
+                            </button>
+                          </div>
                         </div>
                         <div>
                           <label className="text-xs font-medium text-zinc-600">
@@ -3268,7 +3873,10 @@ export function TestCaseLibraryClient({
                         <button
                           type="button"
                           className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                          onClick={() => setAdvFilter({ ...DEFAULT_ADV_FILTER })}
+                          onClick={() => {
+                            setAdvFilter({ ...DEFAULT_ADV_FILTER });
+                            setStatusHeaderFilterOpen(false);
+                          }}
                         >
                           重置筛选条件
                         </button>
@@ -3333,9 +3941,102 @@ export function TestCaseLibraryClient({
                               key={k}
                               className="relative select-none py-2.5 pr-2 align-bottom font-medium"
                             >
-                              <span className="block truncate pr-2">
-                                {COLUMN_LABELS[k]}
-                              </span>
+                              {k === "status" ? (
+                                <div
+                                  ref={statusHeaderFilterRef}
+                                  className="relative inline-flex min-w-0 max-w-full items-center"
+                                >
+                                  <button
+                                    type="button"
+                                    className="group/st inline-flex min-w-0 max-w-full items-center gap-0.5 pr-1 text-left"
+                                    title={`筛选状态（当前：${caseStatusFilterSummary(advFilter.statusIn)}）`}
+                                    aria-expanded={statusHeaderFilterOpen}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setStatusHeaderFilterOpen((o) => !o);
+                                    }}
+                                  >
+                                    <span className="min-w-0 shrink truncate leading-tight">
+                                      {COLUMN_LABELS[k]}
+                                      {advFilter.statusIn.length > 0 ? (
+                                        <span className="ml-1 tabular-nums text-zinc-400">
+                                          ({advFilter.statusIn.length})
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                    <span
+                                      aria-hidden
+                                      className="block h-4 w-4 shrink-0 bg-[length:14px_14px] bg-[position:center] bg-no-repeat opacity-70 transition-opacity group-hover/st:opacity-100"
+                                      style={{
+                                        backgroundImage: `url("${CASE_STATUS_HEADER_CHEVRON}")`,
+                                      }}
+                                    />
+                                  </button>
+                                  {statusHeaderFilterOpen ? (
+                                    <div
+                                      className="absolute left-0 top-full z-30 mt-1 w-44 rounded-lg border border-zinc-200 bg-white p-2 text-left shadow-xl"
+                                      role="dialog"
+                                      aria-label="状态筛选"
+                                    >
+                                      <div className="max-h-52 space-y-1 overflow-y-auto">
+                                        {ALL_CASE_STATUS_FILTER_OPTIONS.map(
+                                          (o) => (
+                                            <label
+                                              key={o.value}
+                                              className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-800 hover:bg-zinc-50"
+                                            >
+                                              <input
+                                                type="checkbox"
+                                                className="h-3.5 w-3.5 rounded border-zinc-300"
+                                                checked={advFilter.statusIn.includes(
+                                                  o.value,
+                                                )}
+                                                onChange={() =>
+                                                  toggleStatusInFilter(o.value)
+                                                }
+                                              />
+                                              {o.label}
+                                            </label>
+                                          ),
+                                        )}
+                                      </div>
+                                      <div className="mt-2 flex flex-wrap gap-2 border-t border-zinc-100 pt-2">
+                                        <button
+                                          type="button"
+                                          className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                          onClick={() =>
+                                            setAdvFilter((p) => ({
+                                              ...p,
+                                              statusIn:
+                                                ALL_CASE_STATUS_FILTER_OPTIONS.map(
+                                                  (o) => o.value,
+                                                ),
+                                            }))
+                                          }
+                                        >
+                                          全选
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                          onClick={() =>
+                                            setAdvFilter((p) => ({
+                                              ...p,
+                                              statusIn: [],
+                                            }))
+                                          }
+                                        >
+                                          清除筛选
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ) : (
+                                <span className="block truncate pr-2">
+                                  {COLUMN_LABELS[k]}
+                                </span>
+                              )}
                               <span
                                 role="separator"
                                 aria-hidden
@@ -3359,17 +4060,41 @@ export function TestCaseLibraryClient({
                         ref={caseListTableBodyRef}
                         className="divide-y divide-zinc-100"
                       >
-                        {casePager.pagedItems.map((c) => (
+                        {casePager.pagedItems.map((c) => {
+                          const alreadyLinked =
+                            importPickerMode && linkedCaseIdSet.has(c.id);
+                          return (
                           <tr
                             key={c.id}
                             data-pm-row-select={c.id}
-                            className="group cursor-pointer hover:bg-zinc-50/90"
-                            title={`打开编辑：${c.caseNo} ${c.title}`}
-                            onClick={() => void openEdit(c.id)}
-                            onContextMenu={(e) => {
-                              e.preventDefault();
-                              showCaseMenu(c.id, c.title, e.clientX, e.clientY);
+                            className={[
+                              "group",
+                              alreadyLinked
+                                ? "cursor-default text-zinc-500"
+                                : "cursor-pointer hover:bg-zinc-50/90",
+                            ].join(" ")}
+                            title={
+                              importPickerMode
+                                ? alreadyLinked
+                                  ? `已导入本任务：${c.caseNo} ${c.title}`
+                                  : `勾选：${c.caseNo} ${c.title}`
+                                : `打开编辑：${c.caseNo} ${c.title}`
+                            }
+                            onClick={() => {
+                              if (importPickerMode) {
+                                toggleCasePickForImport(c.id);
+                                return;
+                              }
+                              void openEdit(c.id);
                             }}
+                            onContextMenu={
+                              importPickerMode
+                                ? undefined
+                                : (e) => {
+                                    e.preventDefault();
+                                    showCaseMenu(c.id, c.title, e.clientX, e.clientY);
+                                  }
+                            }
                           >
                             <td
                               className="py-2.5 pl-3 pr-1 align-top"
@@ -3377,24 +4102,27 @@ export function TestCaseLibraryClient({
                             >
                               <input
                                 type="checkbox"
-                                className="h-4 w-4 rounded border-zinc-300"
+                                className="h-4 w-4 rounded border-zinc-300 disabled:opacity-40"
                                 checked={selectedCaseIds.includes(c.id)}
+                                disabled={alreadyLinked}
                                 onChange={() => {}}
                                 onClick={(e) => e.preventDefault()}
-                                onPointerDown={(e) =>
-                                  onRowCheckboxPointerDown(e, c.id)
-                                }
+                                onPointerDown={(e) => {
+                                  if (alreadyLinked) return;
+                                  onRowCheckboxPointerDown(e, c.id);
+                                }}
                                 onKeyDown={(e) => {
+                                  if (alreadyLinked) return;
                                   if (e.key !== " " && e.key !== "Enter") return;
                                   e.preventDefault();
                                   e.stopPropagation();
-                                  setSelectedCaseIds((prev) =>
-                                    prev.includes(c.id)
-                                      ? prev.filter((x) => x !== c.id)
-                                      : [...prev, c.id],
-                                  );
+                                  toggleCasePickForImport(c.id);
                                 }}
-                                title="按住并拖动经过多行可连续勾选"
+                                title={
+                                  alreadyLinked
+                                    ? "该用例已导入本任务"
+                                    : "按住并拖动经过多行可连续勾选"
+                                }
                                 aria-label={`选择 ${c.caseNo}`}
                               />
                             </td>
@@ -3412,6 +4140,13 @@ export function TestCaseLibraryClient({
                               className="py-2.5 pr-3 text-right align-top"
                               onClick={(e) => e.stopPropagation()}
                             >
+                              {importPickerMode ? (
+                                alreadyLinked ? (
+                                  <span className="text-[10px] text-emerald-700">
+                                    已导入
+                                  </span>
+                                ) : null
+                              ) : (
                               <button
                                 type="button"
                                 className="rounded px-1.5 py-0.5 text-zinc-500 opacity-60 hover:bg-zinc-200 hover:text-zinc-900 group-hover:opacity-100"
@@ -3431,9 +4166,11 @@ export function TestCaseLibraryClient({
                               >
                                 ⋮
                               </button>
+                              )}
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                       </table>
                 )}
@@ -3455,18 +4192,19 @@ export function TestCaseLibraryClient({
               </div>
             )}
 
+            {!importPickerMode ? (
             <p className="mt-6 shrink-0 text-center text-xs text-zinc-400">
               <Link href="/test-design" className="hover:underline">
                 前往测试设计
               </Link>
             </p>
+            ) : null}
           </div>
         </section>
-        </div>
-      </ModuleWorkspaceCard>
+        </LibraryShell>
       ) : null}
 
-      {(folderMenu || caseMenu) && (
+      {(folderMenu || caseMenu) && !importPickerMode && (
         <div
           ref={menuRef}
           className="fixed z-[200] min-w-[10.5rem] rounded-lg border border-zinc-200 bg-white py-1 text-sm shadow-lg"
@@ -3887,7 +4625,11 @@ export function TestCaseLibraryClient({
                               setStatus(e.target.value as TestCaseStatus | "")
                             }
                           >
-                            <option value="">（未选择）</option>
+                            <option value="">
+                              {embedMode && executionTaskId
+                                ? "未标记"
+                                : "（未选择）"}
+                            </option>
                             {testCaseStatusOptions.map((o) => (
                               <option
                                 key={o.value}

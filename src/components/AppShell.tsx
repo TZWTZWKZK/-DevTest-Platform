@@ -15,6 +15,7 @@ const navItems = [
   { href: "/defects", label: "缺陷管理" },
   { href: "/defect-analysis", label: "缺陷分析" },
   { href: "/executions", label: "执行任务" },
+  { href: "/performance-analysis", label: "性能分析" },
   { href: "/executions/iteration-analysis", label: "迭代分析" },
 ] as const;
 

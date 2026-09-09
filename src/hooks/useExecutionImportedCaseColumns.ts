@@ -45,6 +45,9 @@ const DEFAULT_WIDTH: Record<ExecImportedCaseColumnKey, number> = {
   ops: 64,
 };
 
+/** 仅保留最小宽度，不设上限以便左右无限延伸 */
+const MIN_IMPORTED_COL_WIDTH = 48;
+
 const DEFAULT_ORDER: ExecImportedCaseColumnKey[] = [
   ...EXEC_IMPORTED_CASE_COLUMN_KEYS,
 ];
@@ -114,7 +117,7 @@ export function useExecutionImportedCaseColumns() {
   }, []);
 
   const setWidth = useCallback((k: ExecImportedCaseColumnKey, w: number) => {
-    const width = Math.max(48, Math.min(720, Math.round(w)));
+    const width = Math.max(MIN_IMPORTED_COL_WIDTH, Math.round(w));
     setConfig((prev) => ({
       ...prev,
       widths: { ...prev.widths, [k]: width },

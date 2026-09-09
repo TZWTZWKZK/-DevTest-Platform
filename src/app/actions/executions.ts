@@ -41,6 +41,8 @@ const UI_PREF_KEY_GLOBAL_TEST_DESIGN_ITERATION = "ui.global.testDesign.iteration
 const UI_PREF_KEY_TEST_DESIGN_REQ_TREE_EXPAND = "ui.testDesign.reqTree.expand.v1";
 /** 测试设计页：顶部需求区与右侧工具栏拉伸高度（全局共享，写入 DB） */
 const UI_PREF_KEY_TEST_DESIGN_LAYOUT = "ui.testDesign.layout.v1";
+/** 用例库页：左侧目录栏宽度等布局（全局共享，写入 DB） */
+const UI_PREF_KEY_TEST_CASE_LIBRARY_LAYOUT = "ui.testCaseLibrary.layout.v1";
 const UI_PREF_KEY_GLOBAL_EXECUTION_ITERATION = "ui.global.executions.iteration.v1";
 const UI_PREF_KEY_GLOBAL_ITERATION_PRODUCT = "ui.global.iterations.product.v1";
 const UI_PREF_KEY_GLOBAL_REQUIREMENT_ITERATION = "ui.global.requirements.iteration.v1";
@@ -497,6 +499,57 @@ export async function saveGlobalTestDesignLayoutPreference(
   return writeUiPreference(UI_PREF_KEY_TEST_DESIGN_LAYOUT, input);
 }
 
+export type TestCaseLibraryLayoutPreference = {
+  folderPaneW: number;
+};
+
+const TEST_CASE_LIBRARY_LAYOUT_DEFAULT: TestCaseLibraryLayoutPreference = {
+  folderPaneW: 288,
+};
+
+const TEST_CASE_LIBRARY_FOLDER_PANE_MIN_W = 200;
+const TEST_CASE_LIBRARY_FOLDER_PANE_MAX_W = 440;
+
+function parseTestCaseLibraryLayoutPreference(
+  raw: Partial<TestCaseLibraryLayoutPreference> | null | undefined,
+): TestCaseLibraryLayoutPreference | null {
+  if (!raw || typeof raw !== "object") return null;
+  if (typeof raw.folderPaneW !== "number" || !Number.isFinite(raw.folderPaneW)) {
+    return null;
+  }
+  return {
+    folderPaneW: Math.max(
+      TEST_CASE_LIBRARY_FOLDER_PANE_MIN_W,
+      Math.min(TEST_CASE_LIBRARY_FOLDER_PANE_MAX_W, Math.round(raw.folderPaneW)),
+    ),
+  };
+}
+
+export async function getGlobalTestCaseLibraryLayoutPreference(): Promise<{
+  layout?: TestCaseLibraryLayoutPreference;
+  error?: string;
+}> {
+  const r = await readUiPreference<Partial<TestCaseLibraryLayoutPreference>>(
+    UI_PREF_KEY_TEST_CASE_LIBRARY_LAYOUT,
+    {},
+  );
+  const layout = parseTestCaseLibraryLayoutPreference(r.value);
+  return {
+    ...(layout ? { layout } : {}),
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+export async function saveGlobalTestCaseLibraryLayoutPreference(
+  input: TestCaseLibraryLayoutPreference,
+): Promise<ActionResult> {
+  const parsed = parseTestCaseLibraryLayoutPreference(input);
+  if (!parsed) {
+    return { error: "无效的布局参数" };
+  }
+  return writeUiPreference(UI_PREF_KEY_TEST_CASE_LIBRARY_LAYOUT, parsed);
+}
+
 export async function listExecutionTaskIterations(): Promise<
   Array<{ id: string; label: string; taskCount: number; productId: string }>
 > {
@@ -564,18 +617,27 @@ export async function listExecutionTasksFlat(
   const countsByTask = new Map<string, ReturnType<typeof emptyCounts>>();
   for (const tid of taskIds) countsByTask.set(tid, emptyCounts());
 
-  // 口径对齐：执行任务详情页「已导入用例」表格的“状态”列来源于 TestCase.status。
-  // 因此列表汇总也以 TestCase.status 为准：
-  // - 通过率分子 = PASSED + DEPRECATED + REQ_TRANSFER（废弃/转需求视同达标）
-  // - 执行率(执行情况) = status 不为空 / 总数（NONE=为空）
+  // 口径：任务列表通过率/执行情况按「该任务下该用例最近一次执行记录」统计；
+  // 无执行记录视为未标记（NONE），与详情页「已导入用例」状态列一致。
   const links = await prisma.executionTaskTestCase.findMany({
     where: { executionTaskId: { in: taskIds } },
-    select: { executionTaskId: true, testCase: { select: { status: true } } },
+    select: { executionTaskId: true, testCaseId: true },
   });
+  const execRows = await prisma.executionTaskTestCaseExecRecord.findMany({
+    where: { executionTaskId: { in: taskIds } },
+    orderBy: { executedAt: "desc" },
+    select: { executionTaskId: true, testCaseId: true, status: true },
+  });
+  const latestKey = (taskId: string, caseId: string) => `${taskId}\0${caseId}`;
+  const latestStatus = new Map<string, TestCaseStatus>();
+  for (const r of execRows) {
+    const k = latestKey(r.executionTaskId, r.testCaseId);
+    if (!latestStatus.has(k)) latestStatus.set(k, r.status);
+  }
   for (const link of links) {
     const counts = countsByTask.get(link.executionTaskId) ?? emptyCounts();
     countsByTask.set(link.executionTaskId, counts);
-    const st = link.testCase.status;
+    const st = latestStatus.get(latestKey(link.executionTaskId, link.testCaseId));
     if (!st) {
       counts.NONE += 1;
     } else if (st === "PASSED") counts.PASSED += 1;
@@ -960,7 +1022,7 @@ export async function updateExecutionTaskDetail(input: {
 export async function getExecutionTaskDetail(id: string) {
   const taskId = id.trim();
   if (!taskId) return null;
-  return prisma.executionTask.findUnique({
+  const task = await prisma.executionTask.findUnique({
     where: { id: taskId },
     select: {
       id: true,
@@ -1001,6 +1063,31 @@ export async function getExecutionTaskDetail(id: string) {
       },
     },
   });
+  if (!task) return null;
+
+  // 任务内「状态」= 本任务对该用例最近一次执行记录；无记录则为未标记（null），不沿用用例库状态
+  const execRows = await prisma.executionTaskTestCaseExecRecord.findMany({
+    where: { executionTaskId: taskId },
+    orderBy: { executedAt: "desc" },
+    select: { testCaseId: true, status: true },
+  });
+  const latestStatusByCase = new Map<string, TestCaseStatus>();
+  for (const r of execRows) {
+    if (!latestStatusByCase.has(r.testCaseId)) {
+      latestStatusByCase.set(r.testCaseId, r.status);
+    }
+  }
+
+  return {
+    ...task,
+    linkedCases: task.linkedCases.map((link) => ({
+      ...link,
+      testCase: {
+        ...link.testCase,
+        status: latestStatusByCase.get(link.testCase.id) ?? null,
+      },
+    })),
+  };
 }
 
 export async function addExecutionTaskLinkedTestCases(
@@ -1258,6 +1345,13 @@ export async function addExecutionTaskCaseExecRecord(input: {
       select: { id: true, executedAt: true, status: true, executor: true, result: true, note: true },
     });
 
+    // 执行结果同步回写用例库状态
+    await prisma.testCase.update({
+      where: { id: caseId },
+      data: { status: input.status },
+      select: { id: true },
+    });
+
     const stLabel = String(row.status);
     const ex = row.executor?.trim() || "—";
     const nt = row.note?.trim();
@@ -1281,6 +1375,8 @@ export async function addExecutionTaskCaseExecRecord(input: {
     });
 
     revalidatePath(`/executions/task/${taskId}`);
+    revalidatePath("/executions");
+    revalidatePath("/test-cases");
     return { ok: true };
   } catch (e) {
     return { error: e instanceof Error ? e.message : "保存执行记录失败" };

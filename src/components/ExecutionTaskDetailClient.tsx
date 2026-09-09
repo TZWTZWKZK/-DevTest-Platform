@@ -17,19 +17,17 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
+  addExecutionTaskCaseExecRecord,
   addExecutionTaskLinkedTestCases,
   getExecutionImportedCaseColumnConfig,
   removeExecutionTaskLinkedTestCases,
   saveExecutionImportedCaseColumnConfig,
   type ActionResult,
 } from "@/app/actions/executions";
-import { listIterationCodeOptions } from "@/app/actions/iterations";
-import { listProductOptions, type ProductOption } from "@/app/actions/products";
 import {
   bulkUpdateTestCasesMeta,
-  searchTestCaseIdOptions,
+  getTestCasesExportRows,
   type TestCaseFolderFlat,
-  type TestCaseIdOption,
 } from "@/app/actions/test-cases";
 import {
   ModuleWorkspaceCard,
@@ -44,6 +42,14 @@ import {
   EXEC_IMPORTED_CASE_COLUMN_KEYS,
   useExecutionImportedCaseColumns,
 } from "@/hooks/useExecutionImportedCaseColumns";
+import {
+  DEFAULT_TEST_CASE_EXPORT_FIELDS,
+  TEST_CASE_EXPORT_COLUMN_KEYS,
+} from "@/hooks/useTestCaseListColumns";
+import {
+  buildTestCaseExportCsv,
+  downloadTestCaseExportCsv,
+} from "@/lib/test-case-export-csv";
 import { usePagination } from "@/hooks/usePagination";
 import { useRowCheckboxBrushByIds } from "@/hooks/useRowCheckboxBrushByIds";
 
@@ -61,6 +67,15 @@ function formatTs(iso: string): string {
   }
 }
 
+/** Server → Client 传参后 Date 会变成 ISO 字符串，需统一还原 */
+function coerceToDate(value: Date | string): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function coerceToIso(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
 const testCaseStatusLabel: Record<TestCaseStatus, string> = {
   PASSED: "通过",
   FAILED: "失败",
@@ -68,15 +83,6 @@ const testCaseStatusLabel: Record<TestCaseStatus, string> = {
   DEPRECATED: "废弃",
   REQ_TRANSFER: "转需求",
 };
-
-/** 与「产品」分列时，迭代选项去掉「产品名 / 」前缀 */
-function iterationSelectShortLabel(o: { code: string; label: string }): string {
-  if (!o.code) return o.label;
-  const sep = " / ";
-  const i = o.label.indexOf(sep);
-  if (i >= 0) return o.label.slice(i + sep.length);
-  return o.label;
-}
 
 const testCaseStatusBadgeClass: Record<TestCaseStatus, string> = {
   PASSED: "border-emerald-300 bg-emerald-50 text-emerald-800",
@@ -86,18 +92,34 @@ const testCaseStatusBadgeClass: Record<TestCaseStatus, string> = {
   REQ_TRANSFER: "border-violet-300 bg-violet-50 text-violet-800",
 };
 
-/** 列表头状态筛选：与 advanced 面板共用 detailAdvFilter.status；`__UNSET__` 表示未填 */
+/** 列表头/高级筛选共用：statusIn 为空表示不过滤；`__UNSET__` 表示 status 为空 */
 const IMPORTED_STATUS_FILTER_UNSET = "__UNSET__";
 
 const IMPORTED_STATUS_HEADER_CHEVRON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E";
 
-function importedStatusFilterSummary(statusRaw: string): string {
-  const s = statusRaw.trim();
-  if (!s) return "全部";
-  if (s === IMPORTED_STATUS_FILTER_UNSET) return "未填";
-  return testCaseStatusLabel[s as TestCaseStatus] ?? s;
+function importedStatusFilterSummary(
+  statusIn: Array<TestCaseStatus | typeof IMPORTED_STATUS_FILTER_UNSET>,
+): string {
+  if (statusIn.length === 0) return "全部";
+  if (statusIn.length === 1) {
+    const only = statusIn[0]!;
+  if (only === IMPORTED_STATUS_FILTER_UNSET) return "未标记";
+  return testCaseStatusLabel[only] ?? only;
+  }
+  return `已选 ${statusIn.length} 项`;
 }
+
+const ALL_IMPORTED_STATUS_FILTER_OPTIONS = [
+  { value: IMPORTED_STATUS_FILTER_UNSET, label: "未标记" },
+  ...(Object.keys(testCaseStatusLabel) as TestCaseStatus[]).map((s) => ({
+    value: s,
+    label: testCaseStatusLabel[s],
+  })),
+] as const;
+
+type ImportedStatusFilterValue =
+  (typeof ALL_IMPORTED_STATUS_FILTER_OPTIONS)[number]["value"];
 
 export type ExecutionTaskDetail = {
   id: string;
@@ -150,7 +172,13 @@ export function ExecutionTaskDetailClient({
     () =>
       initial.linkedCases.map((x) => ({
         ...x.testCase,
-        linkedAt: x.createdAt.toISOString(),
+        createdAt: coerceToDate(
+          x.testCase.createdAt as Date | string,
+        ),
+        updatedAt: coerceToDate(
+          x.testCase.updatedAt as Date | string,
+        ),
+        linkedAt: coerceToIso(x.createdAt as Date | string),
       })),
     [initial.linkedCases],
   );
@@ -166,8 +194,8 @@ export function ExecutionTaskDetailClient({
     () => ({
       caseNoContains: "",
       titleContains: "",
-      /** `__UNSET__`：仅 status 为空的用例 */
-      status: "" as TestCaseStatus | typeof IMPORTED_STATUS_FILTER_UNSET | "",
+      /** 空数组表示不过滤；可多项组合（含未填） */
+      statusIn: [] as ImportedStatusFilterValue[],
       priorityText: "",
       maintainer: "",
       submitter: "",
@@ -178,6 +206,38 @@ export function ExecutionTaskDetailClient({
   );
   const [detailAdvFilter, setDetailAdvFilter] = useState({ ...DEFAULT_DETAIL_ADV });
   const [detailAdvOpen, setDetailAdvOpen] = useState(false);
+  const [statusHeaderFilterOpen, setStatusHeaderFilterOpen] = useState(false);
+  const statusHeaderFilterRef = useRef<HTMLDivElement | null>(null);
+
+  const hasActiveDetailFilters = useMemo(() => {
+    if (q.trim()) return true;
+    const f = detailAdvFilter;
+    return (
+      f.caseNoContains.trim() !== "" ||
+      f.titleContains.trim() !== "" ||
+      f.statusIn.length > 0 ||
+      f.priorityText.trim() !== "" ||
+      f.maintainer.trim() !== "" ||
+      f.submitter.trim() !== "" ||
+      f.updatedFrom !== "" ||
+      f.updatedTo !== ""
+    );
+  }, [detailAdvFilter, q]);
+
+  const clearAllDetailFilters = useCallback(() => {
+    setQ("");
+    setDetailAdvFilter({ ...DEFAULT_DETAIL_ADV });
+    setStatusHeaderFilterOpen(false);
+  }, [DEFAULT_DETAIL_ADV]);
+
+  const toggleStatusInFilter = useCallback((value: ImportedStatusFilterValue) => {
+    setDetailAdvFilter((p) => {
+      const set = new Set(p.statusIn);
+      if (set.has(value)) set.delete(value);
+      else set.add(value);
+      return { ...p, statusIn: Array.from(set) };
+    });
+  }, []);
 
   const advFilteredRows = useMemo(() => {
     return linkedRows.filter((c) => {
@@ -185,13 +245,17 @@ export function ExecutionTaskDetailClient({
       if (cn && !c.caseNo.toLowerCase().includes(cn)) return false;
       const tn = detailAdvFilter.titleContains.trim().toLowerCase();
       if (tn && !c.title.toLowerCase().includes(tn)) return false;
-      if (detailAdvFilter.status === IMPORTED_STATUS_FILTER_UNSET) {
-        if (c.status != null) return false;
-      } else if (
-        detailAdvFilter.status &&
-        c.status !== detailAdvFilter.status
-      ) {
-        return false;
+      if (detailAdvFilter.statusIn.length > 0) {
+        const wantsUnset = detailAdvFilter.statusIn.includes(
+          IMPORTED_STATUS_FILTER_UNSET,
+        );
+        const statusValues = detailAdvFilter.statusIn.filter(
+          (s): s is TestCaseStatus => s !== IMPORTED_STATUS_FILTER_UNSET,
+        );
+        const matchUnset = wantsUnset && c.status == null;
+        const matchStatus =
+          c.status != null && statusValues.includes(c.status);
+        if (!matchUnset && !matchStatus) return false;
       }
       const p = detailAdvFilter.priorityText.trim();
       if (p) {
@@ -344,7 +408,25 @@ export function ExecutionTaskDetailClient({
     [linkedRows],
   );
 
+  const handleImportFromLibrary = useCallback(
+    async (ids: string[]) => {
+      const r = await addExecutionTaskLinkedTestCases(initial.id, ids);
+      setMsg(r);
+      if (r.ok) {
+        setImportOpen(false);
+        router.refresh();
+      }
+    },
+    [initial.id, router],
+  );
+
+  const linkedCaseIds = useMemo(
+    () => linkedRows.map((r) => r.id),
+    [linkedRows],
+  );
+
   const [importOpen, setImportOpen] = useState(false);
+  const [exportWorking, setExportWorking] = useState(false);
   const [batchEditOpen, setBatchEditOpen] = useState(false);
   const [batchEditWorking, setBatchEditWorking] = useState(false);
   const [batchStatusSel, setBatchStatusSel] = useState("keep");
@@ -353,25 +435,6 @@ export function ExecutionTaskDetailClient({
   const [batchMaintainerText, setBatchMaintainerText] = useState("");
   const [batchSubmitterApply, setBatchSubmitterApply] = useState(false);
   const [batchSubmitterText, setBatchSubmitterText] = useState("");
-  const [products, setProducts] = useState<ProductOption[]>([]);
-  const [iterOptions, setIterOptions] = useState<
-    Array<{ code: string; label: string; productId?: string | null }>
-  >([{ code: "", label: "baseline（全部迭代）", productId: null }]);
-
-  /** 导入弹窗内所选产品（可与任务产品不一致，便于跨产品搜库） */
-  const [importProductId, setImportProductId] = useState("");
-  const [importIterCode, setImportIterCode] = useState("");
-  const [importQuery, setImportQuery] = useState("");
-  const [importResults, setImportResults] = useState<TestCaseIdOption[]>([]);
-  const [importLoading, setImportLoading] = useState(false);
-  const [importPickIds, setImportPickIds] = useState<string[]>([]);
-  const importPickIdsRef = useRef(importPickIds);
-  importPickIdsRef.current = importPickIds;
-  const importPickSet = useMemo(() => new Set(importPickIds), [importPickIds]);
-  const importSelectAllRef = useRef<HTMLInputElement | null>(null);
-  const [importTblChkW, setImportTblChkW] = useState(40);
-  const [importTblNoW, setImportTblNoW] = useState(128);
-  const [importTblNameW, setImportTblNameW] = useState(320);
 
   const submitBatchEdit = useCallback(async () => {
     const ids = pickedIds.filter((id) => filteredLinkedRows.some((r) => r.id === id));
@@ -382,25 +445,52 @@ export function ExecutionTaskDetailClient({
       maintainer?: string | null;
       submitter?: string | null;
     } = {};
-    if (batchStatusSel === "clear") updates.status = null;
-    else if (batchStatusSel !== "keep") updates.status = batchStatusSel as TestCaseStatus;
+    const setTaskStatus =
+      batchStatusSel !== "keep" && batchStatusSel !== "clear"
+        ? (batchStatusSel as TestCaseStatus)
+        : null;
+    const clearLibraryStatus = batchStatusSel === "clear";
+    // 任务内批量改状态：写入执行记录并回写用例库；「清空」仅清空用例库状态（任务展示仍跟执行记录）
+    if (clearLibraryStatus) updates.status = null;
     if (batchPrioritySel === "unset") updates.priority = null;
     else if (batchPrioritySel !== "keep") updates.priority = Number(batchPrioritySel);
     if (batchMaintainerApply) updates.maintainer = batchMaintainerText.trim() || null;
     if (batchSubmitterApply) updates.submitter = batchSubmitterText.trim() || null;
-    if (Object.keys(updates).length === 0) {
+    if (!setTaskStatus && Object.keys(updates).length === 0) {
       setMsg({ error: "请至少选择一项要修改的内容" });
       return;
     }
     setBatchEditWorking(true);
     setMsg(null);
     try {
-      const r = await bulkUpdateTestCasesMeta({ ids, updates });
-      setMsg(r);
-      if (r.ok) {
-        setBatchEditOpen(false);
-        router.refresh();
+      if (Object.keys(updates).length > 0) {
+        const r = await bulkUpdateTestCasesMeta({ ids, updates });
+        if (r.error) {
+          setMsg(r);
+          return;
+        }
       }
+      if (setTaskStatus) {
+        for (const caseId of ids) {
+          const r = await addExecutionTaskCaseExecRecord({
+            executionTaskId: initial.id,
+            testCaseId: caseId,
+            status: setTaskStatus,
+            executor: batchSubmitterApply
+              ? batchSubmitterText.trim() || null
+              : null,
+            result: null,
+            note: "批量修改状态",
+          });
+          if (r.error) {
+            setMsg(r);
+            return;
+          }
+        }
+      }
+      setMsg({ ok: true });
+      setBatchEditOpen(false);
+      router.refresh();
     } finally {
       setBatchEditWorking(false);
     }
@@ -413,163 +503,45 @@ export function ExecutionTaskDetailClient({
     batchMaintainerText,
     batchSubmitterApply,
     batchSubmitterText,
+    initial.id,
     router,
   ]);
 
-  const importPendingRows = useMemo(
-    () => importResults.filter((r) => !linkedIdSet.has(r.id)),
-    [importResults, linkedIdSet],
-  );
-  const importPendingRowIdsRef = useRef<string[]>([]);
-  importPendingRowIdsRef.current = importPendingRows.map((r) => r.id);
-  const {
-    onRowCheckboxPointerDown: onImportPickCheckboxPointerDown,
-    tableBodyRef: importPickTableBodyRef,
-  } = useRowCheckboxBrushByIds({
-    pagedRowIdsRef: importPendingRowIdsRef,
-    selectedIdsRef: importPickIdsRef,
-    setSelectedIds: setImportPickIds,
-  });
-
-  useEffect(() => {
-    void (async () => {
-      try {
-        const [ps, opts] = await Promise.all([
-          listProductOptions(),
-          listIterationCodeOptions(),
-        ]);
-        setProducts(ps);
-        setIterOptions(opts);
-      } catch {
-        // ignore
-      }
-    })();
-  }, []);
-
-  const importIterationSelectOptions = useMemo(() => {
-    const pid = importProductId.trim();
-    if (!pid) {
-      return iterOptions;
-    }
-    return iterOptions.filter(
-      (o) => o.code === "" || (o.productId ?? "") === pid,
-    );
-  }, [importProductId, iterOptions]);
-
-  useEffect(() => {
-    if (!importOpen) return;
-    setImportProductId((prev) => prev || initial.iteration.productId);
-  }, [importOpen, initial.iteration.productId]);
-
-  useEffect(() => {
-    if (!importOpen) return;
-    const t = window.setTimeout(() => {
-      void (async () => {
-        setImportLoading(true);
-        try {
-          const rawPid = importProductId.trim();
-          const rows = await searchTestCaseIdOptions({
-            q: importQuery,
-            iterationCode: importIterCode || null,
-            take: 200,
-            productId: rawPid !== "" ? rawPid : null,
-          });
-          setImportResults(rows);
-        } finally {
-          setImportLoading(false);
-        }
-      })();
-    }, 220);
-    return () => clearTimeout(t);
-  }, [importIterCode, importOpen, importProductId, importQuery]);
-
-  useEffect(() => {
-    setImportPickIds([]);
-  }, [importResults]);
-
-  useEffect(() => {
-    const el = importSelectAllRef.current;
-    if (!el) return;
-    if (importPendingRows.length === 0) {
-      el.indeterminate = false;
-      el.checked = false;
+  const runExportCases = useCallback(async () => {
+    const ids =
+      pickedIds.length > 0
+        ? pickedIds.filter((id) => filteredLinkedRows.some((r) => r.id === id))
+        : allLinkedFilteredIds;
+    if (ids.length === 0) {
+      setMsg({ error: "没有可导出的用例" });
       return;
     }
-    const all = importPendingRows.every((r) => importPickSet.has(r.id));
-    const some = importPendingRows.some((r) => importPickSet.has(r.id));
-    el.indeterminate = some && !all;
-    el.checked = all;
-  }, [importPendingRows, importPickSet]);
-
-  const startResizeImportChkVsNo = useCallback(
-    (e: ReactMouseEvent) => {
-      e.preventDefault();
-      const sx = e.clientX;
-      const a0 = importTblChkW;
-      const b0 = importTblNoW;
-      const move = (ev: globalThis.MouseEvent) => {
-        const dx = ev.clientX - sx;
-        setImportTblChkW(Math.min(56, Math.max(32, a0 + dx)));
-        setImportTblNoW(Math.min(420, Math.max(88, b0 - dx)));
-      };
-      const up = () => {
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
-      };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
-    },
-    [importTblChkW, importTblNoW],
-  );
-
-  const startResizeImportNoVsName = useCallback(
-    (e: ReactMouseEvent) => {
-      e.preventDefault();
-      const sx = e.clientX;
-      const a0 = importTblNoW;
-      const b0 = importTblNameW;
-      const move = (ev: globalThis.MouseEvent) => {
-        const dx = ev.clientX - sx;
-        setImportTblNoW(Math.min(420, Math.max(88, a0 + dx)));
-        setImportTblNameW(Math.min(820, Math.max(200, b0 - dx)));
-      };
-      const up = () => {
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
-      };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
-    },
-    [importTblNameW, importTblNoW],
-  );
-
-  const toggleImportPick = useCallback((id: string) => {
-    setImportPickIds((prev) => {
-      const s = new Set(prev);
-      if (s.has(id)) s.delete(id);
-      else s.add(id);
-      return Array.from(s);
-    });
-  }, []);
-
-  const toggleImportPickAll = useCallback(() => {
-    const ids = importPendingRows.map((r) => r.id);
-    const all = ids.length > 0 && ids.every((id) => importPickSet.has(id));
-    setImportPickIds(all ? [] : ids);
-  }, [importPendingRows, importPickSet]);
-
-  const doImport = useCallback(async () => {
-    const ids = importPickIds.filter((id) =>
-      importPendingRows.some((r) => r.id === id),
+    const fields = TEST_CASE_EXPORT_COLUMN_KEYS.filter(
+      (k) => DEFAULT_TEST_CASE_EXPORT_FIELDS[k],
     );
-    if (ids.length === 0) return;
-    const r = await addExecutionTaskLinkedTestCases(initial.id, ids);
-    setMsg(r);
-    if (r.ok) {
-      setImportOpen(false);
-      router.refresh();
+    setExportWorking(true);
+    setMsg(null);
+    try {
+      const r = await getTestCasesExportRows(ids, initial.iteration.productId);
+      if (r.error || !r.rows?.length) {
+        setMsg({ error: r.error ?? "没有可导出的数据" });
+        return;
+      }
+      downloadTestCaseExportCsv(
+        buildTestCaseExportCsv(r.rows, fields),
+        "任务用例导出",
+      );
+    } catch {
+      setMsg({ error: "导出失败，请稍后重试" });
+    } finally {
+      setExportWorking(false);
     }
-  }, [importPickIds, importPendingRows, initial.id, router]);
+  }, [
+    pickedIds,
+    filteredLinkedRows,
+    allLinkedFilteredIds,
+    initial.iteration.productId,
+  ]);
 
   const [asidePaneW, setAsidePaneW] = useState(168);
   const [idxColW, setIdxColW] = useState(40);
@@ -634,6 +606,19 @@ export function ExecutionTaskDetailClient({
     return () => window.removeEventListener("mousedown", onDown);
   }, [importedColPanelOpen]);
 
+  useEffect(() => {
+    if (!statusHeaderFilterOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const el = statusHeaderFilterRef.current;
+      if (!el) return;
+      const t = e.target as unknown;
+      if (!(t instanceof Element)) return;
+      if (!el.contains(t)) setStatusHeaderFilterOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [statusHeaderFilterOpen]);
+
   const startResizeAside = useCallback((e: ReactMouseEvent) => {
     e.preventDefault();
     const sx = e.clientX;
@@ -666,8 +651,8 @@ export function ExecutionTaskDetailClient({
             setIdxColW(Math.min(56, Math.max(28, leftW0 + dx)));
             setImportedWidth(right, rightW0 - dx);
           } else {
-            setImportedWidth(left, Math.min(560, Math.max(56, leftW0 + dx)));
-            setImportedWidth(right, Math.min(560, Math.max(40, rightW0 - dx)));
+            setImportedWidth(left, leftW0 + dx);
+            setImportedWidth(right, rightW0 - dx);
           }
         };
         const up = () => {
@@ -721,7 +706,7 @@ export function ExecutionTaskDetailClient({
                 c.status ? testCaseStatusBadgeClass[c.status] : "border-zinc-200 bg-zinc-50 text-zinc-600",
               ].join(" ")}
             >
-              {c.status ? testCaseStatusLabel[c.status] : "—"}
+              {c.status ? testCaseStatusLabel[c.status] : "未标记"}
             </span>
           </td>
         );
@@ -748,13 +733,13 @@ export function ExecutionTaskDetailClient({
       case "updatedAt":
         return (
           <td key={key} className="px-2 py-2 align-top text-xs text-zinc-600 tabular-nums">
-            {formatTs(c.updatedAt.toISOString())}
+            {formatTs(coerceToIso(c.updatedAt))}
           </td>
         );
       case "createdAt":
         return (
           <td key={key} className="px-2 py-2 align-top text-xs text-zinc-600 tabular-nums">
-            {formatTs(c.createdAt.toISOString())}
+            {formatTs(coerceToIso(c.createdAt))}
           </td>
         );
       case "ops":
@@ -783,6 +768,13 @@ export function ExecutionTaskDetailClient({
   };
 
   const firstImportedCol = importedVisibleOrdered[0];
+  const importedTableMinW = useMemo(() => {
+    const cols = importedVisibleOrdered.reduce(
+      (sum, k) => sum + importedWidthFor(k),
+      52 + idxColW,
+    );
+    return Math.max(720, cols);
+  }, [importedVisibleOrdered, importedWidthFor, idxColW]);
 
   return (
     <ModuleWorkspaceCard>
@@ -866,6 +858,15 @@ export function ExecutionTaskDetailClient({
                       {detailAdvOpen ? "▼" : "▶"}
                     </span>
                   </button>
+                  {hasActiveDetailFilters ? (
+                    <button
+                      type="button"
+                      className="rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                      onClick={clearAllDetailFilters}
+                    >
+                      清除筛选
+                    </button>
+                  ) : null}
                   <div className="relative" ref={importedColPanelRef}>
                     <button
                       type="button"
@@ -939,6 +940,23 @@ export function ExecutionTaskDetailClient({
                       </div>
                     ) : null}
                   </div>
+                  <button
+                    type="button"
+                    disabled={exportWorking || filteredLinkedRows.length === 0}
+                    className={MODULE_TOOLBAR_BTN_SECONDARY}
+                    title={
+                      pickedIds.length > 0
+                        ? `导出已选 ${pickedIds.length} 条用例为 CSV`
+                        : "未勾选时导出当前列表全部用例（含筛选结果）"
+                    }
+                    onClick={() => void runExportCases()}
+                  >
+                    {exportWorking
+                      ? "导出中…"
+                      : pickedIds.length > 0
+                        ? `导出用例（${pickedIds.length}）`
+                        : "导出用例"}
+                  </button>
                   <button
                     type="button"
                     className="rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white"
@@ -1016,37 +1034,26 @@ export function ExecutionTaskDetailClient({
                         }
                       />
                     </div>
-                    <div>
+                    <div className="sm:col-span-2">
                       <label className="text-xs font-medium text-zinc-600">
-                        状态
+                        状态（可多选）
                       </label>
-                      <select
-                        className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
-                        value={detailAdvFilter.status}
-                        onChange={(e) =>
-                          setDetailAdvFilter((p) => ({
-                            ...p,
-                            status: e.target.value as
-                              | TestCaseStatus
-                              | typeof IMPORTED_STATUS_FILTER_UNSET
-                              | "",
-                          }))
-                        }
-                      >
-                        <option value="">全部</option>
-                        <option value={IMPORTED_STATUS_FILTER_UNSET}>未填</option>
-                        {(Object.keys(testCaseStatusLabel) as TestCaseStatus[]).map(
-                          (s) => (
-                            <option
-                              key={s}
-                              value={s}
-                              style={testCaseStatusSelectOptionStyle[s]}
-                            >
-                              {testCaseStatusLabel[s]}
-                            </option>
-                          ),
-                        )}
-                      </select>
+                      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1.5 rounded-lg border border-zinc-200 bg-white px-2.5 py-2">
+                        {ALL_IMPORTED_STATUS_FILTER_OPTIONS.map((o) => (
+                          <label
+                            key={o.value}
+                            className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-zinc-800"
+                          >
+                            <input
+                              type="checkbox"
+                              className="h-3.5 w-3.5 rounded border-zinc-300"
+                              checked={detailAdvFilter.statusIn.includes(o.value)}
+                              onChange={() => toggleStatusInFilter(o.value)}
+                            />
+                            {o.label}
+                          </label>
+                        ))}
+                      </div>
                     </div>
                     <div>
                       <label className="text-xs font-medium text-zinc-600">
@@ -1126,7 +1133,7 @@ export function ExecutionTaskDetailClient({
                         }
                       />
                     </div>
-                    <div className="flex items-end sm:col-span-2 lg:col-span-4">
+                    <div className="flex flex-wrap items-end gap-2 sm:col-span-2 lg:col-span-4">
                       <button
                         type="button"
                         className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
@@ -1136,6 +1143,17 @@ export function ExecutionTaskDetailClient({
                       >
                         重置筛选
                       </button>
+                      {detailAdvFilter.statusIn.length > 0 ? (
+                        <button
+                          type="button"
+                          className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                          onClick={() =>
+                            setDetailAdvFilter((p) => ({ ...p, statusIn: [] }))
+                          }
+                        >
+                          清除状态筛选
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -1146,7 +1164,13 @@ export function ExecutionTaskDetailClient({
                     暂无已导入用例。
                   </div>
                 ) : (
-                  <table className="w-max min-w-[720px] table-fixed text-sm">
+                  <table
+                    className="table-fixed text-left text-sm"
+                    style={{
+                      width: importedTableMinW,
+                      minWidth: importedTableMinW,
+                    }}
+                  >
                     <colgroup>
                       <col style={{ width: 52 }} />
                       <col style={{ width: idxColW }} />
@@ -1199,54 +1223,93 @@ export function ExecutionTaskDetailClient({
                               ].join(" ")}
                             >
                               {k === "status" ? (
-                                <div className="group/st inline-flex min-w-0 max-w-full items-center gap-0.5 pr-1">
-                                  <span className="min-w-0 shrink truncate leading-tight">
-                                    {importedColLabels[k]}
-                                  </span>
-                                  <div className="relative h-4 w-4 shrink-0 rounded-sm focus-within:ring-2 focus-within:ring-zinc-400/50">
-                                    <select
-                                      className="absolute inset-0 z-10 cursor-pointer opacity-0 focus:outline-none"
-                                      value={detailAdvFilter.status}
-                                      title={`筛选状态（当前：${importedStatusFilterSummary(detailAdvFilter.status)}）`}
-                                      aria-label={`筛选状态，当前为${importedStatusFilterSummary(detailAdvFilter.status)}`}
-                                      onChange={(e) =>
-                                        setDetailAdvFilter((p) => ({
-                                          ...p,
-                                          status: e.target.value as
-                                            | TestCaseStatus
-                                            | typeof IMPORTED_STATUS_FILTER_UNSET
-                                            | "",
-                                        }))
-                                      }
-                                      onClick={(e) => e.stopPropagation()}
-                                      onMouseDown={(e) =>
-                                        e.stopPropagation()
-                                      }
-                                    >
-                                      <option value="">全部</option>
-                                      <option
-                                        value={IMPORTED_STATUS_FILTER_UNSET}
-                                      >
-                                        未填
-                                      </option>
-                                      {(
-                                        Object.keys(
-                                          testCaseStatusLabel,
-                                        ) as TestCaseStatus[]
-                                      ).map((s) => (
-                                        <option key={s} value={s}>
-                                          {testCaseStatusLabel[s]}
-                                        </option>
-                                      ))}
-                                    </select>
+                                <div
+                                  ref={statusHeaderFilterRef}
+                                  className="relative inline-flex min-w-0 max-w-full items-center"
+                                >
+                                  <button
+                                    type="button"
+                                    className="group/st inline-flex min-w-0 max-w-full items-center gap-0.5 pr-1 text-left"
+                                    title={`筛选状态（当前：${importedStatusFilterSummary(detailAdvFilter.statusIn)}）`}
+                                    aria-expanded={statusHeaderFilterOpen}
+                                    onClick={() =>
+                                      setStatusHeaderFilterOpen((o) => !o)
+                                    }
+                                  >
+                                    <span className="min-w-0 shrink truncate leading-tight">
+                                      {importedColLabels[k]}
+                                      {detailAdvFilter.statusIn.length > 0 ? (
+                                        <span className="ml-1 tabular-nums text-zinc-400">
+                                          ({detailAdvFilter.statusIn.length})
+                                        </span>
+                                      ) : null}
+                                    </span>
                                     <span
                                       aria-hidden
-                                      className="pointer-events-none block h-4 w-4 bg-[length:14px_14px] bg-[position:center] bg-no-repeat opacity-70 transition-opacity group-hover/st:opacity-100"
+                                      className="block h-4 w-4 shrink-0 bg-[length:14px_14px] bg-[position:center] bg-no-repeat opacity-70 transition-opacity group-hover/st:opacity-100"
                                       style={{
                                         backgroundImage: `url("${IMPORTED_STATUS_HEADER_CHEVRON}")`,
                                       }}
                                     />
-                                  </div>
+                                  </button>
+                                  {statusHeaderFilterOpen ? (
+                                    <div
+                                      className="absolute left-0 top-full z-30 mt-1 w-44 rounded-lg border border-zinc-200 bg-white p-2 text-left shadow-xl"
+                                      role="dialog"
+                                      aria-label="状态筛选"
+                                    >
+                                      <div className="max-h-52 space-y-1 overflow-y-auto">
+                                        {ALL_IMPORTED_STATUS_FILTER_OPTIONS.map(
+                                          (o) => (
+                                            <label
+                                              key={o.value}
+                                              className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-800 hover:bg-zinc-50"
+                                            >
+                                              <input
+                                                type="checkbox"
+                                                className="h-3.5 w-3.5 rounded border-zinc-300"
+                                                checked={detailAdvFilter.statusIn.includes(
+                                                  o.value,
+                                                )}
+                                                onChange={() =>
+                                                  toggleStatusInFilter(o.value)
+                                                }
+                                              />
+                                              {o.label}
+                                            </label>
+                                          ),
+                                        )}
+                                      </div>
+                                      <div className="mt-2 flex flex-wrap gap-2 border-t border-zinc-100 pt-2">
+                                        <button
+                                          type="button"
+                                          className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                          onClick={() =>
+                                            setDetailAdvFilter((p) => ({
+                                              ...p,
+                                              statusIn: ALL_IMPORTED_STATUS_FILTER_OPTIONS.map(
+                                                (o) => o.value,
+                                              ),
+                                            }))
+                                          }
+                                        >
+                                          全选
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50"
+                                          onClick={() =>
+                                            setDetailAdvFilter((p) => ({
+                                              ...p,
+                                              statusIn: [],
+                                            }))
+                                          }
+                                        >
+                                          清除筛选
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : null}
                                 </div>
                               ) : (
                                 importedColLabels[k]
@@ -1347,201 +1410,39 @@ export function ExecutionTaskDetailClient({
       </div>
 
       {importOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/45 p-4">
-          <div className="mb-8 flex max-h-[92vh] w-[66.67vw] min-h-[min(70vh,720px)] max-w-[1200px] flex-col rounded-2xl border border-zinc-200 bg-white shadow-xl">
-            <div className="flex items-center justify-between border-b border-zinc-100 px-6 py-4">
-              <div>
-                <div className="text-sm font-semibold text-zinc-900">导入用例</div>
-                <div className="mt-0.5 text-xs text-zinc-500">
-                  已导入的用例会自动隐藏；支持模糊搜索与按迭代筛选。
-                </div>
+        <div className="fixed inset-0 z-50 flex flex-col bg-white">
+          <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-5 py-3">
+            <div>
+              <div className="text-sm font-semibold text-zinc-900">导入用例</div>
+              <div className="mt-0.5 text-xs text-zinc-500">
+                在测试用例库中选择目录并勾选用例导入本任务；已导入的用例不可再次勾选。
               </div>
-              <button
-                type="button"
-                className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
-                onClick={() => setImportOpen(false)}
+            </div>
+            <button
+              type="button"
+              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+              onClick={() => setImportOpen(false)}
+            >
+              关闭
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-hidden">
+              <Suspense
+                fallback={
+                  <div className="flex h-full min-h-[400px] items-center justify-center text-sm text-zinc-500">
+                    加载用例库…
+                  </div>
+                }
               >
-                关闭
-              </button>
-            </div>
-
-            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
-              <div className="flex flex-wrap items-end gap-2">
-                <div className="min-w-[200px] flex-1">
-                  <label className="text-[11px] font-medium text-zinc-500">
-                    产品
-                  </label>
-                  <select
-                    className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
-                    value={importProductId}
-                    onChange={(e) => {
-                      setImportProductId(e.target.value);
-                      setImportIterCode("");
-                    }}
-                  >
-                    <option value="">
-                      全部产品（不按产品过滤）
-                    </option>
-                    {products.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.code ? `${p.name}（${p.code}）` : p.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="min-w-[200px] flex-1">
-                  <label className="text-[11px] font-medium text-zinc-500">
-                    迭代
-                  </label>
-                  <select
-                    className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-sm"
-                    value={importIterCode}
-                    onChange={(e) => setImportIterCode(e.target.value)}
-                  >
-                    {importIterationSelectOptions.map((o) => (
-                      <option key={o.code || "__baseline__"} value={o.code}>
-                        {importProductId.trim() && o.code
-                          ? iterationSelectShortLabel(o)
-                          : o.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  disabled={importPickIds.length === 0}
-                  className="rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-                  onClick={() => void doImport()}
-                >
-                  {importPickIds.length > 0
-                    ? `导入已选（${importPickIds.length}）`
-                    : "导入已选"}
-                </button>
-                <button
-                  type="button"
-                  className="rounded-lg border border-zinc-200 px-2.5 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                  onClick={() => {
-                    setImportProductId(initial.iteration.productId);
-                    setImportIterCode("");
-                    setImportQuery("");
-                    setImportPickIds([]);
-                  }}
-                >
-                  重置
-                </button>
-              </div>
-
-              <div>
-                <label className="text-xs font-medium text-zinc-600">
-                  搜索用例
-                </label>
-                <input
-                  type="search"
-                  className="mt-1 w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                  value={importQuery}
-                  onChange={(e) => setImportQuery(e.target.value)}
-                  placeholder="编号 / 名称（可选）；留空则列出当前迭代下用例"
+                <TestCaseLibraryClient
+                  importPickerMode
+                  embedProductId={initial.iteration.productId}
+                  initialFolders={testCaseFolders}
+                  linkedCaseIds={linkedCaseIds}
+                  onImportCases={handleImportFromLibrary}
+                  onImportPickerClose={() => setImportOpen(false)}
                 />
-              </div>
-
-              <div className="rounded-lg border border-zinc-200">
-                <div className="flex items-center justify-between border-b border-zinc-100 px-3 py-2 text-xs text-zinc-500">
-                  <span>可选用例（未导入 {importPendingRows.length} 条 / 最多 200）</span>
-                  <span>{importLoading ? "加载中…" : ""}</span>
-                </div>
-                <div className="max-h-[420px] overflow-auto">
-                  {importPendingRows.length === 0 ? (
-                    <div className="px-3 py-3 text-sm text-zinc-500">
-                      {importLoading ? "加载中…" : "暂无可用用例（可能均已导入，或当前条件下无数据）。"}
-                    </div>
-                  ) : (
-                    <table className="w-full min-w-[520px] table-fixed text-sm">
-                      <colgroup>
-                        <col style={{ width: importTblChkW }} />
-                        <col style={{ width: importTblNoW }} />
-                        <col style={{ width: importTblNameW }} />
-                      </colgroup>
-                      <thead className="sticky top-0 z-[1] border-b border-zinc-100 bg-zinc-50 text-xs text-zinc-500">
-                        <tr>
-                          <th className="relative px-2 py-2 text-left font-medium">
-                            <input
-                              ref={importSelectAllRef}
-                              type="checkbox"
-                              className="h-3.5 w-3.5 rounded border-zinc-300"
-                              aria-label="全选可选用例"
-                              onChange={() => toggleImportPickAll()}
-                            />
-                            <TableColumnResizeHandle
-                              onResizeStart={startResizeImportChkVsNo}
-                            />
-                          </th>
-                          <th className="relative px-2 py-2 text-left font-medium">
-                            用例编号
-                            <TableColumnResizeHandle
-                              onResizeStart={startResizeImportNoVsName}
-                            />
-                          </th>
-                          <th className="px-2 py-2 text-left font-medium">名称 / 目录</th>
-                        </tr>
-                      </thead>
-                      <tbody
-                        ref={importPickTableBodyRef}
-                        className="divide-y divide-zinc-100"
-                      >
-                        {importPendingRows.map((c) => (
-                          <tr
-                            key={c.id}
-                            data-pm-row-select={c.id}
-                            className="cursor-pointer hover:bg-zinc-50/70"
-                            onClick={() => toggleImportPick(c.id)}
-                          >
-                            <td
-                              className="px-2 py-2 align-middle"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <input
-                                type="checkbox"
-                                className="h-3.5 w-3.5 rounded border-zinc-300"
-                                checked={importPickSet.has(c.id)}
-                                aria-label={`选择用例 ${c.caseNo}`}
-                                onChange={() => {}}
-                                onClick={(e) => e.preventDefault()}
-                                onPointerDown={(e) =>
-                                  onImportPickCheckboxPointerDown(e, c.id)
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key !== " " && e.key !== "Enter") return;
-                                  e.preventDefault();
-                                  e.stopPropagation();
-                                  setImportPickIds((prev) => {
-                                    const s = new Set(prev);
-                                    if (s.has(c.id)) s.delete(c.id);
-                                    else s.add(c.id);
-                                    return Array.from(s);
-                                  });
-                                }}
-                                title="按住并拖动经过多行可连续勾选"
-                              />
-                            </td>
-                            <td className="px-2 py-2 font-mono text-xs text-zinc-700">
-                              {c.caseNo}
-                            </td>
-                            <td className="px-2 py-2 text-zinc-800">
-                              <div className="truncate">{c.title}</div>
-                              {c.folderName ? (
-                                <div className="mt-0.5 truncate text-[11px] text-zinc-500">
-                                  {c.folderName}
-                                </div>
-                              ) : null}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            </div>
+              </Suspense>
           </div>
         </div>
       ) : null}
@@ -1560,7 +1461,7 @@ export function ExecutionTaskDetailClient({
                   批量修改用例
                 </div>
                 <div className="mt-0.5 text-xs text-zinc-500">
-                  将写入用例库中对应用例；仅下方勾选的项会更新（状态可选「清空」）。
+                  状态写入本任务执行记录并同步用例库；等级/维护人等写入用例库。状态选「清空」仅清空用例库状态。
                 </div>
               </div>
               <button

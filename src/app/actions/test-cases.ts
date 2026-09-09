@@ -863,6 +863,63 @@ export async function countTestCasesByFolderSubtree(
   return out;
 }
 
+export type TestCaseCountRow = {
+  folderId: string;
+  status: TestCaseStatus | null;
+  priority: number | null;
+  maintainer: string | null;
+  submitter: string | null;
+  caseNo: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** 供目录树计数：当前产品下全部用例的轻量字段（可选按迭代筛选） */
+export async function listTestCaseCountRows(
+  productId?: string | null,
+  iterationCode?: string | null,
+): Promise<TestCaseCountRow[]> {
+  const pid = await resolveTestCaseLibraryProductId((productId ?? "").trim());
+  if (!pid) return [];
+  await migrateLegacyTestCaseFolderProductIds();
+
+  const where: Prisma.TestCaseWhereInput = {
+    ...(iterationCode ? { iterationCode } : {}),
+    folder: { productId: pid },
+  };
+
+  try {
+    const rows = await prisma.testCase.findMany({
+      where,
+      select: {
+        folderId: true,
+        status: true,
+        priority: true,
+        maintainer: true,
+        submitter: true,
+        caseNo: true,
+        title: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+    return rows.map((c) => ({
+      folderId: c.folderId,
+      status: c.status,
+      priority: c.priority,
+      maintainer: c.maintainer,
+      submitter: c.submitter,
+      caseNo: c.caseNo,
+      title: c.title,
+      createdAt: c.createdAt.toISOString(),
+      updatedAt: c.updatedAt.toISOString(),
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export async function createFolder(input: {
   name: string;
   parentId: string | null;
@@ -1141,7 +1198,7 @@ export async function searchTestCaseIdOptions(input: {
   const productId = rawProductId
     ? await resolveTestCaseLibraryProductId(rawProductId)
     : "";
-  const take = Math.max(1, Math.min(200, Number(input.take ?? 20) || 20));
+  const take = Math.max(1, Math.min(2000, Number(input.take ?? 20) || 20));
 
   try {
     await migrateLegacyTestCaseFolderProductIds();

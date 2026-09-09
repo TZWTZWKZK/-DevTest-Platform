@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
   type ReactElement,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
   bulkDeleteExecutionTasks,
@@ -105,6 +106,59 @@ function clampExecRowMenuPosition(
     x: Math.max(pad, Math.min(x, maxX)),
     y: Math.max(pad, Math.min(y, maxY)),
   };
+}
+
+const EXEC_TREE_TOP_MAXIMIZED = -1;
+const EXEC_TREE_TOP_DEFAULT_H = 168;
+const EXEC_TREE_TOP_SNAP = 20;
+const EXEC_TREE_RESIZE_H = 6;
+const EXEC_TREE_MIN_TASK_H = 160;
+const EXEC_TREE_LAYOUT_STORAGE = "pm.executionTaskTree.layout.v1";
+
+type ExecTreeLayoutPersist = {
+  topChromeH: number;
+  topChromeLastNonZero: number;
+};
+
+const EXEC_TREE_LAYOUT_DEFAULTS: ExecTreeLayoutPersist = {
+  topChromeH: EXEC_TREE_TOP_DEFAULT_H,
+  topChromeLastNonZero: EXEC_TREE_TOP_DEFAULT_H,
+};
+
+function maxExecTopChromeHeight(workspaceH: number): number {
+  return Math.max(96, workspaceH - EXEC_TREE_MIN_TASK_H - EXEC_TREE_RESIZE_H);
+}
+
+function parseExecTreeLayout(raw: unknown): ExecTreeLayoutPersist | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Partial<ExecTreeLayoutPersist>;
+  if (typeof o.topChromeH !== "number") return null;
+  if (o.topChromeH !== EXEC_TREE_TOP_MAXIMIZED && o.topChromeH < 0) return null;
+  const topChromeLastNonZero =
+    typeof o.topChromeLastNonZero === "number" && o.topChromeLastNonZero > 0
+      ? o.topChromeLastNonZero
+      : EXEC_TREE_TOP_DEFAULT_H;
+  return { topChromeH: o.topChromeH, topChromeLastNonZero };
+}
+
+function readExecTreeLayoutStorage(): ExecTreeLayoutPersist | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(EXEC_TREE_LAYOUT_STORAGE);
+    if (!raw) return null;
+    return parseExecTreeLayout(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function saveExecTreeLayoutStorage(data: ExecTreeLayoutPersist): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(EXEC_TREE_LAYOUT_STORAGE, JSON.stringify(data));
+  } catch {
+    // ignore
+  }
 }
 
 export function ExecutionTaskTreeClient({
@@ -236,6 +290,105 @@ export function ExecutionTaskTreeClient({
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const workspaceLayoutRef = useRef<HTMLDivElement | null>(null);
+  const topChromeRef = useRef<HTMLDivElement | null>(null);
+  const topChromeLastNonZeroRef = useRef(EXEC_TREE_TOP_DEFAULT_H);
+  const [topChromeH, setTopChromeH] = useState(EXEC_TREE_LAYOUT_DEFAULTS.topChromeH);
+  const [layoutHydrated, setLayoutHydrated] = useState(false);
+
+  useLayoutEffect(() => {
+    const stored = readExecTreeLayoutStorage();
+    if (stored) {
+      topChromeLastNonZeroRef.current = stored.topChromeLastNonZero;
+      setTopChromeH(stored.topChromeH);
+    }
+    setLayoutHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!layoutHydrated) return;
+    const layoutH = workspaceLayoutRef.current?.clientHeight ?? 0;
+    if (layoutH <= 0) return;
+    const maxTop = maxExecTopChromeHeight(layoutH);
+    const clamped =
+      topChromeH === EXEC_TREE_TOP_MAXIMIZED
+        ? EXEC_TREE_TOP_MAXIMIZED
+        : Math.min(maxTop, Math.max(0, topChromeH));
+    if (clamped !== topChromeH) setTopChromeH(clamped);
+    if (clamped > 0) topChromeLastNonZeroRef.current = clamped;
+    const t = window.setTimeout(() => {
+      saveExecTreeLayoutStorage({
+        topChromeH: clamped,
+        topChromeLastNonZero: topChromeLastNonZeroRef.current,
+      });
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [layoutHydrated, topChromeH]);
+
+  const topChromeCollapsed = topChromeH === 0;
+  const topChromeMaximized = topChromeH === EXEC_TREE_TOP_MAXIMIZED;
+
+  const restoreTopChrome = useCallback(() => {
+    setTopChromeH((cur) => {
+      if (cur === EXEC_TREE_TOP_MAXIMIZED) {
+        return Math.max(96, topChromeLastNonZeroRef.current || EXEC_TREE_TOP_DEFAULT_H);
+      }
+      if (cur > 0) {
+        topChromeLastNonZeroRef.current = cur;
+        return 0;
+      }
+      return Math.max(96, topChromeLastNonZeroRef.current || EXEC_TREE_TOP_DEFAULT_H);
+    });
+  }, []);
+
+  const startResizeTopChrome = useCallback(
+    (e: ReactPointerEvent) => {
+      e.preventDefault();
+      const el = e.currentTarget as HTMLElement;
+      el.setPointerCapture?.(e.pointerId);
+      const sy = e.clientY;
+      const layoutH = workspaceLayoutRef.current?.clientHeight ?? 0;
+      const fullMax =
+        layoutH > 0
+          ? maxExecTopChromeHeight(layoutH)
+          : EXEC_TREE_TOP_DEFAULT_H + 200;
+      const h0 =
+        topChromeH === EXEC_TREE_TOP_MAXIMIZED
+          ? fullMax
+          : topChromeH <= 0
+            ? topChromeRef.current?.offsetHeight ?? EXEC_TREE_TOP_DEFAULT_H
+            : topChromeH;
+      const move = (ev: PointerEvent) => {
+        const dy = ev.clientY - sy;
+        const next = Math.min(fullMax, Math.max(0, h0 + dy));
+        if (next <= 0) {
+          setTopChromeH(0);
+          return;
+        }
+        if (next >= fullMax - EXEC_TREE_TOP_SNAP) {
+          if (next < fullMax) topChromeLastNonZeroRef.current = next;
+          setTopChromeH(EXEC_TREE_TOP_MAXIMIZED);
+          return;
+        }
+        topChromeLastNonZeroRef.current = next;
+        setTopChromeH(next);
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        try {
+          el.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // ignore
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [topChromeH],
+  );
 
   const {
     config: colConfig,
@@ -863,104 +1016,138 @@ export function ExecutionTaskTreeClient({
   return (
     <>
     <ModuleWorkspaceCard>
-      <div className="flex max-h-[calc(100dvh-11rem)] min-h-[70vh] flex-col overflow-hidden">
-        <div className="shrink-0 border-b border-zinc-200 bg-zinc-50/60 px-3 py-2 sm:px-4">
-          <div className="flex flex-wrap items-end gap-3 gap-y-2">
-            <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
-              <label className="text-xs font-medium text-zinc-600">所属产品</label>
-              <select
-                className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm"
-                value={productId}
-                onChange={(e) => setProductId(e.target.value)}
-              >
-                {products.length === 0 ? (
-                  <option value="">暂无产品，请先在「产品管理」中创建</option>
-                ) : (
-                  products.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.code ? `${p.name}（${p.code}）` : p.name}
-                    </option>
-                  ))
-                )}
-              </select>
-            </div>
-            <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
-              <label className="text-xs font-medium text-zinc-600">所属迭代</label>
-              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-                <select
-                  className="min-w-0 flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm sm:max-w-[min(100%,32rem)]"
-                  value={iterationId}
-                  onChange={(e) => setIterationId(e.target.value)}
-                >
-                  {visibleIterations.length === 0 ? (
-                    <option value="">暂无迭代，请先在「产品管理」中创建</option>
-                  ) : (
-                    visibleIterations.map((it) => (
-                      <option key={it.id} value={it.id}>
-                        {formatIterationOption(it)}
-                      </option>
-                    ))
-                  )}
-                </select>
-                {iterationId ? (
-                  <span
-                    className="shrink-0 text-xs tabular-nums text-zinc-600"
-                    title="当前迭代下任务数量（与下方列表一致；新建或删除后随列表更新）"
+      <div
+        ref={workspaceLayoutRef}
+        className="flex max-h-[calc(100dvh-11rem)] min-h-[70vh] flex-col overflow-hidden"
+      >
+        {!topChromeCollapsed ? (
+          <div
+            ref={topChromeRef}
+            className={[
+              "flex shrink-0 flex-col overflow-y-auto overflow-x-hidden",
+              topChromeMaximized ? "min-h-0 flex-1" : "",
+            ].join(" ")}
+            style={
+              topChromeMaximized || topChromeH <= 0
+                ? undefined
+                : { height: topChromeH, minHeight: 0 }
+            }
+          >
+            <div className="shrink-0 border-b border-zinc-200 bg-zinc-50/60 px-3 py-2 sm:px-4">
+              <div className="flex flex-wrap items-end gap-3 gap-y-2">
+                <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
+                  <label className="text-xs font-medium text-zinc-600">所属产品</label>
+                  <select
+                    className="mt-0.5 w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm"
+                    value={productId}
+                    onChange={(e) => setProductId(e.target.value)}
                   >
-                    {loading ? (
-                      <span className="text-zinc-400">加载中…</span>
+                    {products.length === 0 ? (
+                      <option value="">暂无产品，请先在「产品管理」中创建</option>
                     ) : (
-                      <>已有任务 {flat.length} 个</>
+                      products.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.code ? `${p.name}（${p.code}）` : p.name}
+                        </option>
+                      ))
                     )}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-            <p className="hidden max-w-xl pb-0.5 text-[11px] leading-snug text-zinc-500 sm:block">
-              先选择<strong>所属迭代</strong>，再在下方表格维护执行任务；点击<strong>任务名称</strong>进入详情导入用例。
-            </p>
-          </div>
-          {!iterationId ? (
-            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
-              没有可选迭代时，请先创建产品与迭代。
-            </p>
-          ) : null}
-        </div>
-
-        <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white">
-          <div className="border-b border-zinc-100 px-4 py-3">
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div>
-                <h2 className="text-sm font-semibold text-zinc-900">
-                  当前：{iterationLabel}
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-500">
-                  表格包含当前迭代下全部执行任务；点击行进入详情；行首 <strong>⋮</strong>{" "}
-                  可重命名、删除（须无子任务且无已导入用例）。表头竖线可拖动调宽。
+                  </select>
+                </div>
+                <div className="min-w-[min(100%,12rem)] flex-1 sm:flex-initial sm:min-w-[220px]">
+                  <label className="text-xs font-medium text-zinc-600">所属迭代</label>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <select
+                      className="min-w-0 flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm sm:max-w-[min(100%,32rem)]"
+                      value={iterationId}
+                      onChange={(e) => setIterationId(e.target.value)}
+                    >
+                      {visibleIterations.length === 0 ? (
+                        <option value="">暂无迭代，请先在「产品管理」中创建</option>
+                      ) : (
+                        visibleIterations.map((it) => (
+                          <option key={it.id} value={it.id}>
+                            {formatIterationOption(it)}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    {iterationId ? (
+                      <span
+                        className="shrink-0 text-xs tabular-nums text-zinc-600"
+                        title="当前迭代下任务数量（与下方列表一致；新建或删除后随列表更新）"
+                      >
+                        {loading ? (
+                          <span className="text-zinc-400">加载中…</span>
+                        ) : (
+                          <>已有任务 {flat.length} 个</>
+                        )}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+                <p className="hidden max-w-xl pb-0.5 text-[11px] leading-snug text-zinc-500 sm:block">
+                  先选择<strong>所属迭代</strong>，再在下方表格维护执行任务；点击<strong>任务名称</strong>进入详情导入用例。
                 </p>
               </div>
-              <div className="flex flex-shrink-0 flex-wrap items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setCreateOpen((o) => !o)}
-                  className={MODULE_TOOLBAR_BTN_PRIMARY}
-                  disabled={!iterationId}
-                >
-                  + 新建执行任务
-                </button>
-                <div className="w-[min(100%,220px)] sm:w-[220px]">
-                  <input
-                    type="search"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
-                    placeholder="模糊查询：任务名称"
-                    value={listTitleQ}
-                    onChange={(e) => setListTitleQ(e.target.value)}
-                  />
+              {!iterationId ? (
+                <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
+                  没有可选迭代时，请先创建产品与迭代。
+                </p>
+              ) : null}
+            </div>
+
+            <div className="shrink-0 border-b border-zinc-100 bg-white px-4 py-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h2 className="text-sm font-semibold text-zinc-900">
+                    当前：{iterationLabel}
+                  </h2>
+                  <p className="mt-0.5 text-xs text-zinc-500">
+                    表格包含当前迭代下全部执行任务；点击行进入详情；行首 <strong>⋮</strong>{" "}
+                    可重命名、删除（须无子任务且无已导入用例）。表头竖线可拖动调宽。
+                  </p>
+                </div>
+                <div className="flex flex-shrink-0 flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setCreateOpen((o) => !o)}
+                    className={MODULE_TOOLBAR_BTN_PRIMARY}
+                    disabled={!iterationId}
+                  >
+                    + 新建执行任务
+                  </button>
+                  <div className="w-[min(100%,220px)] sm:w-[220px]">
+                    <input
+                      type="search"
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm"
+                      placeholder="模糊查询：任务名称"
+                      value={listTitleQ}
+                      onChange={(e) => setListTitleQ(e.target.value)}
+                    />
+                  </div>
                 </div>
               </div>
             </div>
           </div>
+        ) : null}
 
+        <div
+          role="separator"
+          aria-label="拖动调整筛选区与任务列表高度"
+          title={
+            topChromeCollapsed
+              ? "向下拖展开产品/迭代筛选与工具栏"
+              : topChromeMaximized
+                ? "向上拖展开任务列表"
+                : "拖动调整高度（向上扩大任务列表，向下扩大筛选区；双击切换收展）"
+          }
+          className="relative z-20 h-1.5 shrink-0 cursor-row-resize border-y border-transparent hover:border-zinc-200 hover:bg-sky-500/10"
+          onPointerDown={startResizeTopChrome}
+          onDoubleClick={() => restoreTopChrome()}
+        />
+
+        {!topChromeMaximized ? (
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white">
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-4">
             {!iterationId ? (
               <p className="text-sm text-zinc-500">请先在上方选择所属迭代。</p>
@@ -1264,6 +1451,7 @@ export function ExecutionTaskTreeClient({
             )}
           </div>
         </section>
+        ) : null}
       </div>
     </ModuleWorkspaceCard>
 

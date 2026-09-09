@@ -57,6 +57,7 @@ import {
 } from "@/components/PageModuleLayout";
 import { PaginationBar } from "@/components/PaginationBar";
 import {
+  isTestDesignColumnPinned,
   TEST_DESIGN_COLUMN_LABELS,
   useTestDesignListColumns,
   type TestDesignColumnKey,
@@ -67,7 +68,10 @@ import { testDesignTypeLabel, testDesignTypeOptions } from "@/lib/test-labels";
 import { compareWbsId } from "@/lib/wbs-id";
 import { buildTree, type TreeNode } from "@/lib/tree";
 
-const PENDING_TEST_DESIGN_IMPORT_STORAGE = "pm-pending-test-design-import";
+import {
+  clearPendingTestDesignImport,
+  writePendingTestDesignImport,
+} from "@/lib/pendingTestDesignImport";
 const TEST_DESIGN_TREE_CONTEXT_STORAGE = "pm-test-design-tree-context";
 
 /** 关联用例列表头筛选（当前选项展示于 title） */
@@ -1959,17 +1963,19 @@ export function TestDesignTreeClient({
   }, [moveTargetReqId, reload, selectedDesignIds]);
 
   const runBatchImport = useCallback(() => {
-    if (selectedDesignIds.length === 0) return;
+    const ids = selectedDesignIdsRef.current;
+    if (ids.length === 0) return;
     try {
-      sessionStorage.setItem(
-        PENDING_TEST_DESIGN_IMPORT_STORAGE,
-        JSON.stringify({ ids: selectedDesignIds, ts: Date.now() }),
-      );
+      writePendingTestDesignImport({
+        ids,
+        productId: productId.trim() || undefined,
+      });
     } catch {
-      /* ignore */
+      window.alert("无法写入待导入数据，请检查浏览器是否禁用了本地存储。");
+      return;
     }
-    router.push("/test-cases?designImport=1");
-  }, [router, selectedDesignIds]);
+    window.location.assign("/test-cases?designImport=1");
+  }, [productId]);
 
   useEffect(() => {
     const el = selectAllRef.current;
@@ -2791,8 +2797,14 @@ export function TestDesignTreeClient({
                                 >
                                   <input
                                     type="checkbox"
-                                    className="h-4 w-4 rounded border-zinc-300"
+                                    className="h-4 w-4 rounded border-zinc-300 disabled:opacity-60"
                                     checked={designColConfig.visible[k] !== false}
+                                    disabled={isTestDesignColumnPinned(k)}
+                                    title={
+                                      isTestDesignColumnPinned(k)
+                                        ? "标题列始终显示"
+                                        : undefined
+                                    }
                                     onChange={(e) =>
                                       setDesignColVisible(k, e.target.checked)
                                     }
@@ -3043,16 +3055,6 @@ export function TestDesignTreeClient({
                         <p className="text-sm text-zinc-500">加载中…</p>
                       </div>
                     </div>
-                  ) : listRows.length === 0 ? (
-                    <div className="min-h-0 flex-1">
-                      <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-zinc-50/40 p-6">
-                        <p className="text-sm text-zinc-500">
-                          {iterationCode === ""
-                            ? "baseline 数据已清空。"
-                            : "暂无数据或不符合筛选条件。"}
-                        </p>
-                      </div>
-                    </div>
                   ) : (
                     <>
                       {selectedDesignIds.length > 0 ? (
@@ -3232,7 +3234,19 @@ export function TestDesignTreeClient({
                             </tr>
                           </thead>
                           <tbody ref={designTableBodyRef}>
-                            {pagedDesignRows.map((r) => (
+                            {pagedDesignRows.length === 0 ? (
+                              <tr>
+                                <td
+                                  colSpan={designVisibleOrdered.length + 1}
+                                  className="py-12 text-center text-sm text-zinc-500"
+                                >
+                                  {iterationCode === ""
+                                    ? "baseline 数据已清空。"
+                                    : "暂无数据或不符合筛选条件。"}
+                                </td>
+                              </tr>
+                            ) : (
+                            pagedDesignRows.map((r) => (
                               <tr
                                 key={r.id}
                                 data-pm-row-select={r.id}
@@ -3372,7 +3386,8 @@ export function TestDesignTreeClient({
                                   }
                                 })}
                               </tr>
-                            ))}
+                            ))
+                            )}
                           </tbody>
                           </table>
                         </div>

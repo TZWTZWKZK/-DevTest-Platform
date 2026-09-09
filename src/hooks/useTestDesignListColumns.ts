@@ -52,6 +52,25 @@ const DEFAULT_VISIBLE: Record<TestDesignColumnKey, boolean> = {
   updatedAt: true,
 };
 
+/** 不可隐藏、始终参与列表渲染的列 */
+export const TEST_DESIGN_PINNED_COLUMNS: readonly TestDesignColumnKey[] = [
+  "title",
+];
+
+function applyPinnedVisibility(
+  visible: Record<TestDesignColumnKey, boolean>,
+): Record<TestDesignColumnKey, boolean> {
+  const next = { ...visible };
+  for (const k of TEST_DESIGN_PINNED_COLUMNS) {
+    next[k] = true;
+  }
+  return next;
+}
+
+export function isTestDesignColumnPinned(key: TestDesignColumnKey): boolean {
+  return (TEST_DESIGN_PINNED_COLUMNS as readonly string[]).includes(key);
+}
+
 export type TestDesignColumnConfig = {
   order: TestDesignColumnKey[];
   visible: Record<TestDesignColumnKey, boolean>;
@@ -95,7 +114,11 @@ function parseStored(): TestDesignColumnConfig | null {
         if (nk !== null && typeof val === "number") widths[nk] = val;
       }
     }
-    return { order: fullOrder, visible, widths };
+    return {
+      order: fullOrder,
+      visible: applyPinnedVisibility(visible),
+      widths,
+    };
   } catch {
     return null;
   }
@@ -105,6 +128,7 @@ function saveStored(c: TestDesignColumnConfig) {
   if (typeof window === "undefined") return;
   const payload: TestDesignColumnConfig = {
     ...c,
+    visible: applyPinnedVisibility(c.visible),
     order: normalizeColumnOrder(c.order, DEFAULT_ORDER),
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -137,15 +161,18 @@ export function useTestDesignListColumns() {
   }, [config]);
 
   const visibleOrdered = useMemo(() => {
-    return config.order.filter((k) => config.visible[k] !== false);
+    return config.order.filter(
+      (k) => isTestDesignColumnPinned(k) || config.visible[k] !== false,
+    );
   }, [config.order, config.visible]);
 
   const setVisible = useCallback((key: TestDesignColumnKey, show: boolean) => {
+    if (isTestDesignColumnPinned(key) && !show) return;
     skipNextPersist.current = true;
     setConfig((prev) => {
       const next: TestDesignColumnConfig = {
         ...prev,
-        visible: { ...prev.visible, [key]: show },
+        visible: applyPinnedVisibility({ ...prev.visible, [key]: show }),
         order: normalizeColumnOrder(prev.order, DEFAULT_ORDER),
       };
       saveStored(next);
